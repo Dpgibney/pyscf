@@ -183,3 +183,147 @@ void CVHFnrs8_incore_vk_batch(double *zout, double *eri, double *y,
 }
         free(zprivs);
 }
+
+/*
+ * J and K of a single symmetric dm (SCF), in one pass over the ERI rows:
+ * vj[ij] = sum_kl V[ij,kl] dmtri[kl] as in CVHFnrs8_incore_vj_batch, and K by
+ * the formulation of CVHFnrs8_incore_vk_batch for hermi = 1, with the packed
+ * row used directly as the lower triangle of M:
+ *      zout[ic] += M dm[jc],   zout[jc] += M dm[ic],   vk = Z + Z^T
+ * The dot products are summed in 4-wide vectors, as the compiler does not
+ * reorder floating-point sums by itself.
+ */
+// aligned(8): loaded from arbitrary offsets
+typedef double dvec4 __attribute__((vector_size(32), aligned(8)));
+
+static inline __attribute__((always_inline))
+double _hsum(dvec4 v)
+{
+        return (v[0] + v[1]) + (v[2] + v[3]);
+}
+
+// sum_l e[l] x[l], and y[l] += e[l] * xk, for l < n
+static inline __attribute__((always_inline))
+double _dot_axpy(const double *e, const double *x, double *y, double xk, int n)
+{
+        dvec4 acc = {0};
+        double s;
+        int l;
+        for (l = 0; l + 4 <= n; l += 4) {
+                dvec4 e4 = *(dvec4 *)(e + l);
+                *(dvec4 *)(y + l) += e4 * xk;
+                acc += e4 * *(dvec4 *)(x + l);
+        }
+        s = _hsum(acc);
+        for (; l < n; l++) {
+                y[l] += e[l] * xk;
+                s += e[l] * x[l];
+        }
+        return s;
+}
+
+static inline __attribute__((always_inline))
+void _jk_1dm_row_body(const double *row, size_t ij, double *vpriv, double *zpriv,
+                      const double *dmtri, const double *dm, size_t Nao)
+{
+        if (vpriv != NULL) {
+                vpriv[ij] += _dot_axpy(row, dmtri, vpriv, dmtri[ij], ij)
+                        + row[ij] * dmtri[ij];
+        }
+        if (zpriv == NULL) {
+                return;
+        }
+        const int ic = (int)(sqrt(2*ij+.25) - .5 + 1e-7);
+        const int jc = ij - (size_t)ic*(ic+1)/2;
+        const double *x1 = dm + jc * Nao;
+        const double *x2 = dm + ic * Nao;
+        double *y1 = zpriv + ic * Nao;
+        double *y2 = zpriv + jc * Nao;
+        const double *ek = row;
+        double e;
+        int k;
+        for (k = 0; k < ic; k++) {
+                y1[k] += _dot_axpy(ek, x1, y1, x1[k], k) + ek[k] * x1[k];
+                if (ic != jc) {
+                        y2[k] += _dot_axpy(ek, x2, y2, x2[k], k) + ek[k] * x2[k];
+                }
+                ek += k + 1;
+        }
+        // k = ic: l <= jc, M[ic,jc] = (ij|ij) halved
+        e = ek[jc] * .5;
+        if (ic != jc) {
+                y1[ic] += _dot_axpy(ek, x1, y1, x1[ic], jc) + e * x1[jc];
+                y1[jc] += e * x1[ic];
+                y2[ic] += _dot_axpy(ek, x2, y2, x2[ic], jc) + e * x2[jc];
+                y2[jc] += e * x2[ic];
+        } else {
+                y1[ic] += _dot_axpy(ek, x1, y1, x1[ic], ic) + e * x1[ic];
+        }
+}
+
+static void _jk_1dm_row(const double *row, size_t ij, double *vpriv, double *zpriv,
+                        const double *dmtri, const double *dm, size_t Nao)
+{
+        _jk_1dm_row_body(row, ij, vpriv, zpriv, dmtri, dm, Nao);
+}
+#if defined(__x86_64__) && defined(__GNUC__)
+#define HAVE_JK_1DM_AVX2
+__attribute__((target("avx2,fma")))
+static void _jk_1dm_row_avx2(const double *row, size_t ij, double *vpriv, double *zpriv,
+                             const double *dmtri, const double *dm, size_t Nao)
+{
+        _jk_1dm_row_body(row, ij, vpriv, zpriv, dmtri, dm, Nao);
+}
+#endif
+
+/*
+ * vj (npair) or zout (nao*nao) can be NULL to skip J or K.
+ */
+void CVHFnrs8_incore_jk_1dm(double *vj, double *zout, double *eri,
+                            double *dmtri, double *dm, int nao)
+{
+        const size_t Nao = nao;
+        const size_t npair = Nao * (Nao + 1) / 2;
+        const size_t nn = Nao * Nao;
+        void (*frow)(const double *, size_t, double *, double *,
+                     const double *, const double *, size_t) = _jk_1dm_row;
+#ifdef HAVE_JK_1DM_AVX2
+        __builtin_cpu_init();
+        if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+                frow = _jk_1dm_row_avx2;
+        }
+#endif
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads() * 2);
+        double **zprivs = vprivs + omp_get_max_threads();
+#pragma omp parallel
+{
+        int thread_id = omp_get_thread_num();
+        double *vpriv = vj == NULL ? NULL : calloc(npair, sizeof(double));
+        double *zpriv = zout == NULL ? NULL : calloc(nn, sizeof(double));
+        vprivs[thread_id] = vpriv;
+        zprivs[thread_id] = zpriv;
+        size_t ij, i;
+// static round robin, as in CVHFnrs8_incore_vj_batch
+#pragma omp for schedule(static, 1)
+        for (ij = 0; ij < npair; ij++) {
+                (*frow)(eri + ij * (ij + 1) / 2, ij, vpriv, zpriv, dmtri, dm, Nao);
+        }
+        if (vpriv != NULL) {
+                NPomp_dsum_reduce_inplace(vprivs, npair);
+#pragma omp for schedule(static)
+                for (i = 0; i < npair; i++) {
+                        vj[i] = vprivs[0][i];
+                }
+        }
+        if (zpriv != NULL) {
+                NPomp_dsum_reduce_inplace(zprivs, nn);
+#pragma omp for schedule(static)
+                for (i = 0; i < nn; i++) {
+                        zout[i] = zprivs[0][i];
+                }
+        }
+        free(vpriv);
+        free(zpriv);
+}
+        free(vprivs);
+}

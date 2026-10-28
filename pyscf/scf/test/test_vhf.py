@@ -73,6 +73,14 @@ class KnownValues(unittest.TestCase):
             vj1, vk1 = _vhf.incore(mf._eri, dms, hermi)
             self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+            # a single dm
+            vj3, vk3 = _vhf.incore(mf._eri, dms[1], hermi)
+            self.assertAlmostEqual(abs(vj3 - vj0[1]).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk3 - vk0[1]).max(), 0, 12)
+            vj3 = _vhf.incore(mf._eri, dms[1], hermi, with_k=False)[0]
+            vk3 = _vhf.incore(mf._eri, dms[1], hermi, with_j=False)[1]
+            self.assertAlmostEqual(abs(vj3 - vj0[1]).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk3 - vk0[1]).max(), 0, 12)
             # the per-dm kernels
             with lib.temporary_env(_vhf, INCORE_BATCH_MIN=len(dms)+1):
                 vj2, vk2 = _vhf.incore(mf._eri, dms, hermi)

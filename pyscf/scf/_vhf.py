@@ -373,13 +373,38 @@ def incore(eri, dms, hermi=0, with_j=True, with_k=True):
     return vj, vk
 
 # Number of density matrices from which incore() contracts s8 ERIs with the
-# batched BLAS-3 kernels (nr_incore_batch.c) instead of one kernel per dm
-INCORE_BATCH_MIN = 2
+# kernels of nr_incore_batch.c instead of one kernel per dm: BLAS-3 for
+# several dms, and one fused J/K pass for a single symmetric dm.
+INCORE_BATCH_MIN = 1
 
 def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
     '''J and K of all dms from s8 ERIs, see nr_incore_batch.c'''
     n_dm, nao = dms.shape[:2]
     vj = vk = None
+    # With hermi=1 the per-dm kernel returns the lower triangle of K for any
+    # dm. The symmetric formulations equal it only for symmetric dms, so other
+    # dms take the general one and its lower triangle.
+    sym_k = with_k and hermi == 1 and (
+        abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
+    if n_dm == 1 and (sym_k or not with_k):
+        null = lib.c_null_ptr()
+        dm = numpy.asarray(dms[0], order='C')
+        dmtri = lib.pack_tril(dm + dm.T)
+        idx = numpy.arange(nao)
+        dmtri[idx*(idx+1)//2+idx] *= .5
+        vjtri = numpy.empty_like(dmtri) if with_j else None
+        z = numpy.empty_like(dm) if with_k else None
+        libcvhf.CVHFnrs8_incore_jk_1dm(
+            null if vjtri is None else vjtri.ctypes.data_as(ctypes.c_void_p),
+            null if z is None else z.ctypes.data_as(ctypes.c_void_p),
+            eri.ctypes.data_as(ctypes.c_void_p), dmtri.ctypes.data_as(ctypes.c_void_p),
+            dm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nao))
+        if with_j:
+            vj = lib.unpack_tril(vjtri)[None]
+        if with_k:
+            vk = (z + z.T)[None]
+        return vj, vk
+
     if with_j:
         dmtri = lib.pack_tril(dms + dms.transpose(0,2,1))
         idx = numpy.arange(nao)
@@ -391,11 +416,6 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
             dmtri.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(n_dm), ctypes.c_int(nao))
         vj = lib.unpack_tril(vjtri.T)
     if with_k:
-        # With hermi=1 the per-dm kernel returns the lower triangle of K for any
-        # dm. The symmetric formulation below equals it only for symmetric dms,
-        # so other dms take the general one and its lower triangle.
-        sym_k = hermi == 1 and (
-            abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
         # Thread-private accumulators of nao*nao*w doubles each: take the dms in
         # batches so that they stay within ~2 GB in total
         w = 1 if sym_k else 2
