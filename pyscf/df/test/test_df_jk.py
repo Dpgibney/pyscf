@@ -194,6 +194,25 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(vj0-vj1).max(), 0, 12)
         self.assertAlmostEqual(lib.fp(vj0), -194.15910890730052, 9)
 
+    def test_get_j_cderi(self):
+        # J only: the 3-center tensor is built when it fits in memory, otherwise
+        # get_j evaluates the integrals. Both fit the same way.
+        numpy.random.seed(1)
+        nao = mol.nao_nr()
+        dms = numpy.random.random((2,nao,nao))
+        with_df = df.DF(mol, auxbasis='weigend')
+        vj0 = df_jk.get_j(with_df, dms)
+        self.assertTrue(with_df._cderi is None)
+        vj1 = df_jk.get_jk(with_df, dms, with_k=False)[0]
+        self.assertTrue(with_df._cderi is not None)
+        self.assertAlmostEqual(abs(vj1-vj0).max(), 0, 11)
+
+        with_df = df.DF(mol, auxbasis='weigend')
+        with_df.max_memory = 0
+        vj2 = df_jk.get_jk(with_df, dms, with_k=False)[0]
+        self.assertTrue(with_df._cderi is None)
+        self.assertAlmostEqual(abs(vj2-vj0).max(), 0, 12)
+
     def test_df_jk_complex_dm(self):
         mol = gto.M(atom='H 0 0 0; H 0 0 1')
         mf = mol.RHF().run()

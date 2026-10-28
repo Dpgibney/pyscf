@@ -277,11 +277,34 @@ class _DFHF:
         return lib.to_gpu(self, obj)
 
 
+def _build_cderi_for_j(dfobj):
+    '''Build the 3-center tensor for J-only calls if DF.build would keep it in
+    memory. get_j evaluates the 3-center integrals twice in every call, and an
+    SCF calls it once per cycle; contracting the tensor takes a fraction of
+    that. Only for a Cholesky-decomposable metric: both paths then fit with the
+    same factorization (cholesky_eri would fall back to an eigendecomposition
+    with a linear-dependency cutoff, get_j to scipy.linalg.solve).'''
+    from pyscf.df import df, addons
+    if type(dfobj) is not df.DF or isinstance(dfobj._cderi_to_save, str):
+        return False
+    mol = dfobj.mol
+    auxmol = addons.make_auxmol(mol, dfobj.auxbasis)
+    nao_pair = mol.nao * (mol.nao + 1) // 2
+    max_memory = dfobj.max_memory - lib.current_memory()[0]
+    if nao_pair * auxmol.nao * 8 / 1e6 >= .9 * max_memory:
+        return False
+    try:
+        scipy.linalg.cholesky(auxmol.intor('int2c2e', hermi=1), lower=True)
+    except scipy.linalg.LinAlgError:
+        return False
+    dfobj.build()
+    return dfobj._cderi is not None
+
 def get_jk(dfobj, dm, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-13):
     assert (with_j or with_k)
     if (not with_k and not dfobj.mol.incore_anyway and
         # 3-center integral tensor is not initialized
-        dfobj._cderi is None):
+        dfobj._cderi is None and not _build_cderi_for_j(dfobj)):
         return get_j(dfobj, dm, hermi, direct_scf_tol), None
 
     t0 = t1 = (logger.process_clock(), logger.perf_counter())
