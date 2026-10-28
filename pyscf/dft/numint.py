@@ -159,6 +159,12 @@ def eval_rho(mol, ao, dm, non0tab=None, xctype='LDA', hermi=0,
     xctype = xctype.upper()
     ngrids, nao = ao.shape[-2:]
 
+    if not hermi and xctype in ('GGA', 'NLC', 'MGGA') and dm.dtype == numpy.double:
+        # rho and its derivatives only depend on the symmetric part of a real dm.
+        # Symmetrizing lets the hermi=1 branches skip the dm.T contractions.
+        dm = lib.hermi_sum(numpy.asarray(dm, order='C')) * .5
+        hermi = 1
+
     shls_slice = (0, mol.nbas)
     ao_loc = mol.ao_loc_nr()
     if xctype == 'LDA' or xctype == 'HF':
