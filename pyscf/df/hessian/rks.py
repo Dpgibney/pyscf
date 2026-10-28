@@ -72,14 +72,12 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     t1 = log.timer_debug1('computing veff_diag', *t1)
 
     aoslices = mol.aoslice_by_atom()
-    vxc = rks_hess._get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
+    vxc_dm = rks_hess._get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
-        veff = vxc[ia]
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veff_diag[:,:,p0:p1], dm0[p0:p1])*2
         for j0, ja in enumerate(atmlst[:i0+1]):
-            q0, q1 = aoslices[ja][2:]
-            de2[i0,j0] += numpy.einsum('xypq,pq->xy', veff[:,:,q0:q1], dm0[q0:q1])*2
+            de2[i0,j0] += vxc_dm[ia,ja] * 2
 
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T

@@ -82,13 +82,14 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
 
     aoslices = mol.aoslice_by_atom()
-    vxc = _get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
+    vxc_dm = _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
 
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
-        veff = vxc[ia]
+        veff = None
         if hybrid and omega != 0:
+            veff = numpy.zeros((3,3,nao,nao))
             with mol.with_range_coulomb(omega):
                 vk1, vk2 = rhf_hess._get_jk(mol, 'int2e_ip1ip2', 9, 's1',
                                             ['li->s1kj', dm0[:,p0:p1],  # vk1
@@ -108,7 +109,9 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veff_diag[:,:,p0:p1], dm0[p0:p1])*2
         for j0, ja in enumerate(atmlst[:i0+1]):
             q0, q1 = aoslices[ja][2:]
-            de2[i0,j0] += numpy.einsum('xypq,pq->xy', veff[:,:,q0:q1], dm0[q0:q1])*2
+            de2[i0,j0] += vxc_dm[ia,ja] * 2
+            if veff is not None:
+                de2[i0,j0] += numpy.einsum('xypq,pq->xy', veff[:,:,q0:q1], dm0[q0:q1])*2
 
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
@@ -459,6 +462,122 @@ def _get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
             vmat[ia,:,:,:,p0:p1] += ipip[:,:,p0:p1].transpose(1,0,3,2)
 
     return vmat
+
+def _atom_pair_sum(aoslices, x, y):
+    '''[A,g] = sum_{p in atom A} x[g,p] * y[g,p] for x, y of shape (ngrids,nao)'''
+    xt, yt = x.T, y.T
+    return numpy.array([numpy.einsum('pg,pg->g', xt[p0:p1], yt[p0:p1])
+                        for p0, p1 in aoslices[:,2:]])
+
+# _D2[x][y]: index of the AO component d_x d_y ao
+_D2 = ((XX, XY, XZ), (YX, YY, YZ), (ZX, ZY, ZZ))
+
+def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
+    '''The contraction of _get_vxc_deriv2 with dm0 that partial_hess_elec needs,
+    e[A,B,x,y] = sum_{p in B} sum_q vxc[A,x,y,p,q] dm0[p,q], without building vxc.
+
+    The atom-dependent terms of vxc[A] are AO products weighted on the grid. Their
+    contraction with dm0 reduces to grid sums of the atom-resolved pair densities
+    (ao_k * ao_dm0)[g, p in B], which are evaluated once per grid block for all
+    atoms. This replaces 18 (ngrids x nao x nao) GEMMs per atom and grid block.
+    '''
+    mol = hessobj.mol
+    mf = hessobj.base
+    if hessobj.grids is not None:
+        grids = hessobj.grids
+    else:
+        grids = mf.grids
+    if grids.coords is None:
+        grids.build(with_non0tab=True)
+
+    nao, nmo = mo_coeff.shape
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    aoslices = mol.aoslice_by_atom()
+    natm = mol.natm
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    dm0 = mf.make_rdm1(mo_coeff, mo_occ)
+
+    vxc_dm = numpy.zeros((natm,natm,3,3))
+    ipip = numpy.zeros((3,3,nao,nao))
+    if xctype == 'LDA':
+        ao_deriv = 1
+        for ao, mask, weight, coords \
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            rho = ni.eval_rho2(mol, ao[0], mo_coeff, mo_occ, mask, xctype)
+            vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype)[1:3]
+            wv = weight * vxc[0]
+            aow = [numint._scale_ao(ao[i], wv) for i in range(1, 4)]
+            _d1d2_dot_(ipip, mol, aow, ao[1:4], mask, ao_loc, False)
+
+            ao_dm0 = numint._dot_ao_dm(mol, ao[0], dm0, mask, shls_slice, ao_loc)
+            wf = weight * fxc[0,0]
+            # t[B,d] = sum_{p in B} (d_d ao * ao_dm0)[:,p]
+            t = numpy.array([_atom_pair_sum(aoslices, ao[1+d], ao_dm0)
+                             for d in range(3)]).transpose(1,0,2)
+            for ia in range(natm):
+                p0, p1 = aoslices[ia][2:]
+                # *2 for \nabla|ket> in rho1
+                rho1 = numpy.einsum('xpi,pi->xp', ao[1:,:,p0:p1], ao_dm0[:,p0:p1]) * 2
+                vxc_dm[ia] += numpy.einsum('sg,btg->bst', wf * rho1, t)
+            ao_dm0 = aow = t = None
+
+    elif xctype in ('GGA', 'MGGA'):
+        ao_deriv = 2
+        if xctype == 'GGA':
+            ncomp, nrho = 4, 4
+        else:
+            ncomp, nrho = 5, 10
+        for ao, mask, weight, coords \
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            rho = ni.eval_rho2(mol, ao[:nrho], mo_coeff, mo_occ, mask, xctype)
+            vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype)[1:3]
+            wv = weight * vxc
+            wv[0] *= .5
+            if xctype == 'MGGA':
+                wv[4] *= .25
+            aow = rks_grad._make_dR_dao_w(ao, wv)
+            _d1d2_dot_(ipip, mol, aow, ao[1:4], mask, ao_loc, False)
+            if xctype == 'MGGA':
+                aow = [numint._scale_ao(ao[i], wv[4]) for i in range(4, 10)]
+                _d1d2_dot_(ipip, mol, [aow[0], aow[1], aow[2]], [ao[XX], ao[XY], ao[XZ]], mask, ao_loc, False)
+                _d1d2_dot_(ipip, mol, [aow[1], aow[3], aow[4]], [ao[YX], ao[YY], ao[YZ]], mask, ao_loc, False)
+                _d1d2_dot_(ipip, mol, [aow[2], aow[4], aow[5]], [ao[ZX], ao[ZY], ao[ZZ]], mask, ao_loc, False)
+
+            ao_dm0 = [numint._dot_ao_dm(mol, ao[i], dm0, mask, shls_slice, ao_loc) for i in range(4)]
+            wf = weight * fxc
+            # t[B,d,c] is the dm0 contraction of the c-th density component of the
+            # atom-dependent terms: sum_{p in B} (D[d,c] * ao_dm0[0] + d_d ao * ao_dm0[c])
+            # with D[d,0] = d_d ao and D[d,c] = d_d d_(c-1) ao. For meta-GGA, c=4 is
+            # the tau term sum_x sum_{p in B} (d_x d_d ao * ao_dm0[1+x]).
+            t = numpy.empty((natm,3,ncomp,weight.size))
+            for d in range(3):
+                t[:,d,0] = _atom_pair_sum(aoslices, ao[1+d], ao_dm0[0]) * 2
+                for c in range(1, 4):
+                    t[:,d,c] = _atom_pair_sum(aoslices, ao[_D2[d][c-1]], ao_dm0[0])
+                    t[:,d,c] += _atom_pair_sum(aoslices, ao[1+d], ao_dm0[c])
+                if xctype == 'MGGA':
+                    t[:,d,4] = sum(_atom_pair_sum(aoslices, ao[_D2[x][d]], ao_dm0[1+x])
+                                   for x in range(3))
+            for ia in range(natm):
+                dR_rho1 = _make_dR_rho1(ao, ao_dm0, ia, aoslices, xctype)
+                wv = numpy.einsum('xyg,sxg->syg', wf, dR_rho1)
+                wv[:,0] *= .5
+                if xctype == 'MGGA':
+                    wv[:,4] *= .5  # for the factor 1/2 in tau
+                vxc_dm[ia] += numpy.einsum('scg,btcg->bst', wv, t)
+            ao_dm0 = aow = t = None
+
+    # The atom-independent ipip terms enter vxc[A] through the AO columns of atom A
+    for ia in range(natm):
+        p0, p1 = aoslices[ia][2:]
+        for ja in range(natm):
+            q0, q1 = aoslices[ja][2:]
+            vxc_dm[ia,ja] += numpy.einsum('xypq,pq->xy', ipip[:,:,q0:q1,p0:p1], dm0[q0:q1,p0:p1])
+            if xctype != 'LDA':
+                vxc_dm[ia,ja] += numpy.einsum('yxqp,pq->xy', ipip[:,:,p0:p1,q0:q1], dm0[q0:q1,p0:p1])
+    return vxc_dm
 
 def _get_enlc_deriv2_numerical(hessobj, mo_coeff, mo_occ, max_memory):
     """

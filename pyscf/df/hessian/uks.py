@@ -76,18 +76,14 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
 
     aoslices = mol.aoslice_by_atom()
-    vxca, vxcb = uks_hess._get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
+    vxc_dma, vxc_dmb = uks_hess._get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
-        veffa = vxca[ia]
-        veffb = vxcb[ia]
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veffa_diag[:,:,p0:p1], dm0a[p0:p1])*2
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veffb_diag[:,:,p0:p1], dm0b[p0:p1])*2
 
         for j0, ja in enumerate(atmlst[:i0+1]):
-            q0, q1 = aoslices[ja][2:]
-            de2[i0,j0] += numpy.einsum('xypq,pq->xy', veffa[:,:,q0:q1], dm0a[q0:q1])*2
-            de2[i0,j0] += numpy.einsum('xypq,pq->xy', veffb[:,:,q0:q1], dm0b[q0:q1])*2
+            de2[i0,j0] += (vxc_dma[ia,ja] + vxc_dmb[ia,ja]) * 2
 
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
