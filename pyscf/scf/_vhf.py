@@ -325,6 +325,13 @@ def incore(eri, dms, hermi=0, with_j=True, with_k=True):
                 fjkptr.append(fvk)
 
     elif eri.ndim == 1 and npair*(npair+1)//2 == eri.size: # 8-fold symmetry eri
+        if n_dm >= INCORE_BATCH_MIN:
+            vj, vk = _incore_s8_batch(eri, dms, hermi, with_j, with_k)
+            if with_j:
+                vj = vj.reshape(dms_shape)
+            if with_k:
+                vk = vk.reshape(dms_shape)
+            return vj, vk
         fdrv = getattr(libcvhf, 'CVHFnrs8_incore_drv')
         if with_j:
             fvj = _fpointer('CVHFics8_tridm_vj')
@@ -363,6 +370,58 @@ def incore(eri, dms, hermi=0, with_j=True, with_k=True):
             for i in range(n_dm):
                 lib.hermi_triu(vk[i], hermi, inplace=True)
         vk = vk.reshape(dms_shape)
+    return vj, vk
+
+# Number of density matrices from which incore() contracts s8 ERIs with the
+# batched BLAS-3 kernels (nr_incore_batch.c) instead of one kernel per dm
+INCORE_BATCH_MIN = 2
+
+def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
+    '''J and K of all dms from s8 ERIs, see nr_incore_batch.c'''
+    n_dm, nao = dms.shape[:2]
+    vj = vk = None
+    if with_j:
+        dmtri = lib.pack_tril(dms + dms.transpose(0,2,1))
+        idx = numpy.arange(nao)
+        dmtri[:,idx*(idx+1)//2+idx] *= .5
+        dmtri = numpy.asarray(dmtri.T, order='C')
+        vjtri = numpy.empty_like(dmtri)
+        libcvhf.CVHFnrs8_incore_vj_batch(
+            vjtri.ctypes.data_as(ctypes.c_void_p), eri.ctypes.data_as(ctypes.c_void_p),
+            dmtri.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(n_dm), ctypes.c_int(nao))
+        vj = lib.unpack_tril(vjtri.T)
+    if with_k:
+        # With hermi=1 the per-dm kernel returns the lower triangle of K for any
+        # dm. The symmetric formulation below equals it only for symmetric dms,
+        # so other dms take the general one and its lower triangle.
+        sym_k = hermi == 1 and (
+            abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
+        # Thread-private accumulators of nao*nao*w doubles each: take the dms in
+        # batches so that they stay within ~2 GB in total
+        w = 1 if sym_k else 2
+        batch = max(1, int(2e9 / (8 * w * nao**2 * lib.num_threads())))
+        vk = numpy.empty((n_dm, nao, nao))
+        for p0 in range(0, n_dm, batch):
+            p1 = min(p0 + batch, n_dm)
+            dm = dms[p0:p1]
+            if sym_k:
+                y = dm.transpose(1,0,2)
+            else:
+                y = numpy.vstack((dm, dm.transpose(0,2,1))).transpose(1,0,2)
+            y = numpy.asarray(y, order='C')
+            z = numpy.empty_like(y)
+            libcvhf.CVHFnrs8_incore_vk_batch(
+                z.ctypes.data_as(ctypes.c_void_p), eri.ctypes.data_as(ctypes.c_void_p),
+                y.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(p1-p0),
+                ctypes.c_int(nao), ctypes.c_int(1 if sym_k else 0))
+            z = z.transpose(1,0,2)
+            if sym_k:
+                vk[p0:p1] = z + z.transpose(0,2,1)
+            else:
+                vk[p0:p1] = z[:p1-p0] + z[p1-p0:].transpose(0,2,1)
+        if hermi != 0 and not sym_k:
+            for i in range(n_dm):
+                lib.hermi_triu(vk[i], hermi, inplace=True)
     return vj, vk
 
 # use int2e_sph as cintor, CVHFnrs8_ij_s2kl, CVHFnrs8_jk_s2il as fjk to call
