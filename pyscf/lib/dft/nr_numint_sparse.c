@@ -18,6 +18,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 #include "config.h"
 #include "np_helper/np_helper.h"
 #include "cint.h"
@@ -1132,4 +1133,378 @@ for (i = i0; i < i1; i++) {
                 }
         }
 }
+}
+
+/*
+ * Sparse AO products with BLAS level 3.
+ *
+ * The kernels above compute each AO pair as a dot product over the grid
+ * points. The kernels below take GEMM_NBLK consecutive blocks of BLKSIZE grid
+ * points at a time, gather the AOs of the shells that are unscreened on any of
+ * these blocks into contiguous buffers, and multiply the buffers with dgemm or
+ * dsyrk. The values on the blocks where a shell is screened are gathered as
+ * zeros, so, as for the kernels above, the inputs only need to be valid where
+ * the screen index is nonzero. eval_ao sets the AO values of screened shells to
+ * exactly zero, so the results equal the dense products up to the order of
+ * summation: nbins and pair_mask are not used and no product is dropped.
+ */
+#define GEMM_NBLK       4
+#define GEMM_NGRIDS     (GEMM_NBLK*BLKSIZE)
+
+typedef struct {
+        int nao;            // number of AOs of the unscreened shells
+        int nshl;           // number of unscreened shells
+        int nseg;           // number of contiguous AO ranges they form
+        int *shl;           // [nshl] shell ids, ascending
+        uint8_t *blkmask;   // [nshl] bit b: the shell is unscreened on block blk0+b
+        int *seg_ao;        // [nseg] first AO of each range
+        int *seg_off;       // [nseg] position of that AO in the gathered buffers
+        int *seg_len;       // [nseg] number of AOs in the range
+} GemmGroup;
+
+static void _gemm_group_init(GemmGroup *g, int nbas)
+{
+        g->shl = malloc(sizeof(int) * nbas * 4);
+        g->seg_ao = g->shl + nbas;
+        g->seg_off = g->seg_ao + nbas;
+        g->seg_len = g->seg_off + nbas;
+        g->blkmask = malloc(sizeof(uint8_t) * nbas);
+}
+
+static void _gemm_group_free(GemmGroup *g)
+{
+        free(g->shl);
+        free(g->blkmask);
+}
+
+// The shells that are unscreened on any of the blocks [blk0, blk1)
+static void _gemm_group_shells(GemmGroup *g, uint8_t *screen_index,
+                               int blk0, int blk1, int nbas, int *ao_loc)
+{
+        int ish, b, mask;
+        int nao = 0;
+        int nshl = 0;
+        int nseg = 0;
+        for (ish = 0; ish < nbas; ish++) {
+                mask = 0;
+                for (b = 0; b < blk1 - blk0; b++) {
+                        if (screen_index[(blk0+b)*nbas+ish]) {
+                                mask |= 1 << b;
+                        }
+                }
+                if (mask == 0) {
+                        continue;
+                }
+                if (nseg == 0 ||
+                    g->seg_ao[nseg-1] + g->seg_len[nseg-1] != ao_loc[ish]) {
+                        g->seg_ao[nseg] = ao_loc[ish];
+                        g->seg_off[nseg] = nao;
+                        g->seg_len[nseg] = 0;
+                        nseg++;
+                }
+                g->seg_len[nseg-1] += ao_loc[ish+1] - ao_loc[ish];
+                g->shl[nshl] = ish;
+                g->blkmask[nshl] = mask;
+                nshl++;
+                nao += ao_loc[ish+1] - ao_loc[ish];
+        }
+        g->nao = nao;
+        g->nshl = nshl;
+        g->nseg = nseg;
+}
+
+// The largest number of AOs of the unscreened shells over all groups of blocks
+static int _gemm_max_group_aos(uint8_t *screen_index, int ngrids, int nbas,
+                               int *ao_loc)
+{
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        int max_nao = 0;
+        int igroup;
+#pragma omp parallel for schedule(static) reduction(max:max_nao)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                int blk0 = igroup * GEMM_NBLK;
+                int blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                int nao = 0;
+                int ish, b;
+                for (ish = 0; ish < nbas; ish++) {
+                        for (b = blk0; b < blk1; b++) {
+                                if (screen_index[b*nbas+ish]) {
+                                        nao += ao_loc[ish+1] - ao_loc[ish];
+                                        break;
+                                }
+                        }
+                }
+                max_nao = MAX(max_nao, nao);
+        }
+        return max_nao;
+}
+
+// buf[n,k] = ao[i,ig0+k] * wv[ig0+k] (wv = NULL: without weights) for the n-th
+// AO i of the group, and zero on the blocks where the shell of i is screened
+static void _gemm_gather(double *buf, double *ao, double *wv, GemmGroup *g,
+                         int *ao_loc, size_t Ngrids, int ig0, int ng)
+{
+        int s, i, b, k, k0, k1;
+        double *pao;
+        double *pbuf = buf;
+        for (s = 0; s < g->nshl; s++) {
+        for (i = ao_loc[g->shl[s]]; i < ao_loc[g->shl[s]+1]; i++) {
+                pao = ao + i * Ngrids + ig0;
+                for (b = 0, k0 = 0; k0 < ng; b++, k0 += BLKSIZE) {
+                        k1 = MIN(k0 + BLKSIZE, ng);
+                        if (!(g->blkmask[s] & (1 << b))) {
+                                for (k = k0; k < k1; k++) {
+                                        pbuf[k] = 0;
+                                }
+                        } else if (wv == NULL) {
+                                for (k = k0; k < k1; k++) {
+                                        pbuf[k] = pao[k];
+                                }
+                        } else {
+                                for (k = k0; k < k1; k++) {
+                                        pbuf[k] = pao[k] * wv[ig0+k];
+                                }
+                        }
+                }
+                pbuf += ng;
+        } }
+}
+
+// buf[n,p] = ao[i,ig0+pidx[p]] * scale[p] for the n-th AO i of the group, and
+// zero on the blocks where the shell of i is screened
+static void _gemm_gather_points(double *buf, double *ao, double *scale,
+                                int *pidx, int np, GemmGroup *g, int *ao_loc,
+                                size_t Ngrids, int ig0)
+{
+        int s, i, p, mask;
+        double *pao;
+        double *pbuf = buf;
+        for (s = 0; s < g->nshl; s++) {
+                mask = g->blkmask[s];
+                for (i = ao_loc[g->shl[s]]; i < ao_loc[g->shl[s]+1]; i++) {
+                        pao = ao + i * Ngrids + ig0;
+                        for (p = 0; p < np; p++) {
+                                if (mask & (1 << (pidx[p] / BLKSIZE))) {
+                                        pbuf[p] = pao[pidx[p]] * scale[p];
+                                } else {
+                                        pbuf[p] = 0;
+                                }
+                        }
+                        pbuf += np;
+                }
+        }
+}
+
+// out[i,j] += cbuf[n,m] for the n-th AO i and the m-th AO j of the group;
+// with tril, only for m <= n (j <= i)
+static void _gemm_scatter_add(double *out, double *cbuf, GemmGroup *g,
+                              size_t Nao, int tril)
+{
+        const int ns = g->nao;
+        int s, s1, i, m, m0, mlen;
+        int n = 0;
+        double *pout, *pc;
+        for (s = 0; s < g->nseg; s++) {
+        for (i = g->seg_ao[s]; i < g->seg_ao[s] + g->seg_len[s]; i++, n++) {
+                pc = cbuf + n * (size_t)ns;
+                pout = out + i * Nao;
+                for (s1 = 0; s1 < g->nseg; s1++) {
+                        m0 = g->seg_off[s1];
+                        mlen = g->seg_len[s1];
+                        if (tril) {
+                                if (m0 > n) {
+                                        break;
+                                }
+                                mlen = MIN(mlen, n - m0 + 1);
+                        }
+                        for (m = 0; m < mlen; m++) {
+                                pout[g->seg_ao[s1]+m] += pc[m0+m];
+                        }
+                }
+        } }
+}
+
+/* out[j,g] = sum_i ao[i,g] * dm[i,j] for real ao[nao,ngrids] and dm[nao,nao].
+ * As for VXCdot_ao_dm_sparse, out[j,g] is only written where shell j can be
+ * unscreened on the block of g. */
+void VXCdot_ao_dm_sparse_gemm(double *out, double *ao, double *dm,
+                              int nao, int ngrids, int nbas,
+                              uint8_t *screen_index, int *ao_loc)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        if (max_nao == 0) {
+                return;
+        }
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *aobuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*2 + max_nao));
+        double *outbuf = aobuf + max_nao * GEMM_NGRIDS;
+        double *dmbuf = outbuf + max_nao * GEMM_NGRIDS;
+        int igroup, blk0, blk1, ig0, ng, ns, s, s1, i, k, n;
+        double *pin, *pout;
+// each group writes its own grid columns of out, so the result does not depend
+// on the schedule
+#pragma omp for schedule(dynamic, 4)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                _gemm_gather(aobuf, ao, NULL, &g, ao_loc, Ngrids, ig0, ng);
+                // dmbuf[m,n] = dm[i,j] for the m-th AO i and the n-th AO j
+                n = 0;
+                for (s = 0; s < g.nseg; s++) {
+                for (i = g.seg_ao[s]; i < g.seg_ao[s] + g.seg_len[s]; i++, n++) {
+                        pin = dm + i * Nao;
+                        pout = dmbuf + n * (size_t)ns;
+                        for (s1 = 0; s1 < g.nseg; s1++) {
+                                for (k = 0; k < g.seg_len[s1]; k++) {
+                                        pout[g.seg_off[s1]+k] = pin[g.seg_ao[s1]+k];
+                                }
+                        }
+                } }
+                // outbuf[n,k] = sum_m dmbuf[m,n] * aobuf[m,k]
+                dgemm_(&TRANS_N, &TRANS_T, &ng, &ns, &ns, &D1, aobuf, &ng,
+                       dmbuf, &ns, &D0, outbuf, &ng);
+                n = 0;
+                for (s = 0; s < g.nseg; s++) {
+                for (i = g.seg_ao[s]; i < g.seg_ao[s] + g.seg_len[s]; i++, n++) {
+                        pin = outbuf + n * (size_t)ng;
+                        pout = out + i * Ngrids + ig0;
+                        for (k = 0; k < ng; k++) {
+                                pout[k] = pin[k];
+                        }
+                } }
+        }
+        _gemm_group_free(&g);
+        free(aobuf);
+}
+}
+
+/* out[i,j] += sum_g bra[i,g] * wv[g] * ket[j,g] for real bra[nao,ngrids] and
+ * ket[nao,ngrids]; wv = NULL for no weights. With hermi, the lower triangle is
+ * computed and copied to the upper triangle, as in VXCdot_ao_ao_sparse. */
+void VXCdot_aow_ao_sparse_gemm(double *out, double *bra, double *ket, double *wv,
+                               int nao, int ngrids, int nbas, int hermi,
+                               uint8_t *screen_index, int *ao_loc)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const size_t nn = Nao * Nao;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        // The symmetric product of one set of AOs is evaluated with dsyrk on
+        // one triangle, at half the cost of dgemm
+        const int syrk = bra == ket && (hermi == HERMITIAN || hermi == SYMMETRIC);
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+        if (max_nao > 0) {
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const char UPLO = 'U';  // cbuf[n,m] for m <= n in C order
+        const double D0 = 0;
+        const double D1 = 1;
+        const double DM1 = -1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *vpriv = calloc(nn, sizeof(double));
+        // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
+        // visible to the other threads.
+        vprivs[omp_get_thread_num()] = vpriv;
+        double *brabuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*2 + max_nao));
+        double *ketbuf = brabuf + max_nao * GEMM_NGRIDS;
+        double *cbuf = ketbuf + max_nao * GEMM_NGRIDS;
+        double sqrtw[GEMM_NGRIDS];
+        int pidx[GEMM_NGRIDS];
+        int igroup, blk0, blk1, ig0, ng, ns, np, sign, i, j, k;
+        double w, beta;
+// static: each thread sums a fixed set of groups, so out is reproducible for a
+// given number of threads. Round robin, because the cost of a group varies
+// along the grid.
+#pragma omp for schedule(static, 1)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                if (!syrk) {
+                        _gemm_gather(brabuf, bra, wv, &g, ao_loc, Ngrids, ig0, ng);
+                        _gemm_gather(ketbuf, ket, NULL, &g, ao_loc, Ngrids, ig0, ng);
+                        // cbuf[n,m] = sum_k brabuf[n,k] * ketbuf[m,k]
+                        dgemm_(&TRANS_T, &TRANS_N, &ns, &ns, &ng, &D1, ketbuf, &ng,
+                               brabuf, &ng, &D0, cbuf, &ns);
+                } else if (wv == NULL) {
+                        _gemm_gather(brabuf, bra, NULL, &g, ao_loc, Ngrids, ig0, ng);
+                        dsyrk_(&UPLO, &TRANS_T, &ns, &ng, &D1, brabuf, &ng,
+                               &D0, cbuf, &ns);
+                } else {
+                        // dsyrk needs the form A^T A, so the grid points are split
+                        // by the sign of wv and the AO values scaled by sqrt(|wv|)
+                        beta = 0;
+                        for (sign = 1; sign >= -1; sign -= 2) {
+                                np = 0;
+                                for (k = 0; k < ng; k++) {
+                                        w = wv[ig0+k] * sign;
+                                        // NaN goes to the positive set so that it propagates
+                                        if (w > 0 || (sign > 0 && w != w)) {
+                                                pidx[np] = k;
+                                                sqrtw[np] = sqrt(w);
+                                                np++;
+                                        }
+                                }
+                                if (np == 0) {
+                                        continue;
+                                }
+                                _gemm_gather_points(brabuf, bra, sqrtw, pidx, np,
+                                                    &g, ao_loc, Ngrids, ig0);
+                                dsyrk_(&UPLO, &TRANS_T, &ns, &np, (sign > 0 ? &D1 : &DM1),
+                                       brabuf, &np, &beta, cbuf, &ns);
+                                beta = 1;
+                        }
+                        if (beta == 0) {  // wv is zero on all points of the group
+                                continue;
+                        }
+                }
+                _gemm_scatter_add(vpriv, cbuf, &g, Nao, hermi);
+        }
+        NPomp_dsum_reduce_inplace(vprivs, nn);
+        double *vsum = vprivs[0];
+#pragma omp for schedule(static)
+        for (i = 0; i < nao; i++) {
+                for (j = 0; j < (hermi ? i+1 : nao); j++) {
+                        out[i*Nao+j] += vsum[i*Nao+j];
+                }
+        }
+        _gemm_group_free(&g);
+        free(vpriv);
+        free(brabuf);
+}
+        }
+        free(vprivs);
+        if (hermi != 0) {
+                NPdsymm_triu(nao, out, hermi);
+        }
 }

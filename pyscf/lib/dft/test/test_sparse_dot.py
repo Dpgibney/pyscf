@@ -284,6 +284,92 @@ class KnownValues(unittest.TestCase):
         out = _fill_zero_blocks(out, ao_loc, mask)
         self.assertAlmostEqual(abs(ref - out).max(), 0, 15)
 
+    def test_dot_ao_dm_sparse_gemm(self):
+        np.random.seed(1)
+        ngrids = BLKSIZE*37 + 24
+        dims = np.array([1,3,1,1,1,3,3,6,6,5,7,1,3,1,3,1,1,3,1,1,1,1,3,3,1,1,3,3]*3)
+        ao_loc = np.append(0, np.cumsum(dims)).astype(np.int32)
+        nbas = len(dims)
+        nao = ao_loc[-1]
+        nrow = (ngrids+BLKSIZE-1)//BLKSIZE
+        ao = np.random.rand(nao, ngrids).T
+        dm = np.random.rand(nao, nao)
+        mask = np.asarray(np.random.rand(nrow, nbas) < .3).astype(np.uint8)
+        mask[:6,nbas//2:] = 0
+        mask[-9:] = 0
+        ref = _fill_zero_blocks(ao.copy(), ao_loc, mask).dot(dm)
+        # The values of screened blocks must not be read
+        ao = _fill_blocks(ao, ao_loc, mask, np.nan)
+        out = np.full((nao, ngrids), np.nan).T
+        libdft.VXCdot_ao_dm_sparse_gemm(
+            out.ctypes.data_as(ctypes.c_void_p),
+            ao.ctypes.data_as(ctypes.c_void_p),
+            dm.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+            mask.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        # out is defined where the shell is unscreened
+        unscreened = _fill_blocks(np.ones((ngrids, nao)), ao_loc, mask, 0) == 1
+        self.assertAlmostEqual(abs(ref - out)[unscreened].max(), 0, 12)
+
+    def test_dot_aow_ao_sparse_gemm(self):
+        np.random.seed(1)
+        ngrids = BLKSIZE*37 + 24
+        dims = np.array([1,3,1,1,1,3,3,6,6,5,7,1,3,1,3,1,1,3,1,1,1,1,3,3,1,1,3,3]*3)
+        ao_loc = np.append(0, np.cumsum(dims)).astype(np.int32)
+        nbas = len(dims)
+        nao = ao_loc[-1]
+        nrow = (ngrids+BLKSIZE-1)//BLKSIZE
+        bra = np.random.rand(nao, ngrids).T
+        ket = np.random.rand(nao, ngrids).T
+        wv = np.random.rand(ngrids) - .3
+        mask = np.asarray(np.random.rand(nrow, nbas) < .3).astype(np.uint8)
+        mask[:6,nbas//2:] = 0
+        mask[-9:] = 0
+        bra0 = _fill_zero_blocks(bra.copy(), ao_loc, mask)
+        ket0 = _fill_zero_blocks(ket.copy(), ao_loc, mask)
+        bra = _fill_blocks(bra, ao_loc, mask, np.nan)
+        ket = _fill_blocks(ket, ao_loc, mask, np.nan)
+        out0 = np.random.rand(nao, nao)
+        out0 = out0 + out0.T
+
+        def dot(bra, ket, wv, hermi):
+            out = out0.copy()
+            libdft.VXCdot_aow_ao_sparse_gemm(
+                out.ctypes.data_as(ctypes.c_void_p),
+                bra.ctypes.data_as(ctypes.c_void_p),
+                ket.ctypes.data_as(ctypes.c_void_p),
+                None if wv is None else wv.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(nao), ctypes.c_int(ngrids),
+                ctypes.c_int(nbas), ctypes.c_int(hermi),
+                mask.ctypes.data_as(ctypes.c_void_p),
+                ao_loc.ctypes.data_as(ctypes.c_void_p))
+            return out
+
+        out = dot(bra, ket, wv, 0)
+        self.assertAlmostEqual(abs(out - out0 - (bra0.T*wv).dot(ket0)).max(), 0, 11)
+        out = dot(bra, ket, None, 0)
+        self.assertAlmostEqual(abs(out - out0 - bra0.T.dot(ket0)).max(), 0, 11)
+        # dsyrk with the grid points split by the sign of wv
+        out = dot(bra, bra, wv, 1)
+        self.assertAlmostEqual(abs(out - out0 - (bra0.T*wv).dot(bra0)).max(), 0, 11)
+        self.assertAlmostEqual(abs(out - out.T).max(), 0, 14)
+        out = dot(bra, bra, None, 1)
+        self.assertAlmostEqual(abs(out - out0 - bra0.T.dot(bra0)).max(), 0, 11)
+        # hermi with different bra and ket: the lower triangle is copied to the upper one
+        ref = out0 + (bra0.T*wv).dot(ket0)
+        out = dot(bra, ket, wv, 1)
+        self.assertAlmostEqual(abs(np.tril(out) - np.tril(ref)).max(), 0, 11)
+        self.assertAlmostEqual(abs(out - out.T).max(), 0, 14)
+
+def _fill_blocks(mat, ao_loc, mask, val):
+    nrow, nbas = mask.shape
+    for ib in range(nbas):
+        for ig in range(nrow):
+            if not mask[ig,ib]:
+                mat[ig*BLKSIZE:(ig+1)*BLKSIZE,ao_loc[ib]:ao_loc[ib+1]] = val
+    return mat
+
 def _fill_zero_blocks(mat, ao_loc, mask):
     nrow, nbas = mask.shape
     for ib in range(nbas):

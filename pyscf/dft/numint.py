@@ -898,7 +898,9 @@ def _dot_ao_wv_ao_hermi(ao, wv, out):
 def _dot_ao_ao_sparse(ao1, ao2, wv, nbins, screen_index, pair_mask, ao_loc,
                       hermi=0, out=None):
     '''Returns (bra*wv).T.dot(ket) while sparsity is explicitly considered.
-    Note the return may have ~1e-13 difference to _dot_ao_ao.
+    The AO values on the grid blocks where screen_index is zero are taken as
+    zero. nbins and pair_mask are not used: the return equals _dot_ao_ao up to
+    the order of summation.
     '''
     ngrids, nao = ao1.shape
     if screen_index is None or pair_mask is None or ngrids % ALIGNMENT_UNIT != 0:
@@ -910,36 +912,30 @@ def _dot_ao_ao_sparse(ao1, ao2, wv, nbins, screen_index, pair_mask, ao_loc,
     nbas = screen_index.shape[1]
     if out is None:
         out = numpy.zeros((nao, nao), dtype=ao1.dtype)
-
     if wv is None:
-        libdft.VXCdot_ao_ao_sparse(
-            out.ctypes.data_as(ctypes.c_void_p),
-            ao1.ctypes.data_as(ctypes.c_void_p),
-            ao2.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nao), ctypes.c_int(ngrids),
-            ctypes.c_int(nbas), ctypes.c_int(hermi),
-            ctypes.c_int(nbins), screen_index.ctypes.data_as(ctypes.c_void_p),
-            pair_mask.ctypes.data_as(ctypes.c_void_p),
-            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        wv_ptr = None
     else:
         assert wv.dtype == numpy.double
-        libdft.VXCdot_aow_ao_sparse(
-            out.ctypes.data_as(ctypes.c_void_p),
-            ao1.ctypes.data_as(ctypes.c_void_p),
-            ao2.ctypes.data_as(ctypes.c_void_p),
-            wv.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_int(nao), ctypes.c_int(ngrids),
-            ctypes.c_int(nbas), ctypes.c_int(hermi),
-            ctypes.c_int(nbins), screen_index.ctypes.data_as(ctypes.c_void_p),
-            pair_mask.ctypes.data_as(ctypes.c_void_p),
-            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        wv = numpy.asarray(wv, order='C')
+        wv_ptr = wv.ctypes.data_as(ctypes.c_void_p)
+
+    libdft.VXCdot_aow_ao_sparse_gemm(
+        out.ctypes.data_as(ctypes.c_void_p),
+        ao1.ctypes.data_as(ctypes.c_void_p),
+        ao2.ctypes.data_as(ctypes.c_void_p), wv_ptr,
+        ctypes.c_int(nao), ctypes.c_int(ngrids),
+        ctypes.c_int(nbas), ctypes.c_int(hermi),
+        screen_index.ctypes.data_as(ctypes.c_void_p),
+        ao_loc.ctypes.data_as(ctypes.c_void_p))
     return out
 
 def _dot_ao_dm_sparse(ao, dm, nbins, screen_index, pair_mask, ao_loc):
     '''Returns numpy.dot(ao, dm) while sparsity is explicitly considered.
-    Note the return may be different to _dot_ao_dm. After contracting to another
-    ao matrix, (numpy.dot(ao, dm)*ao).sum(axis=1), their value can be matched up
-    to ~1e-13.
+    The AO values on the grid blocks where screen_index is zero are taken as
+    zero, and the return is only defined on the blocks where the AO's shell is
+    unscreened. After contracting to another ao matrix,
+    (numpy.dot(ao, dm)*ao).sum(axis=1), it matches _dot_ao_dm up to the order of
+    summation.
     '''
     ngrids, nao = ao.shape
     if screen_index is None or pair_mask is None or ngrids % ALIGNMENT_UNIT != 0:
@@ -951,14 +947,13 @@ def _dot_ao_dm_sparse(ao, dm, nbins, screen_index, pair_mask, ao_loc):
     dm = numpy.asarray(dm, order='C')
     out = _empty_aligned((nao, ngrids)).T
 
-    fn = libdft.VXCdot_ao_dm_sparse
-    fn(out.ctypes.data_as(ctypes.c_void_p),
-       ao.ctypes.data_as(ctypes.c_void_p),
-       dm.ctypes.data_as(ctypes.c_void_p),
-       ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
-       ctypes.c_int(nbins), screen_index.ctypes.data_as(ctypes.c_void_p),
-       pair_mask.ctypes.data_as(ctypes.c_void_p),
-       ao_loc.ctypes.data_as(ctypes.c_void_p))
+    libdft.VXCdot_ao_dm_sparse_gemm(
+        out.ctypes.data_as(ctypes.c_void_p),
+        ao.ctypes.data_as(ctypes.c_void_p),
+        dm.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+        screen_index.ctypes.data_as(ctypes.c_void_p),
+        ao_loc.ctypes.data_as(ctypes.c_void_p))
     return out
 
 def _scale_ao_sparse(ao, wv, screen_index, ao_loc, out=None):
