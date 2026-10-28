@@ -467,6 +467,85 @@ void VXC_dcontract_rho(double *rho, double *bra, double *ket,
 }
 }
 
+#define BATCH_CHUNK 128
+/*
+ * rho[k,c,g] = sum_p ao[c,p,g] * bra[k,p,g] for real ao[ncomp,nao,ngrids] and
+ * bra[nset,nao,ngrids]. Each AO value is read once for all nset sets, rather
+ * than once per (set, component) as with VXC_dcontract_rho.
+ */
+void VXC_dcontract_rho_batch(double *rho, double *ao, double *bra,
+                             int ncomp, int nset, int nao, int ngrids)
+{
+        const size_t Ngrids = ngrids;
+        const size_t ao_size = (size_t)nao * ngrids;
+        const int nchunk = (ngrids + BATCH_CHUNK - 1) / BATCH_CHUNK;
+#pragma omp parallel
+{
+        int ichunk, g0, ng, k, c, p, g;
+        double *prho, *pao, *pbra;
+#pragma omp for schedule(static)
+        for (ichunk = 0; ichunk < nchunk; ichunk++) {
+                g0 = ichunk * BATCH_CHUNK;
+                ng = MIN(ngrids - g0, BATCH_CHUNK);
+                for (k = 0; k < nset * ncomp; k++) {
+                        prho = rho + k * Ngrids + g0;
+                        for (g = 0; g < ng; g++) {
+                                prho[g] = 0;
+                        }
+                }
+                for (p = 0; p < nao; p++) {
+                for (k = 0; k < nset; k++) {
+                        pbra = bra + k * ao_size + p * Ngrids + g0;
+                        for (c = 0; c < ncomp; c++) {
+                                pao = ao + c * ao_size + p * Ngrids + g0;
+                                prho = rho + (k * ncomp + c) * Ngrids + g0;
+                                for (g = 0; g < ng; g++) {
+                                        prho[g] += pao[g] * pbra[g];
+                                }
+                        }
+                } }
+        }
+}
+}
+
+/*
+ * aow[k,p,g] = sum_c wv[k,c,g] * ao[c,p,g] for real ao[ncomp,nao,ngrids] and
+ * wv[nset,ncomp,ngrids]. Each AO value is read once for all nset sets.
+ */
+void VXC_dscale_ao_batch(double *aow, double *ao, double *wv,
+                         int ncomp, int nset, int nao, int ngrids)
+{
+        const size_t Ngrids = ngrids;
+        const size_t ao_size = (size_t)nao * ngrids;
+        const int nchunk = (ngrids + BATCH_CHUNK - 1) / BATCH_CHUNK;
+#pragma omp parallel
+{
+        int ichunk, g0, ng, k, c, p, g;
+        double *paow, *pao, *pwv;
+#pragma omp for schedule(static)
+        for (ichunk = 0; ichunk < nchunk; ichunk++) {
+                g0 = ichunk * BATCH_CHUNK;
+                ng = MIN(ngrids - g0, BATCH_CHUNK);
+                for (p = 0; p < nao; p++) {
+                for (k = 0; k < nset; k++) {
+                        paow = aow + k * ao_size + p * Ngrids + g0;
+                        pwv = wv + k * ncomp * Ngrids + g0;
+                        pao = ao + p * Ngrids + g0;
+                        for (g = 0; g < ng; g++) {
+                                paow[g] = pwv[g] * pao[g];
+                        }
+                        for (c = 1; c < ncomp; c++) {
+                                pwv = wv + (k * ncomp + c) * Ngrids + g0;
+                                pao = ao + c * ao_size + p * Ngrids + g0;
+                                for (g = 0; g < ng; g++) {
+                                        paow[g] += pwv[g] * pao[g];
+                                }
+                        }
+                } }
+        }
+}
+}
+
 void VXC_vv10nlc(double *Fvec, double *Uvec, double *Wvec,
                  double *vvcoords, double *coords,
                  double *W0p, double *W0, double *K, double *Kp, double *RpW,

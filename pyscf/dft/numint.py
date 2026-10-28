@@ -806,6 +806,41 @@ def _contract_rho(bra, ket):
         rho += numpy.einsum('ip,ip->p', bra.imag, ket.imag)
     return rho
 
+def _contract_rho_batch(ao, bra):
+    '''rho[k,c,g] = einsum('cgp,kpg->kcg', ao, bra) for real ao[ncomp,ngrids,nao]
+    and bra[nset,nao,ngrids]. Each AO value is read once for all nset sets.
+    '''
+    ncomp, ngrids, nao = ao.shape
+    nset = bra.shape[0]
+    aot = ao.transpose(0,2,1)
+    assert aot.flags.c_contiguous and bra.flags.c_contiguous
+    rho = numpy.empty((nset,ncomp,ngrids))
+    libdft.VXC_dcontract_rho_batch(
+        rho.ctypes.data_as(ctypes.c_void_p),
+        aot.ctypes.data_as(ctypes.c_void_p),
+        bra.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(ncomp), ctypes.c_int(nset), ctypes.c_int(nao),
+        ctypes.c_int(ngrids))
+    return rho
+
+def _scale_ao_batch(ao, wv):
+    '''aow[k,p,g] = einsum('cgp,kcg->kpg', ao, wv) for real ao[ncomp,ngrids,nao]
+    and wv[nset,ncomp,ngrids]. Each AO value is read once for all nset sets.
+    '''
+    ncomp, ngrids, nao = ao.shape
+    nset = wv.shape[0]
+    aot = ao.transpose(0,2,1)
+    assert aot.flags.c_contiguous
+    wv = numpy.asarray(wv, order='C')
+    aow = numpy.empty((nset,nao,ngrids))
+    libdft.VXC_dscale_ao_batch(
+        aow.ctypes.data_as(ctypes.c_void_p),
+        aot.ctypes.data_as(ctypes.c_void_p),
+        wv.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(ncomp), ctypes.c_int(nset), ctypes.c_int(nao),
+        ctypes.c_int(ngrids))
+    return aow
+
 def _tau_dot(mol, bra, ket, wv, mask, shls_slice, ao_loc):
     '''nabla_ao dot nabla_ao
     numpy.einsum('p,xpi,xpj->ij', wv, bra[1:4].conj(), ket[1:4])
@@ -1448,6 +1483,81 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dm, relativity=0, hermi=1,
     vmat = vmat + vmat.T
     return nelec, excsum, vmat
 
+def _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1, nbins,
+                   pair_mask, ao_loc, max_memory):
+    '''nr_rks_fxc for real dms and LDA/GGA kernels. On dense grid blocks the
+    response densities and potentials of all dms are evaluated together: one GEMM
+    gives ao.dm for every dm, and each AO block is read once for all dms by the
+    batched contraction and scaling kernels. Sparse blocks use the per-dm kernels.
+    '''
+    dms = numpy.asarray(dms, order='C')
+    nao = dms.shape[-1]
+    dms = dms.reshape(-1,nao,nao)
+    nset = dms.shape[0]
+    if hermi != 1:
+        # rho1 only depends on the symmetric part of a real dm
+        dms = lib.hermi_sum(dms, axes=(0,2,1)) * .5
+    if xctype == 'LDA':
+        ao_deriv, ncomp = 0, 1
+    else:
+        ao_deriv, ncomp = 1, 4
+    # comp AO arrays plus ao.dm and the scaled AOs of every dm in each block
+    comp = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
+    ngrids = grids.weights.size
+    blksize = int(max_memory*1e6/((comp+1+2*nset)*nao*8*BLKSIZE))
+    blksize = max(4, min(blksize, ngrids//BLKSIZE+1, 1200)) * BLKSIZE
+
+    vmat = numpy.zeros((nset,nao,nao))
+    aow = None
+    p1 = 0
+    for ao, mask, weight, coords \
+            in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
+                             blksize=blksize):
+        p0, p1 = p1, p1 + weight.size
+        _fxc = fxc[:,:,p0:p1]
+        if mask is not None:
+            for i in range(nset):
+                rho1 = make_rho1(i, ao, mask, xctype)
+                if xctype == 'LDA':
+                    wv = weight * rho1 * _fxc[0]
+                    _dot_ao_ao_sparse(ao, ao, wv[0], nbins, mask, pair_mask, ao_loc,
+                                      hermi, vmat[i])
+                else:
+                    wv = numpy.einsum('yg,xyg,g->xg', rho1, _fxc, weight)
+                    wv[0] *= .5  # *.5 for v+v.conj().T
+                    aow = _scale_ao_sparse(ao, wv, mask, ao_loc, out=aow)
+                    _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
+                                      hermi=0, out=vmat[i])
+            continue
+
+        if xctype == 'LDA':
+            ao = ao[numpy.newaxis]
+        ng = weight.size
+        # (ao.dm)^T = dm.ao^T for symmetric dm, in the layout of ao.T
+        ao_dm = lib.dot(dms.reshape(nset*nao,nao), ao[0].T).reshape(nset,nao,ng)
+        rho1 = _contract_rho_batch(ao[:ncomp], ao_dm)
+        ao_dm = None
+        if xctype == 'LDA':
+            wv = weight * rho1[:,0] * _fxc[0,0]
+            for i in range(nset):
+                _dot_ao_wv_ao_hermi(ao, wv[i], vmat[i])
+        else:
+            rho1[:,1:4] *= 2  # *2 for |nabla mu> dm <nu| + |mu> dm <nabla nu|
+            wv = numpy.einsum('kyg,xyg,g->kxg', rho1, _fxc, weight)
+            wv[:,0] *= .5  # *.5 for v+v.conj().T
+            aow_batch = _scale_ao_batch(ao[:4], wv)
+            # vmat[k] += aow_k^T.ao0, the transpose of the per-dm ao0^T.aow_k; the
+            # hermi_sum below makes them equal
+            lib.dot(aow_batch.reshape(nset*nao,ng), ao[0], 1,
+                    vmat.reshape(nset*nao,nao), 1)
+            aow_batch = None
+
+    if xctype == 'GGA':
+        # For real orbitals, K_{ia,bj} = K_{ia,jb}. It simplifies real fxc_jb
+        # [(\nabla mu) nu + mu (\nabla nu)] * fxc_jb = ((\nabla mu) nu f_jb) + h.c.
+        vmat = lib.hermi_sum(vmat, axes=(0,2,1))
+    return vmat
+
 def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
                rho0=None, vxc=None, fxc=None, max_memory=2000, verbose=None):
     '''Contract RKS XC (singlet hessian) kernel matrix with given density matrices
@@ -1524,7 +1634,11 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     pair_mask = mol.get_overlap_cond() < -numpy.log(ni.cutoff)
     vmat = numpy.zeros((nset,nao,nao))
     aow = None
-    if xctype == 'LDA':
+    if xctype in ('LDA', 'GGA') and dtype == numpy.double:
+        vmat = _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1,
+                              nbins, pair_mask, ao_loc, max_memory)
+
+    elif xctype == 'LDA':
         ao_deriv = 0
         for i, ao, mask, wv in block_loop(ao_deriv):
             _dot_ao_ao_sparse(ao, ao, wv[0], nbins, mask, pair_mask, ao_loc,
