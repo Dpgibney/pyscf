@@ -686,9 +686,36 @@ def eval_mat(mol, ao, weight, rho, vxc,
 
     return mat + mat.T.conj()
 
+def _screened_gemm(mol, ao, non0tab, shls_slice, ao_loc):
+    '''Whether the products of real ao[ngrids,nao] over all shells of mol use the
+    sparse kernels for the screen index non0tab (zero where eval_ao zeroed the
+    AO values).'''
+    return (non0tab is not None and shls_slice is not None and ao_loc is not None
+            and ao.dtype == numpy.double and non0tab.ndim == 2
+            and tuple(shls_slice) == (0, mol.nbas) and non0tab.shape[1] == mol.nbas
+            and ao.shape[1] == ao_loc[mol.nbas]
+            and non0tab.shape[0] * BLKSIZE >= ao.shape[0]
+            and (ao.shape[1] > SWITCH_SIZE or _sparse_enough(non0tab)))
+
 def _dot_ao_ao(mol, ao1, ao2, non0tab, shls_slice, ao_loc, hermi=0):
     '''return numpy.dot(ao1.T, ao2)'''
     ngrids, nao = ao1.shape
+    if (_screened_gemm(mol, ao1, non0tab, shls_slice, ao_loc) and
+            ao2.dtype == numpy.double):
+        if not ao1.flags.f_contiguous:
+            ao1 = lib.transpose(ao1)
+        if not ao2.flags.f_contiguous:
+            ao2 = lib.transpose(ao2)
+        vv = numpy.zeros((nao,nao))
+        libdft.VXCdot_aow_ao_sparse_gemm(
+            vv.ctypes.data_as(ctypes.c_void_p),
+            ao1.ctypes.data_as(ctypes.c_void_p),
+            ao2.ctypes.data_as(ctypes.c_void_p), None,
+            ctypes.c_int(nao), ctypes.c_int(ngrids),
+            ctypes.c_int(mol.nbas), ctypes.c_int(hermi),
+            non0tab.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        return vv
     if (nao < SWITCH_SIZE or
         non0tab is None or shls_slice is None or ao_loc is None):
         return lib.dot(ao1.conj().T, ao2)
@@ -718,6 +745,20 @@ def _dot_ao_ao(mol, ao1, ao2, non0tab, shls_slice, ao_loc, hermi=0):
 def _dot_ao_dm(mol, ao, dm, non0tab, shls_slice, ao_loc, out=None):
     '''return numpy.dot(ao, dm)'''
     ngrids, nao = ao.shape
+    if (_screened_gemm(mol, ao, non0tab, shls_slice, ao_loc) and
+            dm.dtype == numpy.double):
+        if not ao.flags.f_contiguous:
+            ao = lib.transpose(ao)
+        dm = numpy.asarray(dm, order='C')
+        vm = numpy.ndarray((ngrids,dm.shape[1]), order='F', buffer=out)
+        libdft.VXCdot_ao_mo_sparse_gemm(
+            vm.ctypes.data_as(ctypes.c_void_p),
+            ao.ctypes.data_as(ctypes.c_void_p),
+            dm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(dm.shape[1]),
+            ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(mol.nbas),
+            non0tab.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        return vm
     if (nao < SWITCH_SIZE or
         non0tab is None or shls_slice is None or ao_loc is None):
         return lib.dot(dm.T, ao.T).T

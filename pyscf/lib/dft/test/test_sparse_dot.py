@@ -430,6 +430,20 @@ class KnownValues(unittest.TestCase):
             ref = np.array(ref)
             self.assertAlmostEqual(abs(rho - ref).max() / abs(ref).max(), 0, 14)
 
+    def test_dot_ao_mo_sparse_gemm(self):
+        ao, ao0, mask, ao_loc, nao, ngrids, nbas = self._random_sparse_ao(1)
+        c = np.random.rand(nao, 17)
+        ref = ao0[0].dot(c)
+        vm = np.full((17, ngrids), np.nan)
+        libdft.VXCdot_ao_mo_sparse_gemm(
+            vm.ctypes.data_as(ctypes.c_void_p),
+            ao.ctypes.data_as(ctypes.c_void_p),
+            c.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(17),
+            ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+            mask.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        self.assertAlmostEqual(abs(vm.T - ref).max(), 0, 12)
+
 def _fill_blocks(mat, ao_loc, mask, val):
     nrow, nbas = mask.shape
     for ib in range(nbas):

@@ -1704,3 +1704,65 @@ void VXCeval_rho_sparse_gemm(double *rho, double *ao, double *dm, int nderiv,
         free(aobuf);
 }
 }
+
+/* vm[k,g] = sum_i ao[i,g] * c[i,k] for real ao[nao,ngrids] and c[nao,nc], i.e.
+ * numpy.dot(ao, c) stored as [nc,ngrids]. Every entry of vm is written. */
+void VXCdot_ao_mo_sparse_gemm(double *vm, double *ao, double *c, int nc,
+                              int nao, int ngrids, int nbas,
+                              uint8_t *screen_index, int *ao_loc)
+{
+        const size_t Ngrids = ngrids;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = MAX(1, _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc));
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *aobuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS + (size_t)nc));
+        double *cbuf = aobuf + max_nao * GEMM_NGRIDS;
+        int igroup, blk0, blk1, ig0, ng, ns, s, k, n;
+        size_t nseg_c;
+        double *pin, *pout;
+// each group writes its own grid columns of vm, so the result does not depend
+// on the schedule
+#pragma omp for schedule(dynamic, 4)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        for (k = 0; k < nc; k++) {
+                                pout = vm + k * Ngrids + ig0;
+                                for (n = 0; n < ng; n++) {
+                                        pout[n] = 0;
+                                }
+                        }
+                        continue;
+                }
+                _gemm_gather(aobuf, ao, NULL, 1, 0, &g, ao_loc, Ngrids, ig0, ng);
+                // cbuf[n,k] = c[i,k] for the n-th AO i of the group
+                pout = cbuf;
+                for (s = 0; s < g.nseg; s++) {
+                        pin = c + g.seg_ao[s] * (size_t)nc;
+                        nseg_c = g.seg_len[s] * (size_t)nc;
+                        for (k = 0; k < nseg_c; k++) {
+                                pout[k] = pin[k];
+                        }
+                        pout += nseg_c;
+                }
+                // vm[k,ig0+m] = sum_n aobuf[n,m] * cbuf[n,k]
+                dgemm_(&TRANS_N, &TRANS_T, &ng, &nc, &ns, &D1, aobuf, &ng,
+                       cbuf, &nc, &D0, vm + ig0, &ngrids);
+        }
+        _gemm_group_free(&g);
+        free(aobuf);
+}
+}
