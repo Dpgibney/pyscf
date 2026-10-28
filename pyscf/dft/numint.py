@@ -278,6 +278,13 @@ def eval_rho1(mol, ao, dm, screen_index=None, xctype='LDA', hermi=0,
     xctype = xctype.upper()
     ngrids = ao.shape[-2]
 
+    ao_loc = mol.ao_loc_nr()
+    if (hermi and screen_index is not None and ngrids % ALIGNMENT_UNIT == 0 and
+            not (xctype == 'MGGA' and with_lapl) and
+            (ao.ndim == 2 and ao.flags.f_contiguous if xctype in ('LDA', 'HF') else
+             _ao_comps_contiguous(ao) and ao.shape[0] >= 4)):
+        return _eval_rho_sparse(ao, dm, screen_index, ao_loc, xctype)
+
     if cutoff is None:
         cutoff = CUTOFF
     cutoff = min(cutoff, .1)
@@ -287,7 +294,6 @@ def eval_rho1(mol, ao, dm, screen_index=None, xctype='LDA', hermi=0,
         ovlp_cond = mol.get_overlap_cond()
         pair_mask = numpy.asarray(ovlp_cond < -numpy.log(cutoff), dtype=numpy.uint8)
 
-    ao_loc = mol.ao_loc_nr()
     if xctype == 'LDA' or xctype == 'HF':
         c0 = _dot_ao_dm_sparse(ao, dm, nbins, screen_index, pair_mask, ao_loc)
         rho = _contract_rho_sparse(ao, c0, screen_index, ao_loc)
@@ -956,6 +962,63 @@ def _dot_ao_dm_sparse(ao, dm, nbins, screen_index, pair_mask, ao_loc):
         ao_loc.ctypes.data_as(ctypes.c_void_p))
     return out
 
+def _ao_comps_contiguous(ao):
+    '''Whether ao[ncomp,ngrids,nao] is stored as consecutive [nao,ngrids] blocks,
+    the layout of eval_ao'''
+    return (ao.ndim == 3 and ao.dtype == numpy.double and ao[0].flags.f_contiguous
+            and ao.strides[0] == ao[0].nbytes)
+
+def _eval_rho_sparse(ao, dm, screen_index, ao_loc, xctype):
+    '''eval_rho1 with hermi=1 and with_lapl=False for a real dm: rho for LDA,
+    rho and nabla rho for GGA, and also tau for meta-GGA. The products of
+    _dot_ao_dm_sparse and _contract_rho_sparse, without storing ao.dm.
+    '''
+    if xctype in ('LDA', 'HF'):
+        nderiv, nrho, ngrids, nao = 0, 1, *ao.shape
+    elif xctype in ('GGA', 'NLC'):
+        nderiv, nrho, ngrids, nao = 1, 4, *ao[0].shape
+    else:
+        nderiv, nrho, ngrids, nao = 2, 5, *ao[0].shape
+    dm = numpy.asarray(dm, order='C')
+    rho = numpy.empty((nrho, ngrids))
+    libdft.VXCeval_rho_sparse_gemm(
+        rho.ctypes.data_as(ctypes.c_void_p),
+        ao.ctypes.data_as(ctypes.c_void_p),
+        dm.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nderiv), ctypes.c_int(nao), ctypes.c_int(ngrids),
+        ctypes.c_int(screen_index.shape[1]),
+        screen_index.ctypes.data_as(ctypes.c_void_p),
+        ao_loc.ctypes.data_as(ctypes.c_void_p))
+    if nderiv == 0:
+        rho = rho[0]
+    return rho
+
+def _dot_ao_aow_sparse(ao, wv, nbins, screen_index, pair_mask, ao_loc, out,
+                       aow=None):
+    '''out += ao[0].T.dot(einsum('xgi,xg->gi', ao, wv)) for real ao[ncomp,ngrids,nao]
+    and wv[ncomp,ngrids]: _scale_ao_sparse followed by _dot_ao_ao_sparse,
+    without storing the scaled AOs on the sparse path. Returns the buffer of the
+    scaled AOs, if one was used, for the next call.
+    '''
+    ngrids, nao = ao[0].shape
+    if (screen_index is None or pair_mask is None or ngrids % ALIGNMENT_UNIT != 0
+            or not _ao_comps_contiguous(ao) or not out.flags.c_contiguous):
+        aow = _scale_ao_sparse(ao, wv, screen_index, ao_loc, out=aow)
+        _dot_ao_ao_sparse(ao[0], aow, None, nbins, screen_index, pair_mask, ao_loc,
+                          hermi=0, out=out)
+        return aow
+    assert wv.dtype == numpy.double
+    wv = numpy.asarray(wv, order='C')
+    libdft.VXCdot_ao_aow_sparse_gemm(
+        out.ctypes.data_as(ctypes.c_void_p),
+        ao.ctypes.data_as(ctypes.c_void_p),
+        wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(wv.shape[0]),
+        ctypes.c_int(nao), ctypes.c_int(ngrids),
+        ctypes.c_int(screen_index.shape[1]),
+        screen_index.ctypes.data_as(ctypes.c_void_p),
+        ao_loc.ctypes.data_as(ctypes.c_void_p))
+    return aow
+
 def _scale_ao_sparse(ao, wv, screen_index, ao_loc, out=None):
     '''Returns einsum('xgi,xg->gi', ao, wv) while sparsity is explicitly considered.
     Note the return may be different to _scale_ao. After contracting to another
@@ -1022,10 +1085,22 @@ def _tau_dot_sparse(bra, ket, wv, nbins, screen_index, pair_mask, ao_loc, out=No
         out = numpy.zeros((nao, nao), dtype=bra.dtype)
     dense = (screen_index is None or pair_mask is None or
              bra.shape[1] % ALIGNMENT_UNIT != 0)
-    if (dense and _same_ao(bra, ket) and bra.dtype == numpy.double and
-            out.flags.c_contiguous):
+    if _same_ao(bra, ket) and bra.dtype == numpy.double and out.flags.c_contiguous:
         # The three products below as one symmetric product
-        return _dot_ao_wv_ao_hermi(ket[1:4], wv, out)
+        if dense:
+            return _dot_ao_wv_ao_hermi(ket[1:4], wv, out)
+        if _ao_comps_contiguous(ket):
+            wv = numpy.asarray(wv, order='C')
+            ngrids, nao = ket[0].shape
+            libdft.VXCdot_ao_wv_ao_sparse_gemm(
+                out.ctypes.data_as(ctypes.c_void_p),
+                ket[1:4].ctypes.data_as(ctypes.c_void_p),
+                wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(3),
+                ctypes.c_int(nao), ctypes.c_int(ngrids),
+                ctypes.c_int(screen_index.shape[1]),
+                screen_index.ctypes.data_as(ctypes.c_void_p),
+                ao_loc.ctypes.data_as(ctypes.c_void_p))
+            return out
     hermi = 1
     _dot_ao_ao_sparse(bra[1], ket[1], wv, nbins, screen_index, pair_mask,
                       ao_loc, hermi, out)
@@ -1214,9 +1289,8 @@ def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
         ao_deriv = 1
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[0] *= .5  # *.5 because vmat + vmat.T at the end
-            aow = _scale_ao_sparse(ao[:4], wv[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[i])
+            aow = _dot_ao_aow_sparse(ao[:4], wv[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[i], aow)
         vmat = lib.hermi_sum(vmat, axes=(0,2,1))
 
     elif xctype == 'MGGA':
@@ -1227,9 +1301,8 @@ def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[0] *= .5  # *.5 for v+v.conj().T
             wv[4] *= .5  # *.5 for 1/2 in tau
-            aow = _scale_ao_sparse(ao[:4], wv[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[i])
+            aow = _dot_ao_aow_sparse(ao[:4], wv[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[i], aow)
             _tau_dot_sparse(ao, ao, wv[4], nbins, mask, pair_mask, ao_loc, out=v1[i])
         vmat = lib.hermi_sum(vmat, axes=(0,2,1))
         vmat += v1
@@ -1343,12 +1416,10 @@ def nr_uks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[:,0] *= .5
             wva, wvb = wv
-            aow = _scale_ao_sparse(ao, wva, mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[0,i])
-            aow = _scale_ao_sparse(ao, wvb, mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[1,i])
+            aow = _dot_ao_aow_sparse(ao, wva, nbins, mask, pair_mask,
+                                     ao_loc, vmat[0,i], aow)
+            aow = _dot_ao_aow_sparse(ao, wvb, nbins, mask, pair_mask,
+                                     ao_loc, vmat[1,i], aow)
         vmat = lib.hermi_sum(vmat.reshape(-1,nao,nao), axes=(0,2,1)).reshape(2,nset,nao,nao)
 
     elif xctype == 'MGGA':
@@ -1361,13 +1432,11 @@ def nr_uks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
             wv[:,0] *= .5
             wv[:,4] *= .5
             wva, wvb = wv
-            aow = _scale_ao_sparse(ao[:4], wva[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[0,i])
+            aow = _dot_ao_aow_sparse(ao[:4], wva[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[0,i], aow)
             _tau_dot_sparse(ao, ao, wva[4], nbins, mask, pair_mask, ao_loc, out=v1[0,i])
-            aow = _scale_ao_sparse(ao[:4], wvb[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[1,i])
+            aow = _dot_ao_aow_sparse(ao[:4], wvb[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[1,i], aow)
             _tau_dot_sparse(ao, ao, wvb[4], nbins, mask, pair_mask, ao_loc, out=v1[1,i])
         vmat = lib.hermi_sum(vmat.reshape(-1,nao,nao), axes=(0,2,1)).reshape(2,nset,nao,nao)
         vmat += v1
@@ -1472,9 +1541,8 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dm, relativity=0, hermi=1,
         p0, p1 = p1, p1 + weight.size
         wv = vv_vxc[:,p0:p1] * weight
         wv[0] *= .5
-        aow = _scale_ao_sparse(ao[:4], wv[:4], mask, ao_loc, out=aow)
-        _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                          hermi=0, out=vmat)
+        aow = _dot_ao_aow_sparse(ao[:4], wv[:4], nbins, mask, pair_mask,
+                                 ao_loc, vmat, aow)
     vmat = vmat + vmat.T
     return nelec, excsum, vmat
 
@@ -1520,9 +1588,8 @@ def _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1, nbins,
                 else:
                     wv = numpy.einsum('yg,xyg,g->xg', rho1, _fxc, weight)
                     wv[0] *= .5  # *.5 for v+v.conj().T
-                    aow = _scale_ao_sparse(ao, wv, mask, ao_loc, out=aow)
-                    _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                                      hermi=0, out=vmat[i])
+                    aow = _dot_ao_aow_sparse(ao, wv, nbins, mask, pair_mask,
+                                             ao_loc, vmat[i], aow)
             continue
 
         if xctype == 'LDA':
@@ -1643,9 +1710,8 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
         ao_deriv = 1
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[0] *= .5  # *.5 for v+v.conj().T
-            aow = _scale_ao_sparse(ao, wv, mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[i])
+            aow = _dot_ao_aow_sparse(ao, wv, nbins, mask, pair_mask,
+                                     ao_loc, vmat[i], aow)
 
         # For real orbitals, K_{ia,bj} = K_{ia,jb}. It simplifies real fxc_jb
         # [(\nabla mu) nu + mu (\nabla nu)] * fxc_jb = ((\nabla mu) nu f_jb) + h.c.
@@ -1658,9 +1724,8 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[0] *= .5  # *.5 for v+v.conj().T
             wv[4] *= .5  # *.5 for 1/2 in tau
-            aow = _scale_ao_sparse(ao, wv[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[i])
+            aow = _dot_ao_aow_sparse(ao, wv[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[i], aow)
             _tau_dot_sparse(ao, ao, wv[4], nbins, mask, pair_mask, ao_loc, out=v1[i])
         vmat = lib.hermi_sum(vmat, axes=(0,2,1))
         vmat += v1
@@ -1922,12 +1987,10 @@ def nr_uks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
         for i, ao, mask, wv in block_loop(ao_deriv):
             wv[:,0] *= .5
             wva, wvb = wv
-            aow = _scale_ao_sparse(ao, wva, mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[0,i])
-            aow = _scale_ao_sparse(ao, wvb, mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[1,i])
+            aow = _dot_ao_aow_sparse(ao, wva, nbins, mask, pair_mask,
+                                     ao_loc, vmat[0,i], aow)
+            aow = _dot_ao_aow_sparse(ao, wvb, nbins, mask, pair_mask,
+                                     ao_loc, vmat[1,i], aow)
 
         # For real orbitals, K_{ia,bj} = K_{ia,jb}. It simplifies real fxc_jb
         # [(\nabla mu) nu + mu (\nabla nu)] * fxc_jb = ((\nabla mu) nu f_jb) + h.c.
@@ -1941,13 +2004,11 @@ def nr_uks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
             wv[:,0] *= .5
             wv[:,4] *= .5
             wva, wvb = wv
-            aow = _scale_ao_sparse(ao[:4], wva[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[0,i])
+            aow = _dot_ao_aow_sparse(ao[:4], wva[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[0,i], aow)
             _tau_dot_sparse(ao, ao, wva[4], nbins, mask, pair_mask, ao_loc, out=v1[0,i])
-            aow = _scale_ao_sparse(ao[:4], wvb[:4], mask, ao_loc, out=aow)
-            _dot_ao_ao_sparse(ao[0], aow, None, nbins, mask, pair_mask, ao_loc,
-                              hermi=0, out=vmat[1,i])
+            aow = _dot_ao_aow_sparse(ao[:4], wvb[:4], nbins, mask, pair_mask,
+                                     ao_loc, vmat[1,i], aow)
             _tau_dot_sparse(ao, ao, wvb[4], nbins, mask, pair_mask, ao_loc, out=v1[1,i])
         vmat = lib.hermi_sum(vmat.reshape(-1,nao,nao), axes=(0,2,1)).reshape(2,nset,nao,nao)
         vmat += v1

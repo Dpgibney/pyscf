@@ -362,6 +362,74 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(np.tril(out) - np.tril(ref)).max(), 0, 11)
         self.assertAlmostEqual(abs(out - out.T).max(), 0, 14)
 
+    def _random_sparse_ao(self, ncomp):
+        np.random.seed(2)
+        ngrids = BLKSIZE*37 + 24
+        dims = np.array([1,3,1,1,1,3,3,6,6,5,7,1,3,1,3,1,1,3,1,1,1,1,3,3,1,1,3,3]*3)
+        ao_loc = np.append(0, np.cumsum(dims)).astype(np.int32)
+        nbas = len(dims)
+        nao = ao_loc[-1]
+        nrow = (ngrids+BLKSIZE-1)//BLKSIZE
+        ao = np.random.rand(ncomp, nao, ngrids).transpose(0,2,1)
+        mask = np.asarray(np.random.rand(nrow, nbas) < .3).astype(np.uint8)
+        mask[:6,nbas//2:] = 0
+        mask[-9:] = 0
+        ao0 = ao.copy()
+        for c in range(ncomp):
+            _fill_zero_blocks(ao0[c], ao_loc, mask)
+            # The values of screened blocks must not be read
+            _fill_blocks(ao[c], ao_loc, mask, np.nan)
+        return ao, ao0, mask, ao_loc, nao, ngrids, nbas
+
+    def test_dot_ao_aow_sparse_gemm(self):
+        ao, ao0, mask, ao_loc, nao, ngrids, nbas = self._random_sparse_ao(4)
+        wv = np.random.rand(4, ngrids) - .5
+        out = np.random.rand(nao, nao)
+        ref = out + ao0[0].T.dot(np.einsum('xgi,xg->gi', ao0, wv))
+        libdft.VXCdot_ao_aow_sparse_gemm(
+            out.ctypes.data_as(ctypes.c_void_p),
+            ao.ctypes.data_as(ctypes.c_void_p),
+            wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(4),
+            ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+            mask.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        self.assertAlmostEqual(abs(out - ref).max(), 0, 11)
+
+    def test_dot_ao_wv_ao_sparse_gemm(self):
+        ao, ao0, mask, ao_loc, nao, ngrids, nbas = self._random_sparse_ao(3)
+        wv = np.random.rand(ngrids) - .3
+        out = np.random.rand(nao, nao)
+        out = out + out.T
+        ref = out + np.einsum('xgi,g,xgj->ij', ao0, wv, ao0)
+        libdft.VXCdot_ao_wv_ao_sparse_gemm(
+            out.ctypes.data_as(ctypes.c_void_p),
+            ao.ctypes.data_as(ctypes.c_void_p),
+            wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(3),
+            ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+            mask.ctypes.data_as(ctypes.c_void_p),
+            ao_loc.ctypes.data_as(ctypes.c_void_p))
+        self.assertAlmostEqual(abs(out - ref).max(), 0, 11)
+        self.assertAlmostEqual(abs(out - out.T).max(), 0, 14)
+
+    def test_eval_rho_sparse_gemm(self):
+        ao, ao0, mask, ao_loc, nao, ngrids, nbas = self._random_sparse_ao(4)
+        dm = np.random.rand(nao, nao)
+        dm = dm + dm.T
+        rho0 = np.einsum('gi,ij,gj->g', ao0[0], dm, ao0[0])
+        drho = np.einsum('xgi,ij,gj->xg', ao0[1:4], dm, ao0[0]) * 2
+        tau = np.einsum('xgi,ij,xgj->g', ao0[1:4], dm, ao0[1:4]) * .5
+        for nderiv, ref in ((0, [rho0]), (1, [rho0, *drho]), (2, [rho0, *drho, tau])):
+            rho = np.empty((len(ref), ngrids))
+            libdft.VXCeval_rho_sparse_gemm(
+                rho.ctypes.data_as(ctypes.c_void_p),
+                ao.ctypes.data_as(ctypes.c_void_p),
+                dm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nderiv),
+                ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+                mask.ctypes.data_as(ctypes.c_void_p),
+                ao_loc.ctypes.data_as(ctypes.c_void_p))
+            ref = np.array(ref)
+            self.assertAlmostEqual(abs(rho - ref).max() / abs(ref).max(), 0, 14)
+
 def _fill_blocks(mat, ao_loc, mask, val):
     nrow, nbas = mask.shape
     for ib in range(nbas):
