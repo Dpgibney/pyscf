@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <math.h>
 #include "config.h"
 #include "gto/grid_ao_drv.h"
 #include "np_helper/np_helper.h"
@@ -332,6 +333,89 @@ void VXCdot_ao_ao(double *vv, double *ao1, double *ao2,
         if (hermi != 0) {
                 NPdsymm_triu(nao, vv, hermi);
         }
+}
+
+#define HERMI_DOT_CHUNK 256
+/*
+ * vv[nao,nao] += sum_c sum_g wv[g] ao[c,i,g] ao[c,j,g] for real ao[ncomp,nao,ngrids].
+ * The product is symmetric, so it is evaluated with dsyrk, which costs half of
+ * the equivalent dgemm. dsyrk needs the form A^T A, so the grid points are split
+ * by the sign of wv and the AO values scaled by sqrt(|wv|): vv += P^T P - N^T N.
+ */
+void VXCdot_ao_wv_ao_hermi(double *vv, double *ao, double *wv,
+                           int ncomp, int nao, int ngrids)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const size_t nn = Nao * Nao;
+        const int nchunk = (ngrids + HERMI_DOT_CHUNK - 1) / HERMI_DOT_CHUNK;
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+#pragma omp parallel
+{
+        const char UPLO = 'U';  // upper triangle in Fortran order: vpriv[i*nao+j] for j <= i
+        const char TRANS_T = 'T';
+        const double D1 = 1;
+        const double DM1 = -1;
+        double *vpriv = calloc(nn, sizeof(double));
+        // Published here so the barrier at the end of the omp for below makes it
+        // visible before NPomp_dsum_reduce_inplace reads vprivs[0].
+        vprivs[omp_get_thread_num()] = vpriv;
+        double *buf = malloc(sizeof(double) * Nao * ncomp * HERMI_DOT_CHUNK);
+        double scale[HERMI_DOT_CHUNK];
+        int idx[HERMI_DOT_CHUNK];
+        int ichunk, ip0, ip1, ip, n, ns, k, sign, i, j, c;
+        double w;
+        double *pbuf, *pao;
+// static: each thread sums a fixed set of chunks, so vv is reproducible for a given
+        // number of threads
+#pragma omp for schedule(static)
+        for (ichunk = 0; ichunk < nchunk; ichunk++) {
+                ip0 = ichunk * HERMI_DOT_CHUNK;
+                ip1 = MIN(ip0 + HERMI_DOT_CHUNK, ngrids);
+                for (sign = 1; sign >= -1; sign -= 2) {
+                        ns = 0;
+                        for (ip = ip0; ip < ip1; ip++) {
+                                w = wv[ip] * sign;
+                                // NaN goes to the positive set so that it propagates
+                                if (w > 0 || (sign > 0 && w != w)) {
+                                        idx[ns] = ip;
+                                        scale[ns] = sqrt(w);
+                                        ns++;
+                                }
+                        }
+                        if (ns == 0) {
+                                continue;
+                        }
+                        // buf[i,c*ns+n] = ao[c,i,idx[n]] * scale[n], i.e. A[k,nao] in Fortran order
+                        k = ns * ncomp;
+                        for (i = 0; i < nao; i++) {
+                                pbuf = buf + i * (size_t)k;
+                                for (c = 0; c < ncomp; c++) {
+                                        pao = ao + (c * Nao + i) * Ngrids;
+                                        for (n = 0; n < ns; n++) {
+                                                pbuf[c*ns+n] = pao[idx[n]] * scale[n];
+                                        }
+                                }
+                        }
+                        dsyrk_(&UPLO, &TRANS_T, &nao, &k, (sign > 0 ? &D1 : &DM1),
+                               buf, &k, &D1, vpriv, &nao);
+                }
+        }
+        NPomp_dsum_reduce_inplace(vprivs, nn);
+        double *vsum = vprivs[0];
+#pragma omp for schedule(static)
+        for (i = 0; i < nao; i++) {
+                for (j = 0; j <= i; j++) {
+                        vv[i*Nao+j] += vsum[i*Nao+j];
+                }
+                for (; j < nao; j++) {
+                        vv[i*Nao+j] += vsum[j*Nao+i];
+                }
+        }
+        free(vpriv);
+        free(buf);
+}
+        free(vprivs);
 }
 
 // 'nip,np->ip'

@@ -836,8 +836,29 @@ def _dot_ao_ao_dense(ao1, ao2, wv, out=None):
         return lib.ddot(ao1.T, ao2, 1, out, 1)
     else:
         assert wv.dtype == numpy.double
+        if _same_ao(ao1, ao2) and out.flags.c_contiguous:
+            return _dot_ao_wv_ao_hermi(ao1[None], wv.ravel(), out)
         ao1 = _scale_ao(ao1, wv.ravel())
         return lib.ddot(ao1.T, ao2, 1, out, 1)
+
+def _same_ao(ao1, ao2):
+    return (ao1.ctypes.data == ao2.ctypes.data and ao1.shape == ao2.shape and
+            ao1.strides == ao2.strides)
+
+def _dot_ao_wv_ao_hermi(ao, wv, out):
+    '''out += einsum('xgi,g,xgj->ij', ao, wv, ao) for real ao[ncomp,ngrids,nao].
+    The product is symmetric, so it is evaluated with dsyrk on one triangle.
+    '''
+    ncomp, ngrids, nao = ao.shape
+    aot = ao.transpose(0,2,1)
+    assert aot.flags.c_contiguous and out.flags.c_contiguous
+    wv = numpy.asarray(wv, order='C')
+    libdft.VXCdot_ao_wv_ao_hermi(
+        out.ctypes.data_as(ctypes.c_void_p),
+        aot.ctypes.data_as(ctypes.c_void_p),
+        wv.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(ncomp), ctypes.c_int(nao), ctypes.c_int(ngrids))
+    return out
 
 def _dot_ao_ao_sparse(ao1, ao2, wv, nbins, screen_index, pair_mask, ao_loc,
                       hermi=0, out=None):
@@ -969,6 +990,12 @@ def _tau_dot_sparse(bra, ket, wv, nbins, screen_index, pair_mask, ao_loc, out=No
     nao = bra.shape[1]
     if out is None:
         out = numpy.zeros((nao, nao), dtype=bra.dtype)
+    dense = (screen_index is None or pair_mask is None or
+             bra.shape[1] % ALIGNMENT_UNIT != 0)
+    if (dense and _same_ao(bra, ket) and bra.dtype == numpy.double and
+            out.flags.c_contiguous):
+        # The three products below as one symmetric product
+        return _dot_ao_wv_ao_hermi(ket[1:4], wv, out)
     hermi = 1
     _dot_ao_ao_sparse(bra[1], ket[1], wv, nbins, screen_index, pair_mask,
                       ao_loc, hermi, out)
