@@ -13,14 +13,14 @@
     limitations under the License.
 
  *
- * Direct J and K of several density matrices at once (the trial densities of
- * TDDFT or CPHF, UKS), from 8-fold symmetric ERIs computed shell quartet by
- * shell quartet. CVHFnr_direct_drv contracts each quartet with one kernel
- * call per dm and per J/K script; here each quartet is contracted with all
- * dms in one pass, the dm index being the innermost dimension:
- * dm[p,q,n] = D_n[p,q] for n < npad, npad a multiple of DM_CHUNK (padded with
- * zeros), and likewise for the outputs. The dms are taken DM_CHUNK at a time,
- * as vectors that stay in registers.
+ * Direct J and K of one or several density matrices at once (SCF, UKS, the
+ * trial densities of TDDFT or CPHF), from 8-fold symmetric ERIs computed shell
+ * quartet by shell quartet. CVHFnr_direct_drv contracts each quartet with one
+ * kernel call per dm and per J/K script; here each quartet is contracted with
+ * all dms in one pass, the dm index being the innermost dimension:
+ * dm[p,q,n] = D_n[p,q] for n < npad, and likewise for the outputs. Several
+ * dms are taken DM_CHUNK at a time, as vectors that stay in registers (npad a
+ * multiple of DM_CHUNK, padded with zeros); a single dm has npad = 1.
  *
  * A quartet (ish jsh|ksh lsh), ish >= jsh, ksh >= lsh, (ish,jsh) >= (ksh,lsh),
  * stands for the index permutations that map it to another quartet:
@@ -77,102 +77,108 @@ typedef struct {
         const int k1 = ao_loc[ksh+1]; \
         const int l1 = ao_loc[lsh+1]
 
-static inline __attribute__((always_inline))
-void _batch_j_body(double *eri, JKBatch *b, int *ao_loc,
-                   int ish, int jsh, int ksh, int lsh)
-{
-        DECLARE_QUARTET;
-        const double c = (ish != jsh ? 1. : .5) * (ksh != lsh ? 1. : .5);
-        const int sbk = ish != ksh || jsh != lsh;
-        double *pe;
-        double e;
-        dvec dkl, acc;
-        int i, j, k, l, n;
-        for (n = 0; n < npad; n += DM_CHUNK) {
-                const double *dms = b->dms + n;
-                double *vj = b->vj + n;
-                pe = eri;
-                for (l = l0; l < l1; l++) {
-                for (k = k0; k < k1; k++) {
-                        dkl = *(dvec *)(dms + k * S + l * npad);
-                        acc = (dvec){0};
-                        for (j = j0; j < j1; j++) {
-                        for (i = i0; i < i1; i++, pe++) {
-                                e = *pe * c;
-                                *(dvec *)(vj + i * S + j * npad) += e * dkl;
-                                acc += e * *(dvec *)(dms + i * S + j * npad);
-                        } }
-                        if (sbk) {
-                                *(dvec *)(vj + k * S + l * npad) += acc;
-                        }
-                } }
-        }
+/* The kernels for dms in chunks of type VT: a vector of DM_CHUNK doubles, or a
+ * double for a single dm (npad = 1) */
+#define DEF_BATCH_KERNELS(SFX, VT) \
+static inline __attribute__((always_inline))                                        \
+void _batch_j_body##SFX(double *eri, JKBatch *b, int *ao_loc,                       \
+                   int ish, int jsh, int ksh, int lsh)                              \
+{                                                                                   \
+        DECLARE_QUARTET;                                                            \
+        const double c = (ish != jsh ? 1. : .5) * (ksh != lsh ? 1. : .5);           \
+        const int sbk = ish != ksh || jsh != lsh;                                   \
+        double *pe;                                                                 \
+        double e;                                                                   \
+        VT dkl, acc;                                                                \
+        int i, j, k, l, n;                                                          \
+        for (n = 0; n < npad; n += (int)(sizeof(VT) / sizeof(double))) {            \
+                const double *dms = b->dms + n;                                     \
+                double *vj = b->vj + n;                                             \
+                pe = eri;                                                           \
+                for (l = l0; l < l1; l++) {                                         \
+                for (k = k0; k < k1; k++) {                                         \
+                        dkl = *(VT *)(dms + k * S + l * npad);                      \
+                        acc = (VT){0};                                              \
+                        for (j = j0; j < j1; j++) {                                 \
+                        for (i = i0; i < i1; i++, pe++) {                           \
+                                e = *pe * c;                                        \
+                                *(VT *)(vj + i * S + j * npad) += e * dkl;          \
+                                acc += e * *(VT *)(dms + i * S + j * npad);         \
+                        } }                                                         \
+                        if (sbk) {                                                  \
+                                *(VT *)(vj + k * S + l * npad) += acc;              \
+                        }                                                           \
+                } }                                                                 \
+        }                                                                           \
+}                                                                                   \
+                                                                                    \
+static inline __attribute__((always_inline))                                        \
+void _batch_k_body##SFX(double *eri, JKBatch *b, int *ao_loc, int hermi,            \
+                   int ish, int jsh, int ksh, int lsh)                              \
+{                                                                                   \
+        DECLARE_QUARTET;                                                            \
+        const double sij = ish != jsh;                                              \
+        const double skl = ksh != lsh;                                              \
+        const double sbk = ish != ksh || jsh != lsh;                                \
+        /* hermi=1: t1..t4 only, halved if not sbk */                               \
+        const double c = (hermi == 1 && !sbk) ? .5 : 1.;                            \
+        const double w2 = sij;                                                      \
+        const double w3 = skl;                                                      \
+        const double w4 = sij * skl;                                                \
+        const double w5 = sbk;                                                      \
+        const double w6 = sbk * skl;                                                \
+        const double w7 = sbk * sij;                                                \
+        const double w8 = sbk * sij * skl;                                          \
+        double *pe;                                                                 \
+        double e;                                                                   \
+        VT dJK, dJL, dLJ, dKJ, a2, a4, a5, a6;                                      \
+        int i, j, k, l, n;                                                          \
+        for (n = 0; n < npad; n += (int)(sizeof(VT) / sizeof(double))) {            \
+                const double *dm = b->dm + n;                                       \
+                double *vk = b->vk + n;                                             \
+                pe = eri;                                                           \
+                for (l = l0; l < l1; l++) {                                         \
+                for (k = k0; k < k1; k++) {                                         \
+                for (j = j0; j < j1; j++) {                                         \
+                        dJK = *(VT *)(dm + j * S + k * npad);                       \
+                        dJL = *(VT *)(dm + j * S + l * npad) * w3;                  \
+                        a2 = (VT){0};                                               \
+                        a4 = (VT){0};                                               \
+                        if (hermi == 1) {                                           \
+                                for (i = i0; i < i1; i++, pe++) {                   \
+                                        e = *pe * c;                                \
+                                        *(VT *)(vk + i * S + l * npad) += e * dJK;  \
+                                        *(VT *)(vk + i * S + k * npad) += e * dJL;  \
+                                        a2 += e * *(VT *)(dm + i * S + k * npad);   \
+                                        a4 += e * *(VT *)(dm + i * S + l * npad);   \
+                                }                                                   \
+                        } else {                                                    \
+                                dLJ = *(VT *)(dm + l * S + j * npad) * w7;          \
+                                dKJ = *(VT *)(dm + k * S + j * npad) * w8;          \
+                                a5 = (VT){0};                                       \
+                                a6 = (VT){0};                                       \
+                                for (i = i0; i < i1; i++, pe++) {                   \
+                                        e = *pe;                                    \
+                                        *(VT *)(vk + i * S + l * npad) += e * dJK;  \
+                                        *(VT *)(vk + i * S + k * npad) += e * dJL;  \
+                                        *(VT *)(vk + k * S + i * npad) += e * dLJ;  \
+                                        *(VT *)(vk + l * S + i * npad) += e * dKJ;  \
+                                        a2 += e * *(VT *)(dm + i * S + k * npad);   \
+                                        a4 += e * *(VT *)(dm + i * S + l * npad);   \
+                                        a5 += e * *(VT *)(dm + l * S + i * npad);   \
+                                        a6 += e * *(VT *)(dm + k * S + i * npad);   \
+                                }                                                   \
+                                *(VT *)(vk + k * S + j * npad) += w5 * a5;          \
+                                *(VT *)(vk + l * S + j * npad) += w6 * a6;          \
+                        }                                                           \
+                        *(VT *)(vk + j * S + l * npad) += w2 * a2;                  \
+                        *(VT *)(vk + j * S + k * npad) += w4 * a4;                  \
+                } } }                                                               \
+        }                                                                           \
 }
 
-static inline __attribute__((always_inline))
-void _batch_k_body(double *eri, JKBatch *b, int *ao_loc, int hermi,
-                   int ish, int jsh, int ksh, int lsh)
-{
-        DECLARE_QUARTET;
-        const double sij = ish != jsh;
-        const double skl = ksh != lsh;
-        const double sbk = ish != ksh || jsh != lsh;
-        // hermi=1: t1..t4 only, halved if not sbk
-        const double c = (hermi == 1 && !sbk) ? .5 : 1.;
-        const double w2 = sij;
-        const double w3 = skl;
-        const double w4 = sij * skl;
-        const double w5 = sbk;
-        const double w6 = sbk * skl;
-        const double w7 = sbk * sij;
-        const double w8 = sbk * sij * skl;
-        double *pe;
-        double e;
-        dvec dJK, dJL, dLJ, dKJ, a2, a4, a5, a6;
-        int i, j, k, l, n;
-        for (n = 0; n < npad; n += DM_CHUNK) {
-                const double *dm = b->dm + n;
-                double *vk = b->vk + n;
-                pe = eri;
-                for (l = l0; l < l1; l++) {
-                for (k = k0; k < k1; k++) {
-                for (j = j0; j < j1; j++) {
-                        dJK = *(dvec *)(dm + j * S + k * npad);
-                        dJL = *(dvec *)(dm + j * S + l * npad) * w3;
-                        a2 = (dvec){0};
-                        a4 = (dvec){0};
-                        if (hermi == 1) {
-                                for (i = i0; i < i1; i++, pe++) {
-                                        e = *pe * c;
-                                        *(dvec *)(vk + i * S + l * npad) += e * dJK;
-                                        *(dvec *)(vk + i * S + k * npad) += e * dJL;
-                                        a2 += e * *(dvec *)(dm + i * S + k * npad);
-                                        a4 += e * *(dvec *)(dm + i * S + l * npad);
-                                }
-                        } else {
-                                dLJ = *(dvec *)(dm + l * S + j * npad) * w7;
-                                dKJ = *(dvec *)(dm + k * S + j * npad) * w8;
-                                a5 = (dvec){0};
-                                a6 = (dvec){0};
-                                for (i = i0; i < i1; i++, pe++) {
-                                        e = *pe;
-                                        *(dvec *)(vk + i * S + l * npad) += e * dJK;
-                                        *(dvec *)(vk + i * S + k * npad) += e * dJL;
-                                        *(dvec *)(vk + k * S + i * npad) += e * dLJ;
-                                        *(dvec *)(vk + l * S + i * npad) += e * dKJ;
-                                        a2 += e * *(dvec *)(dm + i * S + k * npad);
-                                        a4 += e * *(dvec *)(dm + i * S + l * npad);
-                                        a5 += e * *(dvec *)(dm + l * S + i * npad);
-                                        a6 += e * *(dvec *)(dm + k * S + i * npad);
-                                }
-                                *(dvec *)(vk + k * S + j * npad) += w5 * a5;
-                                *(dvec *)(vk + l * S + j * npad) += w6 * a6;
-                        }
-                        *(dvec *)(vk + j * S + l * npad) += w2 * a2;
-                        *(dvec *)(vk + j * S + k * npad) += w4 * a4;
-                } } }
-        }
-}
+DEF_BATCH_KERNELS(_v, dvec)
+DEF_BATCH_KERNELS(_s, double)
 
 // zeroed thread-private sums; huge pages where the OS offers them, as the
 // kernels update rows and columns of these arrays
@@ -200,39 +206,32 @@ typedef void (*FBatchJ)(double *eri, JKBatch *b, int *ao_loc,
 typedef void (*FBatchK)(double *eri, JKBatch *b, int *ao_loc, int hermi,
                         int ish, int jsh, int ksh, int lsh);
 
-static void _batch_j(double *eri, JKBatch *b, int *ao_loc,
-                     int ish, int jsh, int ksh, int lsh)
-{
-        _batch_j_body(eri, b, ao_loc, ish, jsh, ksh, lsh);
+#define DEF_BATCH_WRAPPERS(SFX, BODY, ATTR) \
+ATTR static void _batch_j##SFX(double *eri, JKBatch *b, int *ao_loc, \
+                               int ish, int jsh, int ksh, int lsh) \
+{ \
+        _batch_j_body##BODY(eri, b, ao_loc, ish, jsh, ksh, lsh); \
+} \
+ATTR static void _batch_k##SFX(double *eri, JKBatch *b, int *ao_loc, int hermi, \
+                               int ish, int jsh, int ksh, int lsh) \
+{ \
+        _batch_k_body##BODY(eri, b, ao_loc, hermi, ish, jsh, ksh, lsh); \
 }
-static void _batch_k(double *eri, JKBatch *b, int *ao_loc, int hermi,
-                     int ish, int jsh, int ksh, int lsh)
-{
-        _batch_k_body(eri, b, ao_loc, hermi, ish, jsh, ksh, lsh);
-}
-
+DEF_BATCH_WRAPPERS(_v, _v, )
+DEF_BATCH_WRAPPERS(_s, _s, )
 #if defined(__x86_64__) && defined(__GNUC__)
 // The same kernels compiled for AVX2 and FMA, taken when the CPU has them
 #define HAVE_BATCH_AVX2
-__attribute__((target("avx2,fma")))
-static void _batch_j_avx2(double *eri, JKBatch *b, int *ao_loc,
-                          int ish, int jsh, int ksh, int lsh)
-{
-        _batch_j_body(eri, b, ao_loc, ish, jsh, ksh, lsh);
-}
-__attribute__((target("avx2,fma")))
-static void _batch_k_avx2(double *eri, JKBatch *b, int *ao_loc, int hermi,
-                          int ish, int jsh, int ksh, int lsh)
-{
-        _batch_k_body(eri, b, ao_loc, hermi, ish, jsh, ksh, lsh);
-}
+#define AVX2_FMA __attribute__((target("avx2,fma")))
+DEF_BATCH_WRAPPERS(_v_avx2, _v, AVX2_FMA)
+DEF_BATCH_WRAPPERS(_s_avx2, _s, AVX2_FMA)
 #endif
 
 /*
  * vj, vk: [nao,nao,npad] (either can be NULL), VJ and VK as described at the
  * top: the caller forms vj = VJ + VJ^T and, for hermi=1, vk = VK + VK^T.
  * dm, dms: [nao,nao,npad], D_n and D_n + D_n^T (dms is only read for J),
- * npad a multiple of DM_CHUNK. hermi=1 requires symmetric dms.
+ * npad a multiple of DM_CHUNK, or 1. hermi=1 requires symmetric dms.
  * vhfopt (or NULL) gives the screening of CVHFnr_direct_drv: the same
  * fprescreen is applied to every quartet.
  */
@@ -248,13 +247,13 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         const int di = GTOmax_shell_dim(ao_loc, shls_slice, 4);
         const size_t cache_size = GTOmax_cache_size(intor, shls_slice, 4,
                                                     atm, natm, bas, nbas, env);
-        FBatchJ fj = _batch_j;
-        FBatchK fk = _batch_k;
+        FBatchJ fj = npad == 1 ? _batch_j_s : _batch_j_v;
+        FBatchK fk = npad == 1 ? _batch_k_s : _batch_k_v;
 #ifdef HAVE_BATCH_AVX2
         __builtin_cpu_init();
         if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-                fj = _batch_j_avx2;
-                fk = _batch_k_avx2;
+                fj = npad == 1 ? _batch_j_s_avx2 : _batch_j_v_avx2;
+                fk = npad == 1 ? _batch_k_s_avx2 : _batch_k_v_avx2;
         }
 #endif
         int (*fprescreen)() = CVHFnoscreen;

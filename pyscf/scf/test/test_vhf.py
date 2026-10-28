@@ -98,6 +98,10 @@ class KnownValues(unittest.TestCase):
             vj1, vk1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi)
             self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+            # a single dm
+            vj1, vk1 = _vhf.direct(dms[1], mol._atm, mol._bas, mol._env, None, hermi)
+            self.assertAlmostEqual(abs(vj1 - vj0[1]).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk1 - vk0[1]).max(), 0, 12)
             vj1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi,
                               with_k=False)[0]
             vk1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi,

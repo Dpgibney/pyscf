@@ -426,8 +426,9 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
 
 # Number of density matrices from which direct() contracts each shell quartet
 # with all dms in one pass (nr_direct_batch.c) instead of one kernel call per
-# dm and J/K script
-DIRECT_BATCH_MIN = 2
+# dm and J/K script (CVHFnr_direct_drv). The batched kernels are also faster
+# for a single dm.
+DIRECT_BATCH_MIN = 1
 
 def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
                      cvhfopt=None, cintopt=None):
@@ -458,8 +459,9 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
     null = lib.c_null_ptr()
     for p0 in range(0, n_dm, batch):
         p1 = min(p0 + batch, n_dm)
-        # the kernels take the dms in chunks of 4, the last one padded with zeros
-        npad = (p1 - p0 + 3) // 4 * 4
+        # the kernels take the dms in chunks of 4, the last one padded with
+        # zeros, or a single dm
+        npad = 1 if p1 - p0 == 1 else (p1 - p0 + 3) // 4 * 4
         dm = numpy.zeros((nao, nao, npad))
         dm[:,:,:p1-p0] = dms[p0:p1].transpose(1,2,0)
         dm_sum = dm + dm.transpose(1,0,2) if with_j else None
