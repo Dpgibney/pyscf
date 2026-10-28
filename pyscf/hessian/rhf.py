@@ -117,13 +117,15 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     hcore_deriv = hessobj.hcore_generator(mol)
     s1aa, s1ab, s1a = get_ovlp(mol)
 
-    vj1_diag, vk1_diag = \
-            _get_jk(mol, 'int2e_ipip1', 9, 's2kl',
-                    ['lk->s1ij', dm0,   # vj1
-                     'jk->s1il', dm0],  # vk1
-                    vhfopt=_make_vhfopt(mol, dm0, 'ipip1', 'int2e_ipip1ipip2'))
-    vj1_diag = vj1_diag.reshape(3,3,nao,nao)
-    vk1_diag = vk1_diag.reshape(3,3,nao,nao)
+    # Skip the K-type contractions when no exact exchange is needed (with_k=False)
+    jk_diag = ['lk->s1ij', dm0]           # vj1
+    if with_k:
+        jk_diag += ['jk->s1il', dm0]      # vk1
+    vjk1_diag = _get_jk(mol, 'int2e_ipip1', 9, 's2kl', jk_diag,
+                        vhfopt=_make_vhfopt(mol, dm0, 'ipip1', 'int2e_ipip1ipip2'))
+    vj1_diag = vjk1_diag[0].reshape(3,3,nao,nao)
+    if with_k:
+        vk1_diag = vjk1_diag[1].reshape(3,3,nao,nao)
     t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
 
     ip1ip2_opt = _make_vhfopt(mol, dm0, 'ip1ip2', 'int2e_ip1ip2')
@@ -138,32 +140,40 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
-        vj1, vk1, vk2 = _get_jk(mol, 'int2e_ip1ip2', 9, 's1',
-                                ['ji->s1kl', dm0[:,p0:p1],  # vj1
-                                 'li->s1kj', dm0[:,p0:p1],  # vk1
-                                 'lj->s1ki', dm0         ], # vk2
-                                shls_slice=shls_slice, vhfopt=ip1ip2_opt)
-        vk1[:,:,p0:p1] += vk2
+        jk1 = ['ji->s1kl', dm0[:,p0:p1]]          # vj1
+        if with_k:
+            jk1 += ['li->s1kj', dm0[:,p0:p1],      # vk1
+                    'lj->s1ki', dm0         ]      # vk2
+        vjk1 = _get_jk(mol, 'int2e_ip1ip2', 9, 's1', jk1,
+                       shls_slice=shls_slice, vhfopt=ip1ip2_opt)
+        vj1 = vjk1[0]
+        if with_k:
+            vk1, vk2 = vjk1[1:]
+            vk1[:,:,p0:p1] += vk2
         t1 = log.timer_debug1('contracting int2e_ip1ip2 for atom %d'%ia, *t1)
-        vj2, vk2 = _get_jk(mol, 'int2e_ipvip1', 9, 's2kl',
-                           ['lk->s1ij', dm0         ,  # vj1
-                            'li->s1kj', dm0[:,p0:p1]], # vk1
-                           shls_slice=shls_slice, vhfopt=ipvip1_opt)
-        vj1[:,:,p0:p1] += vj2.transpose(0,2,1) * .5
-        vk1 += vk2.transpose(0,2,1)
+        jk2 = ['lk->s1ij', dm0         ]          # vj1
+        if with_k:
+            jk2 += ['li->s1kj', dm0[:,p0:p1]]      # vk1
+        vjk2 = _get_jk(mol, 'int2e_ipvip1', 9, 's2kl', jk2,
+                       shls_slice=shls_slice, vhfopt=ipvip1_opt)
+        vj1[:,:,p0:p1] += vjk2[0].transpose(0,2,1) * .5
         vj1 = vj1.reshape(3,3,nao,nao)
-        vk1 = vk1.reshape(3,3,nao,nao)
+        if with_k:
+            vk1 += vjk2[1].transpose(0,2,1)
+            vk1 = vk1.reshape(3,3,nao,nao)
         t1 = log.timer_debug1('contracting int2e_ipvip1 for atom %d'%ia, *t1)
 
         ej[i0, i0] += numpy.einsum('xypq,pq->xy', vj1_diag[:,:,p0:p1], dm0[p0:p1])*2
-        ek[i0, i0] += numpy.einsum('xypq,pq->xy', vk1_diag[:,:,p0:p1], dm0[p0:p1])
+        if with_k:
+            ek[i0, i0] += numpy.einsum('xypq,pq->xy', vk1_diag[:,:,p0:p1], dm0[p0:p1])
         e1[i0, i0] -= numpy.einsum('xypq,pq->xy', s1aa[:,:,p0:p1], dme0[p0:p1])*2
 
         for j0, ja in enumerate(atmlst[:i0+1]):
             q0, q1 = aoslices[ja][2:]
             # *2 for +c.c.
             ej[i0, j0] += numpy.einsum('xypq,pq->xy', vj1[:,:,q0:q1], dm0[q0:q1])*4
-            ek[i0, j0] += numpy.einsum('xypq,pq->xy', vk1[:,:,q0:q1], dm0[q0:q1])
+            if with_k:
+                ek[i0, j0] += numpy.einsum('xypq,pq->xy', vk1[:,:,q0:q1], dm0[q0:q1])
             e1[i0, j0] -= numpy.einsum('xypq,pq->xy', s1ab[:,:,p0:p1,q0:q1], dme0[p0:p1,q0:q1])*2
 
             h1ao = hcore_deriv(ia, ja)
