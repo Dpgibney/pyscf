@@ -53,25 +53,14 @@ void NPdgemm(const char trans_a, const char trans_b,
 
         if ((k/m) > 3 && (k/n) > 3) { // parallelize k
 
-                if (beta == 0) {
-                        for (i = 0; i < n; i++) {
-                                for (j = 0; j < m; j++) {
-                                        c[i*Ldc+j] = 0;
-                                }
-                        }
-                } else {
-                        for (i = 0; i < n; i++) {
-                                for (j = 0; j < m; j++) {
-                                        c[i*Ldc+j] *= beta;
-                                }
-                        }
-                }
-
+                const size_t mn = (size_t)m * n;
+                double **cprivs = malloc(sizeof(double *) * omp_get_max_threads());
 #pragma omp parallel private(i, j)
 {
                 double D0 = 0;
-                double *cpriv = malloc(sizeof(double) * (m*n+2));
-                size_t k0, k1, ij;
+                double *cpriv = malloc(sizeof(double) * (mn+2));
+                cprivs[omp_get_thread_num()] = cpriv;
+                size_t k0, k1;
                 NPomp_split(&k0, &k1, k);
                 int dk = k1 - k0;
                 if (dk > 0) {
@@ -86,17 +75,34 @@ void NPdgemm(const char trans_a, const char trans_b,
                         dgemm_(&trans_a, &trans_b, &m, &n, &dk,
                                &alpha, a+astride, &lda, b+bstride, &ldb,
                                &D0, cpriv, &m);
+                } else {
+                        NPdset0(cpriv, mn);
                 }
-#pragma omp critical
-                if (dk > 0) {
-                        for (ij = 0, i = 0; i < n; i++) {
-                        for (j = 0; j < m; j++, ij++) {
-                                c[i*Ldc+j] += cpriv[ij];
-                        } }
+                // Sum the partial products in parallel and in a fixed thread order
+                // (bitwise reproducible for a given thread count) rather than
+                // serially, in arbitrary order, in a critical section.
+                // NPomp_dsum_reduce_inplace reads cprivs[0] before its own barrier.
+#pragma omp barrier
+                NPomp_dsum_reduce_inplace(cprivs, mn);
+                double *csum = cprivs[0];
+                if (beta == 0) {
+#pragma omp for schedule(static)
+                        for (i = 0; i < n; i++) {
+                                for (j = 0; j < m; j++) {
+                                        c[i*Ldc+j] = csum[i*(size_t)m+j];
+                                }
+                        }
+                } else {
+#pragma omp for schedule(static)
+                        for (i = 0; i < n; i++) {
+                                for (j = 0; j < m; j++) {
+                                        c[i*Ldc+j] = c[i*Ldc+j] * beta + csum[i*(size_t)m+j];
+                                }
+                        }
                 }
-
                 free(cpriv);
 }
+                free(cprivs);
 
         } else if (m > n*2) { // parallelize m
 
