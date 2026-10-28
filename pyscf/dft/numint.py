@@ -44,6 +44,10 @@ OCCDROP = getattr(__config__, 'dft_numint_occdrop', 1e-12)
 # If the number of AOs in the system is less than this value, all tensors are
 # treated as dense quantities and contracted by dgemm directly.
 SWITCH_SIZE = getattr(__config__, 'dft_numint_switch_size', 800)
+# Grid blocks take the screened (sparse) kernels while less than this fraction of the
+# shell x block screen index is nonzero. The screened kernels multiply gathered AO blocks
+# with BLAS, so they are faster than the dense products until the index is nearly full.
+SPARSE_THRESHOLD = getattr(__config__, 'dft_numint_sparse_threshold', 0.9)
 
 # Whether to compute density laplacian for meta-GGA functionals
 MGGA_DENSITY_LAPL = False
@@ -900,8 +904,9 @@ def _tau_dot(mol, bra, ket, wv, mask, shls_slice, ao_loc):
     mat += _dot_ao_ao(mol, bra[3], aow, mask, shls_slice, ao_loc)
     return mat
 
-def _sparse_enough(screen_index, threshold=0.5):
-    # TODO: improve the turnover threshold
+def _sparse_enough(screen_index, threshold=None):
+    if threshold is None:
+        threshold = SPARSE_THRESHOLD
     return numpy.count_nonzero(screen_index) < screen_index.size * threshold
 
 def _dot_ao_ao_dense(ao1, ao2, wv, out=None):
