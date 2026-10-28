@@ -13,7 +13,8 @@
 # limitations under the License.
 
 add_library(cvhf SHARED 
-  fill_nr_s8.c nr_incore.c nr_incore_batch.c nr_direct.c optimizer.c nr_direct_dot.c
+  fill_nr_s8.c nr_incore.c nr_incore_batch.c nr_direct.c nr_direct_batch.c
+  optimizer.c nr_direct_dot.c
   time_rev.c r_direct_o1.c rkb_screen.c
   r_direct_dot.c rah_direct_dot.c rha_direct_dot.c
   hessian_screen.c nr_sgx_direct.c nr_sr_vhf.c)

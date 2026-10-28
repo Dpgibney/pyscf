@@ -424,6 +424,69 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
                 lib.hermi_triu(vk[i], hermi, inplace=True)
     return vj, vk
 
+# Number of density matrices from which direct() contracts each shell quartet
+# with all dms in one pass (nr_direct_batch.c) instead of one kernel call per
+# dm and J/K script
+DIRECT_BATCH_MIN = 2
+
+def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
+                     cvhfopt=None, cintopt=None):
+    '''J and K of all dms from s8 ERIs computed on the fly, see nr_direct_batch.c'''
+    n_dm, nao = dms.shape[:2]
+    c_atm = numpy.asarray(atm, dtype=numpy.int32, order='C')
+    c_bas = numpy.asarray(bas, dtype=numpy.int32, order='C')
+    c_env = numpy.asarray(env, dtype=numpy.double, order='C')
+    ao_loc = make_loc(c_bas, intor)
+    if cintopt is None:
+        cintopt = make_cintopt(c_atm, c_bas, c_env, intor)
+    if cvhfopt is None:
+        cvhfopt = lib.c_null_ptr()
+    elif isinstance(cvhfopt, ctypes.Structure):
+        assert cvhfopt.dm_cond and cvhfopt.q_cond
+        cvhfopt = ctypes.byref(cvhfopt)
+    # As for incore(): with hermi=1 the per-dm kernels return the lower
+    # triangle of K for any dm; the symmetric formulation needs symmetric dms.
+    sym_k = with_k and hermi == 1 and (
+        abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
+
+    # Each thread accumulates nao*nao*n doubles for J and for K. Batches of dms
+    # beyond the memory available recompute the integrals.
+    mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 2000) * .5e6
+    batch = max(1, int(mem_avail / (8 * nao**2 * (with_j + with_k) * lib.num_threads())))
+    vj = numpy.empty((n_dm, nao, nao)) if with_j else None
+    vk = numpy.empty((n_dm, nao, nao)) if with_k else None
+    null = lib.c_null_ptr()
+    for p0 in range(0, n_dm, batch):
+        p1 = min(p0 + batch, n_dm)
+        # the kernels take the dms in chunks of 4, the last one padded with zeros
+        npad = (p1 - p0 + 3) // 4 * 4
+        dm = numpy.zeros((nao, nao, npad))
+        dm[:,:,:p1-p0] = dms[p0:p1].transpose(1,2,0)
+        dm_sum = dm + dm.transpose(1,0,2) if with_j else None
+        vjb = numpy.empty_like(dm) if with_j else None
+        vkb = numpy.empty_like(dm) if with_k else None
+        libcvhf.CVHFnr_direct_jk_batch(
+            getattr(libcvhf, intor),
+            null if vjb is None else vjb.ctypes.data_as(ctypes.c_void_p),
+            null if vkb is None else vkb.ctypes.data_as(ctypes.c_void_p),
+            dm.ctypes.data_as(ctypes.c_void_p),
+            null if dm_sum is None else dm_sum.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(npad), ctypes.c_int(1 if sym_k else 0),
+            ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt,
+            c_atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_atm.shape[0]),
+            c_bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_bas.shape[0]),
+            c_env.ctypes.data_as(ctypes.c_void_p))
+        if with_j:
+            vj[p0:p1] = (vjb + vjb.transpose(1,0,2)).transpose(2,0,1)[:p1-p0]
+        if with_k:
+            if sym_k:
+                vkb = vkb + vkb.transpose(1,0,2)
+            vk[p0:p1] = vkb.transpose(2,0,1)[:p1-p0]
+    if with_k and hermi != 0 and not sym_k:
+        for i in range(n_dm):
+            lib.hermi_triu(vk[i], hermi, inplace=True)
+    return vj, vk
+
 # use int2e_sph as cintor, CVHFnrs8_ij_s2kl, CVHFnrs8_jk_s2il as fjk to call
 # direct_mapdm
 def direct(dms, atm, bas, env, vhfopt=None, hermi=0, cart=False,
@@ -446,6 +509,24 @@ def direct(dms, atm, bas, env, vhfopt=None, hermi=0, cart=False,
         cvhfopt = vhfopt._this
         cintopt = vhfopt._cintopt
         intor = vhfopt._intor
+
+    if (n_dm >= DIRECT_BATCH_MIN and (with_j or with_k) and
+            not (optimize_sr and env[gto.PTR_RANGE_OMEGA] < 0)):
+        vj, vk = _direct_s8_batch(intor, dms, hermi, with_j, with_k,
+                                  atm, bas, env, cvhfopt, cintopt)
+        if out is not None:  # [vj, vk] or the one requested
+            out = out.reshape(-1, n_dm, nao, nao)
+            if with_j:
+                out[0] = vj
+                vj = out[0]
+            if with_k:
+                out[int(with_j)] = vk
+                vk = out[int(with_j)]
+        if with_j:
+            vj = vj.reshape(dms_shape)
+        if with_k:
+            vk = vk.reshape(dms_shape)
+        return vj, vk
 
     vj = vk = None
     jkscripts = []

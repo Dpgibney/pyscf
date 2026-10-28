@@ -83,6 +83,34 @@ class KnownValues(unittest.TestCase):
             self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
 
+    def test_direct_s8_batch(self):
+        numpy.random.seed(2)
+        eri1 = ao2mo.restore(1, mf._eri, nao)
+        a = numpy.random.random((5,nao,nao)) - .5
+        vhfopt = scf.RHF(mol).init_direct_scf()
+        for hermi, dms in ((0, a), (1, a + a.transpose(0,2,1)),
+                           (2, a - a.transpose(0,2,1)), (1, a)):
+            vj0 = numpy.einsum('ijkl,nlk->nij', eri1, dms)
+            vk0 = numpy.einsum('ijkl,njk->nil', eri1, dms)
+            if hermi != 0:
+                for v in vk0:
+                    lib.hermi_triu(v, hermi, inplace=True)
+            vj1, vk1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi)
+            self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+            vj1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi,
+                              with_k=False)[0]
+            vk1 = _vhf.direct(dms, mol._atm, mol._bas, mol._env, None, hermi,
+                              with_j=False)[1]
+            self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+            # with the screening of SCF, against the per-dm kernels
+            vj1, vk1 = scf.hf.get_jk(mol, dms, hermi, vhfopt)
+            with lib.temporary_env(_vhf, DIRECT_BATCH_MIN=len(dms)+1):
+                vj2, vk2 = scf.hf.get_jk(mol, dms, hermi, vhfopt)
+            self.assertAlmostEqual(abs(vj1 - vj2).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk1 - vk2).max(), 0, 12)
+
     def test_direct_mapdm(self):
         numpy.random.seed(1)
         dm = numpy.random.random((nao,nao))
