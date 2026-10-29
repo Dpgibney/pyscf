@@ -40,9 +40,15 @@
  * For symmetric dms (hermi=1), t5..t8 are the transposes of t4..t1 when
  * sbk, and are the t1..t4 of other elements of the quartet otherwise. So
  * VK = t1..t4 (times 1/2 if not sbk) and vk = VK + VK^T.
+ *
+ * Semi-direct: a CVHFsdCache keeps the integrals of a set of quartets (see
+ * CVHFsd_index) from the call that first evaluates them, and later calls read
+ * them instead. The screening is the same with and without it, so a call
+ * contracts the same integrals either way.
  */
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <sys/mman.h>
@@ -201,6 +207,219 @@ static double *_alloc_sums(size_t n)
         return calloc(n, sizeof(double));
 }
 
+/*
+ * The stored quartets of pair row ij = ish*(ish+1)/2+jsh are row_q[ij] <= n <
+ * row_q[ij+1], in the order of the loop of CVHFnr_direct_jk_batch, with
+ * shls[n] = ksh << 16 | lsh. Their integral blocks follow each other from
+ * eri + row_d[ij]. state[n] is 0 until a call evaluates the quartet, then 1,
+ * or 2 if intor returned 0 (no integrals above its cutoffs). Every quartet
+ * with q_ij q_kl > thr is stored (thr = inf if that does not apply).
+ */
+typedef struct {
+        double thr;
+        int64_t *row_q;
+        int64_t *row_d;
+        int32_t *shls;
+        int8_t *state;
+        double *eri;
+} CVHFsdCache;
+
+// for each ksh, max over lsh <= ksh of q_cond[ksh,lsh]
+static double *_qmax_k(double *q_cond, int nbas)
+{
+        double *qmax_k = malloc(sizeof(double) * nbas);
+        int ksh, lsh;
+        for (ksh = 0; ksh < nbas; ksh++) {
+                qmax_k[ksh] = 0;
+                for (lsh = 0; lsh <= ksh; lsh++) {
+                        qmax_k[ksh] = MAX(qmax_k[ksh], q_cond[ksh*nbas+lsh]);
+                }
+        }
+        return qmax_k;
+}
+
+/*
+ * Which quartets a CVHFsdCache keeps when it cannot keep all that pass the
+ * Schwarz test (q_ij q_kl > cutoff): those with the largest value, the time
+ * their evaluation takes per integral, times the share of the SCF cycles
+ * expected to need them. The time is a fit to qcint's timings (one Zen 5
+ * core) over the classes of def2-SVP/TZVP and cc-pVDZ molecules, in ns:
+ *      80 + nprim (9 + .5 nroots g + .15 nroots ncart) + 1.3 ncart
+ * with nprim the primitive combinations, nroots the Rys roots, g the size of
+ * the 2D integrals, ncart the Cartesian functions of the quartet. Ranked by
+ * this estimate, a cache of 14 GB holds 0.60 of the integral time of
+ * caffeine/def2-TZVP (0.62 ranked by the measured times, 0.30 ranked by
+ * q_ij q_kl). The share of the cycles is 1 from q_ij q_kl = 1e6 cutoff down,
+ * falling linearly in log(q_ij q_kl) to .05 at the cutoff.
+ * Values are binned in SD_BINS bins of 1/64 of an octave of a piecewise
+ * linear log2 from 2^-32 on.
+ */
+#define SD_BINS         4096
+
+// monotonic, piecewise linear in x and exact at powers of 2 (x > 0)
+static inline double _sd_log2(double x)
+{
+        union {double d; uint64_t i;} u = {x};
+        int e = (int)((u.i >> 52) & 0x7ff) - 1023;
+        u.i = (u.i & 0x000fffffffffffffull) | 0x3ff0000000000000ull;
+        return e + (u.d - 1);
+}
+
+typedef struct {
+        double lq0;     // _sd_log2 of the cutoff
+        double *lq;     // [nbas*nbas] _sd_log2(q_cond)
+        int *l;         // [nbas] angular momentum
+        double *nprim;
+        double *ncart;
+        double *nf;     // functions, ao_loc[i+1] - ao_loc[i]
+} SDValue;
+
+static void _sd_value_init(SDValue *v, double *q_cond, double cutoff,
+                           int *ao_loc, int *bas, int nbas)
+{
+        size_t i;
+        v->lq0 = _sd_log2(cutoff);
+        v->lq = malloc(sizeof(double) * nbas * nbas);
+        for (i = 0; i < (size_t)nbas * nbas; i++) {
+                v->lq[i] = q_cond[i] > 0 ? _sd_log2(q_cond[i]) : -2000.;
+        }
+        v->l = malloc(sizeof(int) * nbas);
+        v->nprim = malloc(sizeof(double) * nbas * 3);
+        v->ncart = v->nprim + nbas;
+        v->nf = v->ncart + nbas;
+        for (i = 0; i < (size_t)nbas; i++) {
+                int l = bas[ANG_OF+i*BAS_SLOTS];
+                v->l[i] = l;
+                v->nprim[i] = bas[NPRIM_OF+i*BAS_SLOTS];
+                v->ncart[i] = (l + 1) * (l + 2) / 2;
+                v->nf[i] = ao_loc[i+1] - ao_loc[i];
+        }
+}
+
+static void _sd_value_del(SDValue *v)
+{
+        free(v->lq);
+        free(v->l);
+        free(v->nprim);
+}
+
+static inline int _sd_bin(SDValue *v, int nbas, int i, int j, int k, int l)
+{
+        double nprim = v->nprim[i] * v->nprim[j] * v->nprim[k] * v->nprim[l];
+        double ncart = v->ncart[i] * v->ncart[j] * v->ncart[k] * v->ncart[l];
+        double nroots = (v->l[i] + v->l[j] + v->l[k] + v->l[l]) / 2 + 1;
+        double g = (v->l[i] + v->l[j] + 1) * (v->l[k] + v->l[l] + 1);
+        double t = 80 + nprim * (9 + .5 * nroots * g + .15 * nroots * ncart) + 1.3 * ncart;
+        // 6 decades of q_ij q_kl
+        double u = (v->lq[i*nbas+j] + v->lq[k*nbas+l] - v->lq0) * (1 / 19.93);
+        u = MIN(MAX(u, .05), 1.);
+        int b = (int)((_sd_log2(t * u / (v->nf[i] * v->nf[j] * v->nf[k] * v->nf[l])) + 32) * 64);
+        return MIN(MAX(b, 0), SD_BINS - 1);
+}
+
+/*
+ * hist[2*b], hist[2*b+1]: the integrals and the number of the quartets with
+ * q_ij q_kl > cutoff in value bin b (see above)
+ */
+void CVHFsd_histogram(double *hist, double *q_cond, double cutoff,
+                      int *ao_loc, int *bas, int nbas)
+{
+        const size_t npair = (size_t)nbas * (nbas + 1) / 2;
+        double *qmax_k = _qmax_k(q_cond, nbas);
+        SDValue v;
+        _sd_value_init(&v, q_cond, cutoff, ao_loc, bas, nbas);
+        memset(hist, 0, sizeof(double) * SD_BINS * 2);
+#pragma omp parallel
+{
+        double *h = calloc(SD_BINS * 2, sizeof(double));
+        size_t ij;
+        int b;
+#pragma omp for schedule(dynamic, 4)
+        for (ij = 0; ij < npair; ij++) {
+                int ish = (int)(sqrt(2*ij+.25) - .5 + 1e-7);
+                int jsh = ij - (size_t)ish*(ish+1)/2;
+                double qij = q_cond[ish*nbas+jsh];
+                int ksh, lsh, lsh1;
+                for (ksh = 0; ksh <= ish; ksh++) {
+                        if (!(qij * qmax_k[ksh] > cutoff)) {
+                                continue;
+                        }
+                        lsh1 = ksh < ish ? ksh + 1 : jsh + 1;
+                        for (lsh = 0; lsh < lsh1; lsh++) {
+                                if (qij * q_cond[ksh*nbas+lsh] > cutoff) {
+                                        b = _sd_bin(&v, nbas, ish, jsh, ksh, lsh);
+                                        h[b*2] += v.nf[ish] * v.nf[jsh] * v.nf[ksh] * v.nf[lsh];
+                                        h[b*2+1] += 1;
+                                }
+                        }
+                }
+        }
+#pragma omp critical
+        {
+                for (b = 0; b < SD_BINS * 2; b++) {
+                        hist[b] += h[b];
+                }
+        }
+        free(h);
+}
+        _sd_value_del(&v);
+        free(qmax_k);
+}
+
+/*
+ * The quartets a CVHFsdCache stores: those with q_ij q_kl > cutoff in value
+ * bins >= bin0 (all of them if bin0 <= 0). nq[ij] and nd[ij] receive the
+ * number of quartets of pair row ij and the size of their integral blocks.
+ * With shls != NULL (and row_q, the prefix sums of nq), shls is filled instead.
+ */
+void CVHFsd_index(int64_t *nq, int64_t *nd, int32_t *shls, int64_t *row_q,
+                  double *q_cond, double cutoff, int bin0,
+                  int *ao_loc, int *bas, int nbas)
+{
+        const size_t npair = (size_t)nbas * (nbas + 1) / 2;
+        double *qmax_k = _qmax_k(q_cond, nbas);
+        SDValue v;
+        _sd_value_init(&v, q_cond, cutoff, ao_loc, bas, nbas);
+        size_t ij;
+#pragma omp parallel for schedule(dynamic, 4)
+        for (ij = 0; ij < npair; ij++) {
+                int ish = (int)(sqrt(2*ij+.25) - .5 + 1e-7);
+                int jsh = ij - (size_t)ish*(ish+1)/2;
+                double qij = q_cond[ish*nbas+jsh];
+                size_t dij = (size_t)(ao_loc[ish+1] - ao_loc[ish]) *
+                                     (ao_loc[jsh+1] - ao_loc[jsh]);
+                int64_t n = 0;
+                int64_t d = 0;
+                int ksh, lsh, lsh1;
+                for (ksh = 0; ksh <= ish; ksh++) {
+                        // q_ij q_kl <= q_ij qmax_k[ksh] for every lsh
+                        if (!(qij * qmax_k[ksh] > cutoff)) {
+                                continue;
+                        }
+                        lsh1 = ksh < ish ? ksh + 1 : jsh + 1;
+                        for (lsh = 0; lsh < lsh1; lsh++) {
+                                if (!(qij * q_cond[ksh*nbas+lsh] > cutoff) ||
+                                    (bin0 > 0 && _sd_bin(&v, nbas, ish, jsh, ksh, lsh) < bin0)) {
+                                        continue;
+                                }
+                                if (shls != NULL) {
+                                        shls[row_q[ij]+n] = ksh << 16 | lsh;
+                                } else {
+                                        d += dij * (ao_loc[ksh+1] - ao_loc[ksh]) *
+                                                   (ao_loc[lsh+1] - ao_loc[lsh]);
+                                }
+                                n++;
+                        }
+                }
+                if (shls == NULL) {
+                        nq[ij] = n;
+                        nd[ij] = d;
+                }
+        }
+        _sd_value_del(&v);
+        free(qmax_k);
+}
+
 typedef void (*FBatchJ)(double *eri, JKBatch *b, int *ao_loc,
                         int ish, int jsh, int ksh, int lsh);
 typedef void (*FBatchK)(double *eri, JKBatch *b, int *ao_loc, int hermi,
@@ -233,11 +452,14 @@ DEF_BATCH_WRAPPERS(_s_avx2, _s, AVX2_FMA)
  * dm, dms: [nao,nao,npad], D_n and D_n + D_n^T (dms is only read for J),
  * npad a multiple of DM_CHUNK, or 1. hermi=1 requires symmetric dms.
  * vhfopt (or NULL) gives the screening of CVHFnr_direct_drv: the same
- * fprescreen is applied to every quartet.
+ * fprescreen is applied to every quartet. sd (or NULL) is a semi-direct cache
+ * for the same intor, molecule and q_cond; it is used with the CVHFnrs8_*
+ * prescreen functions only.
  */
 void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                             double *dm, double *dms, int npad, int hermi,
                             int *ao_loc, CINTOpt *cintopt, CVHFOpt *vhfopt,
+                            CVHFsdCache *sd,
                             int *atm, int natm, int *bas, int nbas, double *env)
 {
         const size_t nao = ao_loc[nbas];
@@ -262,7 +484,6 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         double cutoff = 0;
         double dmax4 = 0;
         size_t i;
-        int ksh, lsh;
         if (vhfopt != NULL) {
                 fprescreen = vhfopt->fprescreen;
                 // Quartets with q_ij q_kl max(4 dm_cond) <= cutoff fail each of
@@ -276,14 +497,11 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                                 dmax4 = MAX(dmax4, vhfopt->dm_cond[i]);
                         }
                         dmax4 *= 4;
-                        qmax_k = malloc(sizeof(double) * nbas);
-                        for (ksh = 0; ksh < nbas; ksh++) {
-                                qmax_k[ksh] = 0;
-                                for (lsh = 0; lsh <= ksh; lsh++) {
-                                        qmax_k[ksh] = MAX(qmax_k[ksh], q_cond[ksh*nbas+lsh]);
-                                }
-                        }
+                        qmax_k = _qmax_k(q_cond, nbas);
                 }
+        }
+        if (q_cond == NULL) {
+                sd = NULL;
         }
         double **vjprivs = malloc(sizeof(double *) * omp_get_max_threads() * 2);
         double **vkprivs = vjprivs + omp_get_max_threads();
@@ -301,9 +519,13 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         }
         double *buf = malloc(sizeof(double) * ((size_t)di*di*di*di + cache_size));
         double *cache = buf + (size_t)di*di*di*di;
+        double *e;
         int shls[4];
         int ish, jsh, ksh, lsh, lsh1;
-        size_t it, ij;
+        int32_t key;
+        size_t it, ij, dij, off;
+        int64_t n = 0;
+        double qij = 0;
         double qthr;
 // dynamic, most expensive pairs first: the cost of a pair is dominated by
 // the integrals and varies widely
@@ -314,15 +536,57 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                 jsh = ij - (size_t)ish*(ish+1)/2;
                 qthr = 0;
                 if (q_cond != NULL) {
-                        if (q_cond[ish*nbas+jsh] * dmax4 == 0) {
+                        qij = q_cond[ish*nbas+jsh];
+                        if (qij * dmax4 == 0) {
                                 continue;
                         }
                         // the margin keeps quartets within rounding of the
                         // cutoff for fprescreen
-                        qthr = cutoff / (q_cond[ish*nbas+jsh] * dmax4) * (1 - 1e-10);
+                        qthr = cutoff / (qij * dmax4) * (1 - 1e-10);
                 }
                 shls[0] = ish;
                 shls[1] = jsh;
+                if (sd != NULL) {
+                        // the stored quartets of the row, in the order of
+                        // the loop below
+                        dij = (size_t)(ao_loc[ish+1] - ao_loc[ish]) *
+                                      (ao_loc[jsh+1] - ao_loc[jsh]);
+                        off = sd->row_d[ij];
+                        for (n = sd->row_q[ij]; n < sd->row_q[ij+1]; n++) {
+                                ksh = sd->shls[n] >> 16;
+                                lsh = sd->shls[n] & 0xffff;
+                                e = sd->eri + off;
+                                off += dij * (ao_loc[ksh+1] - ao_loc[ksh]) *
+                                             (ao_loc[lsh+1] - ao_loc[lsh]);
+                                if (q_cond[ksh*nbas+lsh] <= qthr) {
+                                        continue;
+                                }
+                                shls[2] = ksh;
+                                shls[3] = lsh;
+                                if (!(*fprescreen)(shls, vhfopt, atm, bas, env)) {
+                                        continue;
+                                }
+                                if (sd->state[n] == 0) {
+                                        sd->state[n] = (*intor)(e, NULL, shls, atm, natm,
+                                                                bas, nbas, env, cintopt,
+                                                                cache) ? 1 : 2;
+                                }
+                                if (sd->state[n] == 2) {
+                                        continue;
+                                }
+                                if (vj != NULL) {
+                                        (*fj)(e, &b, ao_loc, ish, jsh, ksh, lsh);
+                                }
+                                if (vk != NULL) {
+                                        (*fk)(e, &b, ao_loc, hermi, ish, jsh, ksh, lsh);
+                                }
+                        }
+                        // fprescreen rejects the quartets with q_ij q_kl <= cutoff
+                        if (sd->thr <= cutoff) {
+                                continue;
+                        }
+                        n = sd->row_q[ij];
+                }
                 for (ksh = 0; ksh <= ish; ksh++) {
                         if (q_cond != NULL && qmax_k[ksh] <= qthr) {
                                 continue;
@@ -331,6 +595,17 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                         for (lsh = 0; lsh < lsh1; lsh++) {
                                 if (q_cond != NULL && q_cond[ksh*nbas+lsh] <= qthr) {
                                         continue;
+                                }
+                                if (sd != NULL) {
+                                        // stored (contracted above): the
+                                        // keys of a row ascend in this order
+                                        key = ksh << 16 | lsh;
+                                        while (n < sd->row_q[ij+1] && sd->shls[n] < key) {
+                                                n++;
+                                        }
+                                        if (n < sd->row_q[ij+1] && sd->shls[n] == key) {
+                                                continue;
+                                        }
                                 }
                                 shls[2] = ksh;
                                 shls[3] = lsh;

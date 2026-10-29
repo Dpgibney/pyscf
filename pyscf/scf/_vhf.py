@@ -15,6 +15,7 @@
 
 import sys
 import ctypes
+import weakref
 import numpy
 from pyscf import lib
 from pyscf import gto
@@ -274,6 +275,134 @@ class _CVHFOpt(ctypes.Structure):
                 ('fprescreen', ctypes.c_void_p),
                 ('r_vkscreen', ctypes.c_void_p)]
 
+class _CVHFsdCache(ctypes.Structure):
+    __slots__ = []
+    _fields_ = [('thr', ctypes.c_double),
+                ('row_q', ctypes.c_void_p),
+                ('row_d', ctypes.c_void_p),
+                ('shls', ctypes.c_void_p),
+                ('state', ctypes.c_void_p),
+                ('eri', ctypes.c_void_p)]
+
+class SemiDirectERI:
+    '''ERIs of a set of s8 shell quartets (ij|kl), kept by direct() from the
+    call that first evaluates them for the calls after (semi-direct SCF). Each
+    call screens the quartets as it would without the cache, so it contracts
+    the same integrals.
+
+    The set holds the quartets that pass the Schwarz test of vhfopt (q_ij*q_kl
+    > its direct_scf_tol) in the value bins >= bin0 of CVHFsd_histogram
+    (nr_direct_batch.c), all of them for bin0 <= 0. The integrals are used only
+    by calls with the atm, bas and env (geometry, basis, range-separation
+    parameter, integral cutoffs) given here, and with the q_cond of vhfopt.
+    '''
+    def __init__(self, vhfopt, atm, bas, env, bin0=0):
+        self._atm = numpy.array(atm, dtype=numpy.int32)
+        self._bas = numpy.array(bas, dtype=numpy.int32)
+        self._env = numpy.array(env, dtype=numpy.double)
+        self._intor = vhfopt._intor
+        self._q_cond = vhfopt.q_cond
+        cutoff = vhfopt.direct_scf_tol
+        self.bin0 = bin0
+        # every quartet with q_ij*q_kl > thr is stored
+        self.thr = cutoff if bin0 <= 0 else numpy.inf
+        nbas = self._bas.shape[0]
+        q_cond = numpy.asarray(vhfopt.q_cond, order='C')
+        ao_loc = make_loc(self._bas, self._intor)
+        npair = nbas * (nbas + 1) // 2
+        nq = numpy.zeros(npair + 1, dtype=numpy.int64)
+        nd = numpy.zeros(npair + 1, dtype=numpy.int64)
+        null = lib.c_null_ptr()
+        args = (q_cond.ctypes, ctypes.c_double(cutoff), ctypes.c_int(bin0),
+                ao_loc.ctypes, self._bas.ctypes, ctypes.c_int(nbas))
+        libcvhf.CVHFsd_index(nq[1:].ctypes, nd[1:].ctypes, null, null, *args)
+        self.row_q = numpy.cumsum(nq)
+        self.row_d = numpy.cumsum(nd)
+        self.shls = numpy.empty(self.row_q[-1], dtype=numpy.int32)
+        libcvhf.CVHFsd_index(null, null, self.shls.ctypes, self.row_q.ctypes, *args)
+        self.state = numpy.zeros(self.row_q[-1], dtype=numpy.int8)
+        # pages are committed as the integrals are first stored
+        self.eri = numpy.empty(self.row_d[-1])
+        self.used = False
+        _semi_direct_live.add(self)
+        self._this = _CVHFsdCache(
+            self.thr, self.row_q.ctypes.data, self.row_d.ctypes.data,
+            self.shls.ctypes.data, self.state.ctypes.data, self.eri.ctypes.data)
+
+    @property
+    def nbytes(self):
+        return (self.eri.nbytes + self.shls.nbytes + self.state.nbytes +
+                self.row_q.nbytes + self.row_d.nbytes)
+
+    def matches(self, vhfopt, atm, bas, env):
+        return (vhfopt._intor == self._intor and vhfopt.q_cond is self._q_cond and
+                numpy.array_equal(env, self._env) and
+                numpy.array_equal(bas, self._bas) and
+                numpy.array_equal(atm, self._atm))
+
+def _semi_direct_size(q_cond, ao_loc, thr):
+    '''Bytes of a SemiDirectERI for all quartets with q_ij*q_kl > thr, from
+    the sorted pair bounds'''
+    nf = numpy.diff(ao_loc)
+    i, j = numpy.tril_indices(len(nf))
+    qp = q_cond[i, j]
+    sp = (nf[i] * nf[j]).astype(numpy.double)
+    idx = numpy.argsort(qp)
+    qs = qp[idx]
+    # sizes and number of the pairs from index m of qs on
+    size_from = numpy.append(numpy.cumsum(sp[idx][::-1])[::-1], 0)
+    count_from = numpy.arange(len(qs), -1, -1)
+    with numpy.errstate(divide='ignore'):
+        m = numpy.searchsorted(qs, thr / qp, side='right')
+    # ordered pairs (ij,kl) with q_ij*q_kl > thr, then the s8 half of them
+    diag = qp * qp > thr
+    nd = ((sp * size_from[m]).sum() + (sp**2)[diag].sum()) / 2
+    nq = (count_from[m].sum() + diag.sum()) / 2
+    return 8 * nd + 5 * nq + 16 * (len(qp) + 1)
+
+_SD_BINS = 4096  # SD_BINS of nr_direct_batch.c
+
+def semi_direct_eri(vhfopt, atm, bas, env, max_memory):
+    '''A SemiDirectERI for vhfopt in at most max_memory MB: for all quartets
+    that pass the Schwarz test or, if they do not fit, for those whose
+    evaluation is estimated to take the most time per byte stored, weighted by
+    how many SCF cycles are expected to need them. None if less than 1% of
+    the integrals fit.'''
+    if (not isinstance(vhfopt, _VHFOpt) or vhfopt.q_cond is None or
+            vhfopt._intor not in ('int2e_sph', 'int2e_cart') or
+            len(bas) >= 1 << 15):
+        return None
+    c_bas = numpy.asarray(bas, dtype=numpy.int32, order='C')
+    nbas = c_bas.shape[0]
+    q_cond = numpy.asarray(vhfopt.q_cond, order='C')
+    ao_loc = make_loc(c_bas, vhfopt._intor)
+    budget = max_memory * 1e6
+    cutoff = vhfopt.direct_scf_tol
+    if _semi_direct_size(q_cond, ao_loc, cutoff) <= budget:
+        return SemiDirectERI(vhfopt, atm, bas, env)
+    hist = numpy.empty((_SD_BINS, 2))
+    libcvhf.CVHFsd_histogram(hist.ctypes, q_cond.ctypes, ctypes.c_double(cutoff),
+                             ao_loc.ctypes, c_bas.ctypes, ctypes.c_int(nbas))
+    # bytes of a cache for the bins from b on: 8 per integral, 5 per quartet
+    # and the row offsets
+    size = numpy.cumsum((8 * hist[:,0] + 5 * hist[:,1])[::-1])[::-1]
+    size += 16 * (nbas * (nbas + 1) // 2 + 1)
+    fits = numpy.nonzero(size <= budget)[0]
+    if len(fits) == 0 or hist[fits[0]:,0].sum() < .01 * hist[:,0].sum():
+        return None
+    return SemiDirectERI(vhfopt, atm, bas, env, max(int(fits[0]), 1))
+
+# Share of the memory left under max_memory that SCF.get_jk gives a
+# SemiDirectERI
+SEMI_DIRECT_MEMORY_FRACTION = .75
+
+_semi_direct_live = weakref.WeakSet()
+
+def semi_direct_pending():
+    '''Bytes of the SemiDirectERIs not yet used, which the resident memory does
+    not include yet'''
+    return sum(sd.eri.nbytes for sd in _semi_direct_live if not sd.used)
+
 ################################################
 # for general DM
 # hermi = 0 : arbitrary
@@ -451,8 +580,10 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
 DIRECT_BATCH_MIN = 1
 
 def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
-                     cvhfopt=None, cintopt=None):
-    '''J and K of all dms from s8 ERIs computed on the fly, see nr_direct_batch.c'''
+                     cvhfopt=None, cintopt=None, sd_eri=None):
+    '''J and K of all dms from s8 ERIs computed on the fly, or kept in sd_eri
+    (a SemiDirectERI for intor, atm, bas, env and cvhfopt), see
+    nr_direct_batch.c'''
     n_dm, nao = dms.shape[:2]
     c_atm = numpy.asarray(atm, dtype=numpy.int32, order='C')
     c_bas = numpy.asarray(bas, dtype=numpy.int32, order='C')
@@ -477,6 +608,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
     vj = numpy.empty((n_dm, nao, nao)) if with_j else None
     vk = numpy.empty((n_dm, nao, nao)) if with_k else None
     null = lib.c_null_ptr()
+    c_sd = null if sd_eri is None else ctypes.byref(sd_eri._this)
     for p0 in range(0, n_dm, batch):
         p1 = min(p0 + batch, n_dm)
         # the kernels take the dms in chunks of 4, the last one padded with
@@ -494,7 +626,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
             dm.ctypes.data_as(ctypes.c_void_p),
             null if dm_sum is None else dm_sum.ctypes.data_as(ctypes.c_void_p),
             ctypes.c_int(npad), ctypes.c_int(1 if sym_k else 0),
-            ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt,
+            ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt, c_sd,
             c_atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_atm.shape[0]),
             c_bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_bas.shape[0]),
             c_env.ctypes.data_as(ctypes.c_void_p))
@@ -504,6 +636,8 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
             if sym_k:
                 vkb = vkb + vkb.transpose(1,0,2)
             vk[p0:p1] = vkb.transpose(2,0,1)[:p1-p0]
+    if sd_eri is not None:
+        sd_eri.used = True
     if with_k and hermi != 0 and not sym_k:
         for i in range(n_dm):
             lib.hermi_triu(vk[i], hermi, inplace=True)
@@ -519,6 +653,7 @@ def direct(dms, atm, bas, env, vhfopt=None, hermi=0, cart=False,
     dms = dms.reshape(-1,nao,nao)
     n_dm = dms.shape[0]
 
+    sd_eri = None
     if vhfopt is None:
         cvhfopt = None
         cintopt = None
@@ -531,11 +666,15 @@ def direct(dms, atm, bas, env, vhfopt=None, hermi=0, cart=False,
         cvhfopt = vhfopt._this
         cintopt = vhfopt._cintopt
         intor = vhfopt._intor
+        # semi-direct ERIs, see SCF.get_jk; for the integrals they were made for
+        sd_eri = getattr(vhfopt, 'semi_direct_eri', None)
+        if sd_eri is not None and not sd_eri.matches(vhfopt, atm, bas, env):
+            sd_eri = None
 
     if (n_dm >= DIRECT_BATCH_MIN and (with_j or with_k) and
             not (optimize_sr and env[gto.PTR_RANGE_OMEGA] < 0)):
         vj, vk = _direct_s8_batch(intor, dms, hermi, with_j, with_k,
-                                  atm, bas, env, cvhfopt, cintopt)
+                                  atm, bas, env, cvhfopt, cintopt, sd_eri)
         if out is not None:  # [vj, vk] or the one requested
             out = out.reshape(-1, n_dm, nao, nao)
             if with_j:

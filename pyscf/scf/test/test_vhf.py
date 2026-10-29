@@ -123,6 +123,55 @@ class KnownValues(unittest.TestCase):
             self.assertAlmostEqual(abs(vj1 - vj2).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk2).max(), 0, 12)
 
+    def test_semi_direct(self):
+        numpy.random.seed(3)
+        a = numpy.random.random((3,nao,nao)) - .5
+        dms = a + a.transpose(0,2,1)
+        ref = scf.RHF(mol).init_direct_scf()
+        full = _vhf._semi_direct_size(ref.q_cond, mol.ao_loc_nr(), ref.direct_scf_tol)
+        # all quartets that pass the Schwarz test, then those with the largest bounds
+        for mem in (full, full * .4):
+            vhfopt = scf.RHF(mol).init_direct_scf()
+            sd = _vhf.semi_direct_eri(vhfopt, mol._atm, mol._bas, mol._env, mem / 1e6)
+            self.assertEqual(sd.thr == ref.direct_scf_tol, mem == full)
+            self.assertTrue(sd.nbytes <= mem)
+            vhfopt.semi_direct_eri = sd
+            # the first call stores the integrals, the others read them
+            for d, hermi in ((dms * 1e-6, 1), (dms, 1), (dms[0], 1), (a, 0)):
+                vj0, vk0 = scf.hf.get_jk(mol, d, hermi, ref)
+                vj1, vk1 = scf.hf.get_jk(mol, d, hermi, vhfopt)
+                self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+                self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+                for prescreen, k in (('CVHFnrs8_vj_prescreen', 0), ('CVHFnrs8_vk_prescreen', 1)):
+                    with lib.temporary_env(vhfopt, prescreen=prescreen):
+                        v1 = scf.hf.get_jk(mol, d, hermi, vhfopt, k == 0, k == 1)[k]
+                    self.assertAlmostEqual(abs(v1 - (vj0, vk0)[k]).max(), 0, 12)
+            self.assertTrue(sd.used)
+            self.assertTrue((sd.state != 0).all())
+            # integrals with other parameters do not take them
+            with mol.with_range_coulomb(.3):
+                vj0, vk0 = scf.hf.get_jk(mol, dms, 1, ref)
+                vj1, vk1 = scf.hf.get_jk(mol, dms, 1, vhfopt)
+            self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+            self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+
+        # SCF without the ERIs in memory
+        mf1 = scf.RHF(mol)
+        mf1._is_mem_enough = lambda: False
+        e1 = mf1.kernel()
+        self.assertTrue(mf1._opt[None].semi_direct_eri.used)
+        self.assertAlmostEqual(e1, mf.e_tot, 10)
+        # switched off: the integrals are released
+        mf1.semi_direct = False
+        mf1.get_jk()
+        self.assertFalse(hasattr(mf1._opt[None], 'semi_direct_eri'))
+        mf1 = scf.RHF(mol)
+        mf1._is_mem_enough = lambda: False
+        mf1.semi_direct = False
+        mf1.kernel()
+        self.assertFalse(hasattr(mf1._opt[None], 'semi_direct_eri'))
+        self.assertAlmostEqual(mf1.e_tot, e1, 10)
+
     def test_direct_mapdm(self):
         numpy.random.seed(1)
         dm = numpy.random.random((nao,nao))
