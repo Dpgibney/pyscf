@@ -316,19 +316,64 @@ class KnownValues(unittest.TestCase):
                 out.append(ni.nr_rks_fxc(mol, grids, xc, dm, dm1, hermi=0))
             out.append(ni.nr_uks_fxc(mol, grids, 'pbe', (dm, dm*.5), (dm1, dm1*.5)))
             return out
-        with lib.temporary_env(numint, _sparse_reader_kw=lambda ni, *dms: {}):
+        # the block_loop path, not the kernels that compute AO values in place
+        with lib.temporary_env(numint, FUSED_XC=False,
+                               _sparse_reader_kw=lambda ni, *dms: {}):
             ref = xc_mats()
         # Not lib.temporary_env: getattr would restore the bare function, not the
         # staticmethod
         stock_eval_ao = numint.NumInt.__dict__['eval_ao']
         numint.NumInt.eval_ao = staticmethod(nan_eval_ao)
         try:
-            out = xc_mats()
+            with lib.temporary_env(numint, FUSED_XC=False):
+                out = xc_mats()
         finally:
             numint.NumInt.eval_ao = stock_eval_ao
         self.assertTrue(nan_count[0] > 0)
         for a, b in zip(ref, out):
             self.assertTrue(numpy.array_equal(a, b))
+
+    def test_fused_xc(self):
+        # The kernels that compute the AO values in place (numint._FusedXC) give
+        # the results of the block_loop path bit for bit
+        numpy.random.seed(4)
+        nao = mol.nao_nr()
+        grids = mf.grids
+        mo = numpy.linalg.qr(numpy.random.random((nao,nao)))[0]
+        occ = numpy.zeros(nao)
+        occ[:6] = 2
+        dm = numpy.einsum('pi,i,qi->pq', mo, occ, mo)
+        dm_mo = lib.tag_array(dm, mo_coeff=mo, mo_occ=occ)
+        dmu = lib.tag_array(numpy.asarray((dm, dm*.5)), mo_coeff=numpy.asarray((mo, mo)),
+                            mo_occ=numpy.asarray((occ*.5, occ*.25)))
+        dm1 = numpy.random.random((2,nao,nao)) * .1
+        self.assertIsNotNone(numint._fused_xc(numint.NumInt(), mol, grids, nao, 'GGA',
+                                              2000, (dm,)))
+        def flatten(x):
+            if isinstance(x, (tuple, list)):
+                return [a for y in x for a in flatten(y)]
+            return [numpy.asarray(x)]
+        def xc_results():
+            ni = numint.NumInt()
+            out = []
+            for xc in ('lda,vwn', 'pbe', 'r2scan'):
+                out.append(ni.nr_rks(mol, grids, xc, dm_mo))
+                out.append(ni.nr_rks(mol, grids, xc, dm1, hermi=0))
+                out.append(ni.nr_uks(mol, grids, xc, dmu))
+                out.append(ni.nr_rks_fxc(mol, grids, xc, dm, dm1, hermi=0))
+                out.append(ni.nr_uks_fxc(mol, grids, xc, (dm, dm*.5), (dm1, dm1*.5)))
+                out.append(ni.cache_xc_kernel(mol, grids, xc, mo, occ))
+                out.append(ni.cache_xc_kernel(mol, grids, xc, (mo, mo), (occ*.5, occ*.25), spin=1))
+            return flatten(out)
+        with lib.temporary_env(numint, FUSED_XC=False):
+            ref = xc_results()
+        for env in ({}, {'RADIAL_CACHE_FRACTION': 0}):
+            grids._fused_ao_data = None
+            with lib.temporary_env(numint, **env):
+                out = xc_results()
+            self.assertEqual(grids._fused_ao_data.radial is None, bool(env))
+            for a, b in zip(ref, out):
+                self.assertTrue(numpy.array_equal(a, b))
 
     def test_rks_vxc(self):
         numpy.random.seed(10)
