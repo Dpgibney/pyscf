@@ -96,7 +96,11 @@ def get_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     ao_loc = mol.ao_loc_nr()
 
     vmat = numpy.zeros((2,3,nao,nao))
-    if xctype == 'LDA':
+    fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (dms,))
+    if fused is not None:
+        fused.get_vxc_grad(ni, xc_code, xctype, dms, hermi, 1, vmat)
+
+    elif xctype == 'LDA':
         ao_deriv = 1
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):

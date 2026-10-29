@@ -375,6 +375,45 @@ class KnownValues(unittest.TestCase):
             for a, b in zip(ref, out):
                 self.assertTrue(numpy.array_equal(a, b))
 
+    def test_dot_sets_aow_ao(self):
+        numpy.random.seed(5)
+        coords = mf.grids.coords[:dft.gen_grid.BLKSIZE*20]
+        ngrids = len(coords)
+        mask = mf.grids.non0tab
+        ao = numint.eval_ao(mol, coords, 1, non0tab=mask)
+        for nwv in (1, 4, 5):
+            wv = numpy.random.random((3,nwv,ngrids)) - .5
+            out = numpy.random.random((3,nao,nao))
+            ref = out.copy()
+            nw = min(nwv, 4)
+            for k in range(3):
+                ref[k] += numpy.einsum('xgi,xg->gi', ao[:nw], wv[k,:nw]).T.dot(ao[0])
+                if nwv == 5:
+                    ref[k] += numpy.einsum('xgi,g,xgj->ij', ao[1:4], wv[k,4], ao[1:4])
+            numint._dot_sets_aow_ao(out, ao, wv, mask, mol.ao_loc_nr())
+            self.assertAlmostEqual(abs(out - ref).max(), 0, 12)
+
+    def test_fused_xc_deriv(self):
+        # The XC terms of gradients and of the Hessian's AO-diagonal part with the
+        # AO values computed in the kernels (numint._FusedXC.dot_terms)
+        from pyscf.grad import rks as rks_grad
+        from pyscf.hessian import rks as rks_hess
+        water = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587',
+                      basis='def2-svp', verbose=0)
+        for xc in ('lda,vwn', 'pbe', 'r2scan'):
+            mf1 = dft.RKS(water, xc=xc).run(conv_tol=1e-6)
+            dm = mf1.make_rdm1()
+            hobj = mf1.Hessian()
+            self.assertIsNotNone(numint._fused_xc(mf1._numint, water, mf1.grids, water.nao,
+                                                  'GGA', 2000, (dm,)))
+            def xc_terms():
+                return (rks_grad.get_vxc(mf1._numint, water, mf1.grids, xc, dm)[1],
+                        rks_hess._get_vxc_diag(hobj, mf1.mo_coeff, mf1.mo_occ, 2000))
+            with lib.temporary_env(numint, FUSED_XC=False):
+                ref = xc_terms()
+            for a, b in zip(ref, xc_terms()):
+                self.assertAlmostEqual(abs(a - b).max(), 0, 12)
+
     def test_rks_vxc(self):
         numpy.random.seed(10)
         nao = mol.nao_nr()

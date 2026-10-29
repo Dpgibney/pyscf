@@ -1151,6 +1151,46 @@ class _FusedXC:
                 ctypes.c_int(_FUSED_XCTYPE[xctype]), ctypes.c_int(hermi),
                 *self._args(ip0, ip1, 0 if xctype == 'LDA' else 1))
 
+    def dot_terms(self, ip0, ip1, wv, terms, out):
+        '''out[k,o] += the sums of products of weighted AO values given by terms
+        (see _xc_grad_terms) for the weights wv[k,:,ip0:ip1] on the block'''
+        kets, bras, deriv = terms
+        wv = numpy.asarray(wv, order='C')
+        assert out.flags.c_contiguous and out.dtype == numpy.double
+        nset, nwv = wv.shape[:2]
+        nout, nseg = bras.shape[:2]
+        # Each thread keeps nout [nao,nao] matrices per set
+        blk = int(self.max_memory*.5e6 / (lib.num_threads()*nout*self.nao**2*8))
+        for i0, i1 in lib.prange(0, nset, max(1, blk)):
+            libdft.VXCfused_dot_terms(
+                out[i0:i1].ctypes.data_as(ctypes.c_void_p),
+                wv[i0:i1].ctypes.data_as(ctypes.c_void_p), ctypes.c_int(i1-i0),
+                ctypes.c_int(nwv), ctypes.c_int(nout), ctypes.c_int(nseg),
+                kets.ctypes.data_as(ctypes.c_void_p),
+                bras.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(deriv),
+                *self._args(ip0, ip1, deriv))
+
+    def get_vxc_grad(self, ni, xc_code, xctype, dms, hermi, spin, vmat):
+        '''The loop of grad.rks.get_vxc (spin=0) and grad.uks.get_vxc (spin=1,
+        dms of alpha and beta); adds to vmat[nset,3,nao,nao] (spin=1: nset=2).'''
+        terms = _xc_grad_terms(xctype)
+        make_rho = self.rho_evaluator(ni, [dms], hermi, xctype)
+        for ip0, ip1 in self.blocks:
+            weight = self.grids.weights[ip0:ip1]
+            rho = make_rho(ip0, ip1)[0]
+            if spin == 0:
+                wv = numpy.empty((len(rho), _FUSED_NRHO[xctype], ip1-ip0))
+                for i in range(len(rho)):
+                    wv[i] = weight * ni.eval_xc_eff(xc_code, rho[i], 1, xctype=xctype)[1]
+            else:
+                wv = weight * ni.eval_xc_eff(xc_code, (rho[0], rho[1]), 1, xctype=xctype)[1]
+            if xctype != 'LDA':
+                wv[:,0] *= .5
+            if xctype == 'MGGA':
+                wv[:,4] *= .5
+            self.dot_terms(ip0, ip1, wv, terms, vmat)
+        return vmat
+
     def nr_rks(self, ni, xc_code, xctype, dms, hermi, nelec, excsum, vmat):
         '''The loop of nr_rks; adds to nelec, excsum and vmat[nset,nao,nao],
         and returns the XC matrices as nr_rks does.'''
@@ -1261,6 +1301,59 @@ class _FusedXC:
         if xctype == 'MGGA':
             vmat += vtau
         return vmat
+
+# The second (4..9: xx xy xz yy yz zz) and third (10..19: xxx xxy xxz xyy xyz xzz yyy
+# yyz yzz zzz) derivatives of eval_ao: _AO_D2[x][y] is d_x d_y, and _AO_D3[i][z] is d_z of
+# the i-th second derivative
+_AO_D2 = ((4, 5, 6), (5, 7, 8), (6, 8, 9))
+_AO_D3 = ((10, 11, 12), (11, 13, 14), (12, 14, 15), (13, 16, 17), (14, 17, 18), (15, 18, 19))
+
+def _pack_terms(kets, bras, deriv):
+    '''The terms of VXCfused_dot_terms from lists of (AO component, weight)
+    pairs (weight -1: none), with the AO derivative order they need'''
+    def pack(term):
+        t = numpy.zeros(9, dtype=numpy.int32)
+        t[0] = len(term)
+        t[1:1+2*len(term)] = numpy.ravel(term)
+        return t
+    return (numpy.asarray([pack(t) for t in kets]),
+            numpy.asarray([[pack(t) for t in b] for b in bras]), deriv)
+
+def _xc_grad_terms(xctype):
+    '''The terms of the XC part of nuclear gradients (grad.rks.get_vxc), out[x]:
+    LDA: ao[1+x]^T (wv[0] ao[0]);
+    GGA: ao[1+x]^T sum_c wv[c] ao[c] + (wv[0] ao[1+x] + sum_y wv[1+y] d_y ao[1+x])^T ao[0];
+    meta-GGA: also sum_k (d_k ao[1+x])^T wv[4] ao[1+k].'''
+    if xctype == 'LDA':
+        kets = [[(0, 0)]]
+        bras = [[[(1+x, -1)]] for x in range(3)]
+        return _pack_terms(kets, bras, 1)
+    kets = [[(c, c) for c in range(4)], [(0, -1)]]
+    bras = [[[(1+x, -1)], [(1+x, 0)] + [(_AO_D2[x][y], 1+y) for y in range(3)]]
+            for x in range(3)]
+    if xctype == 'MGGA':
+        kets += [[(1+k, 4)] for k in range(3)]
+        for x in range(3):
+            bras[x] += [[(_AO_D2[k][x], -1)] for k in range(3)]
+    return _pack_terms(kets, bras, 2)
+
+def _xc_hess_diag_terms(xctype):
+    '''The terms of the AO-diagonal XC part of Hessians (hessian.rks._get_vxc_diag),
+    out[i] for the second derivatives i = xx, xy, xz, yy, yz, zz:
+    LDA: (d_i ao)^T (wv[0] ao[0]);
+    GGA: (d_i ao)^T sum_c wv[c] ao[c] + (sum_y wv[1+y] d_y d_i ao)^T ao[0];
+    meta-GGA: also sum_k (d_k d_i ao)^T wv[4] ao[1+k].'''
+    if xctype == 'LDA':
+        kets = [[(0, 0)]]
+        bras = [[[(4+i, -1)]] for i in range(6)]
+        return _pack_terms(kets, bras, 2)
+    kets = [[(c, c) for c in range(4)], [(0, -1)]]
+    bras = [[[(4+i, -1)], [(_AO_D3[i][y], 1+y) for y in range(3)]] for i in range(6)]
+    if xctype == 'MGGA':
+        kets += [[(1+k, 4)] for k in range(3)]
+        for i in range(6):
+            bras[i] += [[(_AO_D3[i][k], -1)] for k in range(3)]
+    return _pack_terms(kets, bras, 3)
 
 def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None):
     '''A _FusedXC for the blocks NumInt.block_loop would give the callers of
@@ -1459,6 +1552,31 @@ def _dot_ao_aow_sparse(ao, wv, nbins, screen_index, pair_mask, ao_loc, out,
         screen_index.ctypes.data_as(ctypes.c_void_p),
         ao_loc.ctypes.data_as(ctypes.c_void_p))
     return aow
+
+def _dot_sets_aow_ao(out, ao, wv, screen_index, ao_loc):
+    '''out[k] += einsum('xgi,xg,gj->ij', ao[:nw], wv[k,:nw], ao[0]) for each set k,
+    nw = min(nwv, 4), and for nwv = 5 also the meta-GGA tau term
+    einsum('xgi,g,xgj->ij', ao[1:4], wv[k,4], ao[1:4]), for real ao[ncomp,ngrids,nao]
+    of eval_ao, wv[nset,nwv,ngrids] and out[nset,nao,nao] (C order). The AO values
+    are read once for all sets, and no weighted AO array is stored.
+    screen_index=None for blocks without screening.
+    '''
+    ngrids, nao = ao[0].shape
+    nbas = len(ao_loc) - 1
+    nset, nwv = wv.shape[:2]
+    if screen_index is None:
+        screen_index = numpy.ones(((ngrids+BLKSIZE-1)//BLKSIZE, nbas), dtype=numpy.uint8)
+    assert _ao_comps_contiguous(ao) and ao.shape[0] >= (1 if nwv == 1 else 4)
+    assert out.flags.c_contiguous and out.dtype == numpy.double and len(out) == nset
+    wv = numpy.asarray(wv, order='C')
+    ao_loc = numpy.asarray(ao_loc, dtype=numpy.int32)
+    libdft.VXCdot_sets_aow_ao_sparse(
+        out.ctypes.data_as(ctypes.c_void_p), ao.ctypes.data_as(ctypes.c_void_p),
+        wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nset), ctypes.c_int(nwv),
+        ctypes.c_int(nao), ctypes.c_int(ngrids), ctypes.c_int(nbas),
+        screen_index.ctypes.data_as(ctypes.c_void_p),
+        ao_loc.ctypes.data_as(ctypes.c_void_p))
+    return out
 
 def _scale_ao_sparse(ao, wv, screen_index, ao_loc, out=None):
     '''Returns einsum('xgi,xg->gi', ao, wv) while sparsity is explicitly considered.

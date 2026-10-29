@@ -50,9 +50,8 @@
 #include "vhf/fblas.h"
 #include "nr_numint_gemm.h"
 
-// The AO values of the deriv-1 kernels: value and x, y, z derivatives
-#define NCOMP_MAX       4
-#define EVAL_WORK       (BLKSIZE*(3 + NPRIMAX*2 + NCTR_CART*NCOMP_MAX))
+// The work buffer of _eval_group for ncomp AO components
+#define EVAL_WORK(ncomp)        (BLKSIZE*(3 + NPRIMAX*2 + NCTR_CART*(ncomp)))
 #define FUSED_LDA       0
 #define FUSED_GGA       1
 #define FUSED_MGGA      2
@@ -65,26 +64,42 @@ void GTOshell_eval_grid_cart_deriv1(double *gto, double *ri, double *exps,
                                     double *coord, double *alpha, double *coeff,
                                     double *env, int l, int np, int nc,
                                     size_t nao, size_t ngrids, size_t blksize);
+void GTOshell_eval_grid_cart_deriv2(double *gto, double *ri, double *exps,
+                                    double *coord, double *alpha, double *coeff,
+                                    double *env, int l, int np, int nc,
+                                    size_t nao, size_t ngrids, size_t blksize);
+void GTOshell_eval_grid_cart_deriv3(double *gto, double *ri, double *exps,
+                                    double *coord, double *alpha, double *coeff,
+                                    double *env, int l, int np, int nc,
+                                    size_t nao, size_t ngrids, size_t blksize);
+
+// The functions of GTOval_sph_deriv0..3: contracted (deriv 0, 1) or primitive
+// (deriv 2, 3) exponentials, and the polynomial parts
+static const FPtr_exp _eval_exp[] = {
+        GTOcontract_exp0, GTOcontract_exp1, GTOprim_exp, GTOprim_exp};
+static const FPtr_eval _eval_poly[] = {
+        GTOshell_eval_grid_cart, GTOshell_eval_grid_cart_deriv1,
+        GTOshell_eval_grid_cart_deriv2, GTOshell_eval_grid_cart_deriv3};
 double *CINTc2s_ket_sph1(double *sph, double *cart, int lds, int ldc, int l);
 double CINTcommon_fac_sp(int l);
 
 /*
- * aobuf[c,n,k] for c < 1 (deriv 0) or c < 4 (deriv 1), n < g->nao and k < ng:
- * the AO value (c = 0) or its x, y, z derivative of the n-th AO of group g at
- * grid point blk0*BLKSIZE+k of the block, as eval_ao (GTOval_sph_deriv0/1)
- * computes it, and zero on the blocks where the shell of the AO is screened.
+ * aobuf[c,n,k] for the components c < (deriv+1)(deriv+2)(deriv+3)/6, deriv <= 3,
+ * n < g->nao and k < ng: the AO value (c = 0) or its derivative c of the n-th AO
+ * of group g at grid point blk0*BLKSIZE+k of the block, as eval_ao
+ * (GTOval_sph_deriv0..3) computes it, and zero on the blocks where the shell of
+ * the AO is screened. The radial parts rcache are for deriv <= 1.
  */
 static void _eval_group(double *aobuf, int deriv, GemmGroup *g, int ng,
                         double *coords, size_t ldc, int blk0,
                         double *rcache, int64_t *roffs, int nbas,
                         int *atm, int *bas, double *env, double *work)
 {
-        const int ncomp = deriv == 0 ? 1 : 4;
+        const int ncomp = (deriv+1)*(deriv+2)*(deriv+3)/6;
         const size_t comp_size = (size_t)g->nao * ng;
         const size_t ig0 = (size_t)blk0 * BLKSIZE;
-        FPtr_exp fexp = deriv == 0 ? GTOcontract_exp0 : GTOcontract_exp1;
-        FPtr_eval feval = deriv == 0 ? GTOshell_eval_grid_cart
-                                     : GTOshell_eval_grid_cart_deriv1;
+        FPtr_exp fexp = _eval_exp[deriv];
+        FPtr_eval feval = _eval_poly[deriv];
         double *grid2atm = work;
         double *eprim = grid2atm + 3*BLKSIZE;
         double *cart = eprim + NPRIMAX*BLKSIZE*2;
@@ -271,7 +286,7 @@ void VXCfused_eval_rho(double *rho, double *dms, int nset, int nderiv,
         double *aobuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*(ncomp+1) + max_nao));
         double *cbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
         double *dmbuf = cbuf + max_nao * GEMM_NGRIDS;
-        double *work = malloc(sizeof(double) * EVAL_WORK);
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
         double rho1[GEMM_NGRIDS];
         double *dm, *rhoi, *prho, *pin, *pout, *pa;
         int igroup, blk0, blk1, ig0, ng, ns, i, s, s1, j, c, k, n;
@@ -400,7 +415,7 @@ void VXCfused_eval_rho_mo(double *rho, double *cmo, int *nocc, int nset, int nde
         double *cbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
         double *v0 = cbuf + max_nao * (size_t)max_nocc;
         double *v1 = v0 + max_nocc * GEMM_NGRIDS;
-        double *work = malloc(sizeof(double) * EVAL_WORK);
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
         double rho1[GEMM_NGRIDS];
         double *rhoi, *prho, *pin, *pout, *ptau;
         int igroup, blk0, blk1, ig0, ng, ns, nc, i, s, c, k;
@@ -534,7 +549,7 @@ void VXCfused_dot_wv(double *vmat, double *vtau, double *wv, int nset, int xctyp
         double *aobuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*(ncomp+3) + (size_t)max_nao));
         double *opbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
         double *cbuf = opbuf + max_nao * GEMM_NGRIDS * 3;
-        double *work = malloc(sizeof(double) * EVAL_WORK);
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
         double sqrtw[GEMM_NGRIDS];
         int pidx[GEMM_NGRIDS];
         int igroup, blk0, blk1, ig0, ng, ns, np, nk, sign, i, j, k, k0, k1;
@@ -698,4 +713,164 @@ void VXCfused_dot_wv(double *vmat, double *vtau, double *wv, int nset, int xctyp
                         }
                 }
         }
+}
+
+// dst[n*ld+k] = sum_t aobuf[c_t,n,k] * wv[u_t,ig0+k] (u_t < 0: weight 1) for the
+// nt = term[0] pairs (c_t, u_t) = (term[1+2t], term[2+2t]), and zero on the
+// blocks where the shell of the n-th AO is screened
+static void _combine(double *dst, size_t ld, double *aobuf, size_t comp_size,
+                     int *term, double *wv, size_t Ngrids, int ig0,
+                     GemmGroup *g, int *ao_loc, int ng)
+{
+        const int nt = term[0];
+        int s, i, n, b, k0, k1, k, t;
+        double *pd, *pa, *pw;
+        n = 0;
+        for (s = 0; s < g->nshl; s++) {
+        for (i = ao_loc[g->shl[s]]; i < ao_loc[g->shl[s]+1]; i++, n++) {
+                pd = dst + n * ld;
+                for (b = 0, k0 = 0; k0 < ng; b++, k0 += BLKSIZE) {
+                        k1 = MIN(k0 + BLKSIZE, ng);
+                        if (!(g->blkmask[s] & (1 << b))) {
+                                for (k = k0; k < k1; k++) {
+                                        pd[k] = 0;
+                                }
+                                continue;
+                        }
+                        for (t = 0; t < nt; t++) {
+                                pa = aobuf + term[1+2*t] * comp_size + n * (size_t)ng;
+                                if (term[2+2*t] < 0) {
+                                        if (t == 0) {
+                                                for (k = k0; k < k1; k++) {
+                                                        pd[k] = pa[k];
+                                                }
+                                        } else {
+                                                for (k = k0; k < k1; k++) {
+                                                        pd[k] += pa[k];
+                                                }
+                                        }
+                                } else {
+                                        pw = wv + term[2+2*t] * Ngrids + ig0;
+                                        if (t == 0) {
+                                                for (k = k0; k < k1; k++) {
+                                                        pd[k] = pa[k] * pw[k];
+                                                }
+                                        } else {
+                                                for (k = k0; k < k1; k++) {
+                                                        pd[k] += pa[k] * pw[k];
+                                                }
+                                        }
+                                }
+                        }
+                }
+        } }
+}
+
+/*
+ * Sums of products of weighted AO values (up to third derivatives, computed in
+ * place), for the XC terms of nuclear gradients and Hessians: for each set k of
+ * weights wv[nset,nwv,ngrids] and each output o,
+ *   out[k,o,i,j] += sum_s sum_g bra[k,o,s,i,g] * ket[k,s,j,g]
+ * where every factor is a combination sum_t ao[c_t,:,g] * wv[k,u_t,g] given by
+ * a term {nt, c_0, u_0, ..., c_3, u_3} (u_t < 0: weight 1; TERM_SLOTS ints):
+ * ket_terms[nseg] and bra_terms[nout,nseg]. The segments s are stacked along
+ * the grid points, so each (k,o) takes one GEMM per group, and the kets are
+ * shared by all outputs. out[nset,nout,nao,nao]; deriv <= 3 is the derivative
+ * order of the AO components used; rcache only for deriv <= 1.
+ */
+#define TERM_SLOTS      9
+void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
+                        int nout, int nseg, int *ket_terms, int *bra_terms, int deriv,
+                        int nao, int ngrids, double *coords, int ldc,
+                        uint8_t *screen_index, int *ao_loc,
+                        int *atm, int natm, int *bas, int nbas, double *env,
+                        double *rcache, int64_t *roffs)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const size_t nn = Nao * Nao;
+        const int ncomp = (deriv+1)*(deriv+2)*(deriv+3)/6;
+        const int npriv = nset * nout;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+        if (deriv > 1) {
+                rcache = NULL;
+        }
+        if (max_nao > 0 && npriv > 0) {
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *vpriv = calloc(npriv * nn, sizeof(double));
+        // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
+        // visible to the other threads.
+        vprivs[omp_get_thread_num()] = vpriv;
+        double *aobuf = malloc(sizeof(double) * max_nao * GEMM_NGRIDS * ncomp);
+        double *ketbuf = malloc(sizeof(double) * max_nao * GEMM_NGRIDS * nseg * 2);
+        double *brabuf = ketbuf + max_nao * GEMM_NGRIDS * nseg;
+        double *cbuf = malloc(sizeof(double) * max_nao * max_nao);
+        double *work = malloc(sizeof(double) * EVAL_WORK(ncomp));
+        int igroup, blk0, blk1, ig0, ng, ns, nk, k, o, s, i, j;
+        size_t comp_size;
+        double *wvk;
+// static: each thread sums a fixed set of groups, so out is reproducible for a
+// given number of threads
+#pragma omp for schedule(static, 1)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                comp_size = (size_t)ns * ng;
+                nk = nseg * ng;
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                for (k = 0; k < nset; k++) {
+                        wvk = wv + (size_t)k * nwv * Ngrids;
+                        for (s = 0; s < nseg; s++) {
+                                _combine(ketbuf + s * ng, nk, aobuf, comp_size,
+                                         ket_terms + s * TERM_SLOTS, wvk, Ngrids, ig0,
+                                         &g, ao_loc, ng);
+                        }
+                        for (o = 0; o < nout; o++) {
+                                for (s = 0; s < nseg; s++) {
+                                        _combine(brabuf + s * ng, nk, aobuf, comp_size,
+                                                 bra_terms + (o * nseg + s) * TERM_SLOTS,
+                                                 wvk, Ngrids, ig0, &g, ao_loc, ng);
+                                }
+                                // cbuf[n,m] = sum_q brabuf[n,q] * ketbuf[m,q]
+                                dgemm_(&TRANS_T, &TRANS_N, &ns, &ns, &nk, &D1, ketbuf, &nk,
+                                       brabuf, &nk, &D0, cbuf, &ns);
+                                _gemm_scatter_add(vpriv + (k * nout + o) * nn, cbuf, &g, Nao, 0);
+                        }
+                }
+        }
+        NPomp_dsum_reduce_inplace(vprivs, npriv * nn);
+        double *vsum = vprivs[0];
+#pragma omp for schedule(static)
+        for (i = 0; i < npriv * nao; i++) {
+                for (j = 0; j < nao; j++) {
+                        out[i*Nao+j] += vsum[i*Nao+j];
+                }
+        }
+        _gemm_group_free(&g);
+        free(vpriv);
+        free(aobuf);
+        free(ketbuf);
+        free(cbuf);
+        free(work);
+}
+        }
+        free(vprivs);
 }
