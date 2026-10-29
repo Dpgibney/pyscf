@@ -17,6 +17,7 @@
 #
 
 import warnings
+import functools
 import ctypes
 import numpy
 from pyscf import lib
@@ -30,7 +31,7 @@ CUTOFF = getattr(__config__, 'eval_gto_cutoff', 1e-15)
 libcgto = lib.load_library('libcgto')
 
 def eval_gto(mol, eval_name, coords, comp=None, shls_slice=None, non0tab=None,
-             ao_loc=None, cutoff=None, out=None):
+             ao_loc=None, cutoff=None, out=None, zero_screened=True):
     r'''Evaluate AO function value on the given grids,
 
     Args:
@@ -80,6 +81,11 @@ def eval_gto(mol, eval_name, coords, comp=None, shls_slice=None, non0tab=None,
             cutoff threshold is ~1e-22 (defined in gto/grid_ao_drv.h)
         out : ndarray
             If provided, results are written into this array.
+        zero_screened : bool
+            If False and non0tab is given, the AO values of the shells that
+            non0tab screens on a block of grids are left unwritten instead of
+            set to zero, for callers that only read the values where non0tab is
+            nonzero. Spinor functions always set them to zero.
 
     Returns:
         An 2D to 4D array for AO values on grids.
@@ -128,6 +134,8 @@ def eval_gto(mol, eval_name, coords, comp=None, shls_slice=None, non0tab=None,
     else:
         ao = numpy.ndarray((comp,nao,ngrids), buffer=out).transpose(0,2,1)
 
+    # Only the caller's own non0tab tells it which values are left unwritten
+    zero_screened = zero_screened or non0tab is None or 'spinor' in eval_name
     if non0tab is None:
         if cutoff is None:
             non0tab = numpy.ones(((ngrids+BLKSIZE-1)//BLKSIZE,nbas),
@@ -136,6 +144,8 @@ def eval_gto(mol, eval_name, coords, comp=None, shls_slice=None, non0tab=None,
             non0tab = make_screen_index(mol, coords, shls_slice, cutoff)
 
     drv = getattr(libcgto, eval_name)
+    if not zero_screened:
+        drv = functools.partial(libcgto.GTOeval_skip_screened, drv)
     drv(ctypes.c_int(ngrids),
         (ctypes.c_int*2)(*shls_slice), ao_loc.ctypes.data_as(ctypes.c_void_p),
         ao.ctypes.data_as(ctypes.c_void_p),

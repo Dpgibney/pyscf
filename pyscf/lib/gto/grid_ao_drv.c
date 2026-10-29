@@ -219,8 +219,16 @@ static void _zset0(double complex *out, size_t odim, size_t bgrids, int counts)
         }
 }
 
-void GTOeval_sph_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
-                      size_t nao, size_t ngrids, size_t bgrids,
+/*
+ * Whether GTOeval_sph_drv and GTOeval_cart_drv set the AO values of the shells
+ * that non0table screens on a block of grids to zero. GTOeval_skip_screened
+ * turns it off for one call, for callers that only read the AO values where
+ * non0table is nonzero. Per calling thread; the OpenMP workers do not read it.
+ */
+static __thread int _zero_screened = 1;
+
+static inline void _sph_iter(int zero_screened, FPtr_eval feval, FPtr_exp fexp,
+                      double fac, size_t nao, size_t ngrids, size_t bgrids,
                       int param[], int *shls_slice, int *ao_loc, double *buf,
                       double *ao, double *coord, uint8_t *non0table,
                       int *atm, int natm, int *bas, int nbas, double *env)
@@ -275,7 +283,7 @@ void GTOeval_sph_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
                                         }
                                 }
                         }
-                } else {
+                } else if (zero_screened) {
                         for (i = 0; i < ncomp; i++) {
                                 _dset0(ao+(i*nao+ao_id)*ngrids, ngrids, bgrids, nc*deg);
                         }
@@ -283,8 +291,28 @@ void GTOeval_sph_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
         }
 }
 
-void GTOeval_cart_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
-                       size_t nao, size_t ngrids, size_t bgrids,
+void GTOeval_sph_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
+                      size_t nao, size_t ngrids, size_t bgrids,
+                      int param[], int *shls_slice, int *ao_loc, double *buf,
+                      double *ao, double *coord, uint8_t *non0table,
+                      int *atm, int natm, int *bas, int nbas, double *env)
+{
+        _sph_iter(1, feval, fexp, fac, nao, ngrids, bgrids, param, shls_slice,
+                  ao_loc, buf, ao, coord, non0table, atm, natm, bas, nbas, env);
+}
+
+static void _sph_iter_unzeroed(FPtr_eval feval,  FPtr_exp fexp, double fac,
+                      size_t nao, size_t ngrids, size_t bgrids,
+                      int param[], int *shls_slice, int *ao_loc, double *buf,
+                      double *ao, double *coord, uint8_t *non0table,
+                      int *atm, int natm, int *bas, int nbas, double *env)
+{
+        _sph_iter(0, feval, fexp, fac, nao, ngrids, bgrids, param, shls_slice,
+                  ao_loc, buf, ao, coord, non0table, atm, natm, bas, nbas, env);
+}
+
+static inline void _cart_iter(int zero_screened, FPtr_eval feval, FPtr_exp fexp,
+                       double fac, size_t nao, size_t ngrids, size_t bgrids,
                        int param[], int *shls_slice, int *ao_loc, double *buf,
                        double *ao, double *coord, uint8_t *non0table,
                        int *atm, int natm, int *bas, int nbas, double *env)
@@ -320,12 +348,32 @@ void GTOeval_cart_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
                         ri = env + atm[PTR_COORD+atm_id*ATM_SLOTS];
                         (*feval)(ao+ao_id*ngrids, ri, eprim, pcoord, p_exp, pcoeff,
                                  env, l, np, nc, nao, ngrids, bgrids);
-                } else {
+                } else if (zero_screened) {
                         for (i = 0; i < ncomp; i++) {
                                 _dset0(ao+(i*nao+ao_id)*ngrids, ngrids, bgrids, nc*deg);
                         }
                 }
         }
+}
+
+void GTOeval_cart_iter(FPtr_eval feval,  FPtr_exp fexp, double fac,
+                       size_t nao, size_t ngrids, size_t bgrids,
+                       int param[], int *shls_slice, int *ao_loc, double *buf,
+                       double *ao, double *coord, uint8_t *non0table,
+                       int *atm, int natm, int *bas, int nbas, double *env)
+{
+        _cart_iter(1, feval, fexp, fac, nao, ngrids, bgrids, param, shls_slice,
+                   ao_loc, buf, ao, coord, non0table, atm, natm, bas, nbas, env);
+}
+
+static void _cart_iter_unzeroed(FPtr_eval feval,  FPtr_exp fexp, double fac,
+                       size_t nao, size_t ngrids, size_t bgrids,
+                       int param[], int *shls_slice, int *ao_loc, double *buf,
+                       double *ao, double *coord, uint8_t *non0table,
+                       int *atm, int natm, int *bas, int nbas, double *env)
+{
+        _cart_iter(0, feval, fexp, fac, nao, ngrids, bgrids, param, shls_slice,
+                   ao_loc, buf, ao, coord, non0table, atm, natm, bas, nbas, env);
 }
 
 void GTOeval_spinor_iter(FPtr_eval feval, FPtr_exp fexp, void (*c2s)(), double fac,
@@ -453,7 +501,8 @@ void GTOeval_sph_drv(FPtr_eval feval, FPtr_exp fexp, double fac, int ngrids,
                      double *ao, double *coord, uint8_t *non0table,
                      int *atm, int natm, int *bas, int nbas, double *env)
 {
-        GTOeval_loop(GTOeval_sph_iter, feval, fexp, fac, ngrids,
+        GTOeval_loop(_zero_screened ? GTOeval_sph_iter : _sph_iter_unzeroed,
+                     feval, fexp, fac, ngrids,
                      param, shls_slice, ao_loc,
                      ao, coord, non0table, atm, natm, bas, nbas, env);
 }
@@ -463,9 +512,28 @@ void GTOeval_cart_drv(FPtr_eval feval, FPtr_exp fexp, double fac, int ngrids,
                       double *ao, double *coord, uint8_t *non0table,
                       int *atm, int natm, int *bas, int nbas, double *env)
 {
-        GTOeval_loop(GTOeval_cart_iter, feval, fexp, fac, ngrids,
+        GTOeval_loop(_zero_screened ? GTOeval_cart_iter : _cart_iter_unzeroed,
+                     feval, fexp, fac, ngrids,
                      param, shls_slice, ao_loc,
                      ao, coord, non0table, atm, natm, bas, nbas, env);
+}
+
+/*
+ * Calls eval_drv (GTOval_sph_deriv1, GTOval_cart, ...) with the same arguments,
+ * leaving the AO values of the shells that non0table screens on a block of grids
+ * unwritten instead of setting them to zero. Writing those zeros can take most
+ * of the time of eval_drv on large molecules. For the drivers that go through
+ * GTOeval_sph_drv or GTOeval_cart_drv; spinor drivers still write the zeros.
+ */
+void GTOeval_skip_screened(void (*eval_drv)(), int ngrids, int *shls_slice,
+                           int *ao_loc, double *ao, double *coord,
+                           uint8_t *non0table, int *atm, int natm,
+                           int *bas, int nbas, double *env)
+{
+        _zero_screened = 0;
+        (*eval_drv)(ngrids, shls_slice, ao_loc, ao, coord, non0table,
+                    atm, natm, bas, nbas, env);
+        _zero_screened = 1;
 }
 
 void GTOeval_spinor_drv(FPtr_eval feval, FPtr_exp fexp, void (*c2s)(), double fac,

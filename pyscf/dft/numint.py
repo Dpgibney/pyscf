@@ -22,6 +22,7 @@ Numerical integration functions for RKS and UKS with real AO basis
 
 import warnings
 import ctypes
+import inspect
 import numpy
 from pyscf import lib
 try:
@@ -53,7 +54,7 @@ SPARSE_THRESHOLD = getattr(__config__, 'dft_numint_sparse_threshold', 0.9)
 MGGA_DENSITY_LAPL = False
 
 def eval_ao(mol, coords, deriv=0, shls_slice=None,
-            non0tab=None, cutoff=None, out=None, verbose=None):
+            non0tab=None, cutoff=None, out=None, verbose=None, zero_screened=True):
     '''Evaluate AO function value on the given grids.
 
     Args:
@@ -85,6 +86,10 @@ def eval_ao(mol, coords, deriv=0, shls_slice=None,
             If provided, results are written into this array.
         verbose : int or object of :class:`Logger`
             No effects.
+        zero_screened : bool
+            If False, the AO values of the shells that non0tab screens on a
+            block of grids are left unwritten instead of set to zero, for
+            callers that only read the values where non0tab is nonzero.
 
     Returns:
         2D array of shape (N,nao) for AO values if deriv = 0.
@@ -115,7 +120,7 @@ def eval_ao(mol, coords, deriv=0, shls_slice=None,
     else:
         feval = 'GTOval_sph_deriv%d' % deriv
     return mol.eval_gto(feval, coords, comp, shls_slice, non0tab,
-                        cutoff=cutoff, out=out)
+                        cutoff=cutoff, out=out, zero_screened=zero_screened)
 
 def eval_rho(mol, ao, dm, non0tab=None, xctype='LDA', hermi=0,
              with_lapl=True, verbose=None):
@@ -909,6 +914,25 @@ def _sparse_enough(screen_index, threshold=None):
         threshold = SPARSE_THRESHOLD
     return numpy.count_nonzero(screen_index) < screen_index.size * threshold
 
+def _sparse_reader_kw(ni, *dms):
+    '''Keyword arguments of ni.block_loop for nr_rks, nr_uks and the fxc
+    contractions, which read the AO blocks yielded with a mask only with the
+    sparse kernels (_eval_rho_sparse, _dot_ao_dm and the *_sparse functions).
+    These read the AO values where the mask is nonzero, so the others need not be
+    set to zero, provided that ni evaluates AOs and densities with NumInt's own
+    functions and the density matrices and orbitals are real (complex ones take
+    dense paths).
+    '''
+    for key in ('block_loop', 'eval_ao', 'eval_rho1', 'eval_rho2',
+                '_gen_rho_evaluator'):
+        if inspect.getattr_static(ni, key, None) is not inspect.getattr_static(NumInt, key):
+            return {}
+    for dm in dms:
+        if (numpy.iscomplexobj(dm) or
+                numpy.iscomplexobj(getattr(dm, 'mo_coeff', None))):
+            return {}
+    return {'zero_screened': False}
+
 def _dot_ao_ao_dense(ao1, ao2, wv, out=None):
     '''Returns (bra*wv).T.dot(ket)
     '''
@@ -1308,9 +1332,11 @@ def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     excsum = numpy.zeros(nset)
     vmat = numpy.zeros((nset,nao,nao))
 
+    loop_kw = _sparse_reader_kw(ni, dms)
     def block_loop(ao_deriv):
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
+                                 **loop_kw):
             for i in range(nset):
                 rho = make_rho(i, ao, mask, xctype)
                 exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=0)[:2]
@@ -1426,9 +1452,11 @@ def nr_uks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     excsum = numpy.zeros(nset)
     vmat = numpy.zeros((2,nset,nao,nao))
 
+    loop_kw = _sparse_reader_kw(ni, dma, dmb)
     def block_loop(ao_deriv):
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
+                                 **loop_kw):
             for i in range(nset):
                 rho_a = make_rhoa(i, ao, mask, xctype)
                 rho_b = make_rhob(i, ao, mask, xctype)
@@ -1621,7 +1649,7 @@ def _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1, nbins,
     p1 = 0
     for ao, mask, weight, coords \
             in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
-                             blksize=blksize):
+                             blksize=blksize, **_sparse_reader_kw(ni, dms)):
         p0, p1 = p1, p1 + weight.size
         _fxc = fxc[:,:,p0:p1]
         if mask is not None:
@@ -1722,10 +1750,12 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
 
     make_rho1, nset, nao = ni._gen_rho_evaluator(mol, dms, hermi, False, grids)
 
+    loop_kw = _sparse_reader_kw(ni, dms)
     def block_loop(ao_deriv):
         p1 = 0
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
+                                 **loop_kw):
             p0, p1 = p1, p1 + weight.size
             _fxc = fxc[:,:,p0:p1]
             for i in range(nset):
@@ -1997,10 +2027,12 @@ def nr_uks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     make_rhoa, nset = ni._gen_rho_evaluator(mol, dma, hermi, False, grids)[:2]
     make_rhob       = ni._gen_rho_evaluator(mol, dmb, hermi, False, grids)[0]
 
+    loop_kw = _sparse_reader_kw(ni, dma, dmb)
     def block_loop(ao_deriv):
         p1 = 0
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory,
+                                 **loop_kw):
             p0, p1 = p1, p1 + weight.size
             _fxc = fxc[:,:,:,:,p0:p1]
             for i in range(nset):
@@ -3134,8 +3166,13 @@ class NumInt(lib.StreamObject, LibXCMixin):
     get_rho_with_derivatives = get_rho_with_derivatives
 
     def block_loop(self, mol, grids, nao=None, deriv=0, max_memory=2000,
-                   non0tab=None, blksize=None, buf=None):
+                   non0tab=None, blksize=None, buf=None, zero_screened=True):
         '''Define this macro to loop over grids by blocks.
+
+        With zero_screened=False, the AO values of the shells that the mask
+        screens are left unwritten on the blocks yielded with a mask, which is
+        for callers that read those blocks only with the sparse kernels (see
+        _sparse_reader_kw).
         '''
         if grids.coords is None:
             grids.build(with_non0tab=True)
@@ -3167,10 +3204,16 @@ class NumInt(lib.StreamObject, LibXCMixin):
             coords = grids.coords[ip0:ip1]
             weight = grids.weights[ip0:ip1]
             mask = screen_index[ip0//BLKSIZE:]
+            sparse = allow_sparse or _sparse_enough(mask)
             # TODO: pass grids.cutoff to eval_ao
-            ao = self.eval_ao(mol, coords, deriv=deriv, non0tab=mask,
-                              cutoff=grids.cutoff, out=buf)
-            if not allow_sparse and not _sparse_enough(mask):
+            if sparse and not zero_screened and (ip1 - ip0) % ALIGNMENT_UNIT == 0:
+                # Unaligned blocks may fall back to the dense kernels
+                ao = self.eval_ao(mol, coords, deriv=deriv, non0tab=mask,
+                                  cutoff=grids.cutoff, out=buf, zero_screened=False)
+            else:
+                ao = self.eval_ao(mol, coords, deriv=deriv, non0tab=mask,
+                                  cutoff=grids.cutoff, out=buf)
+            if not sparse:
                 # Unset mask for dense AO tensor. It determines which eval_rho
                 # to be called in make_rho
                 mask = None

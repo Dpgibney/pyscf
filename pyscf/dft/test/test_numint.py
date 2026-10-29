@@ -273,6 +273,63 @@ class KnownValues(unittest.TestCase):
         mat2 = dft.numint.eval_mat(mol, ao, weight, [rho]*2, vxc_1, xctype='MGGA', spin=1)
         self.assertAlmostEqual(abs(mat0 - mat2).max(), 0, 9)
 
+    def test_eval_ao_unwritten_screened(self):
+        coords = mf.grids.coords[:dft.gen_grid.BLKSIZE*40]
+        mask = mf.grids.non0tab
+        for deriv in (0, 1, 2):
+            ref = numint.eval_ao(mol, coords, deriv, non0tab=mask)
+            out = numpy.full(ref.size, numpy.nan)
+            ao = numint.eval_ao(mol, coords, deriv, non0tab=mask, out=out,
+                                zero_screened=False)
+            unwritten = numpy.isnan(ao)
+            self.assertTrue(unwritten.any())
+            self.assertFalse(ref[unwritten].any())
+            self.assertTrue(numpy.array_equal(ao[~unwritten], ref[~unwritten]))
+
+    def test_screened_ao_unread(self):
+        # nr_rks, nr_uks and the fxc contractions leave the AO values of screened
+        # shells unwritten. Set them to NaN to check that they are not read.
+        nan_count = [0]
+        def nan_eval_ao(mol, coords, deriv=0, shls_slice=None, non0tab=None,
+                        cutoff=None, out=None, verbose=None, zero_screened=True):
+            ao = numint.eval_ao(mol, coords, deriv, shls_slice, non0tab, cutoff,
+                                out, verbose, zero_screened)
+            if not zero_screened:
+                shl = numpy.repeat(numpy.arange(mol.nbas), numpy.diff(mol.ao_loc_nr()))
+                screened = numpy.repeat(non0tab[:,shl] == 0, dft.gen_grid.BLKSIZE,
+                                        axis=0)[:len(coords)]
+                ao[...,screened] = numpy.nan
+                nan_count[0] += numpy.count_nonzero(screened)
+            return ao
+
+        numpy.random.seed(2)
+        nao = mol.nao_nr()
+        dm = numpy.random.random((nao,nao)) * .1
+        dm = dm + dm.T
+        dm1 = numpy.random.random((2,nao,nao)) * .1
+        def xc_mats():
+            ni = numint.NumInt()
+            grids = mf.grids
+            out = [ni.nr_rks(mol, grids, xc, dm)[2] for xc in ('lda,vwn', 'pbe', 'r2scan')]
+            out.append(ni.nr_uks(mol, grids, 'pbe', (dm, dm*.5))[2])
+            for xc in ('lda,vwn', 'pbe', 'r2scan'):
+                out.append(ni.nr_rks_fxc(mol, grids, xc, dm, dm1, hermi=0))
+            out.append(ni.nr_uks_fxc(mol, grids, 'pbe', (dm, dm*.5), (dm1, dm1*.5)))
+            return out
+        with lib.temporary_env(numint, _sparse_reader_kw=lambda ni, *dms: {}):
+            ref = xc_mats()
+        # Not lib.temporary_env: getattr would restore the bare function, not the
+        # staticmethod
+        stock_eval_ao = numint.NumInt.__dict__['eval_ao']
+        numint.NumInt.eval_ao = staticmethod(nan_eval_ao)
+        try:
+            out = xc_mats()
+        finally:
+            numint.NumInt.eval_ao = stock_eval_ao
+        self.assertTrue(nan_count[0] > 0)
+        for a, b in zip(ref, out):
+            self.assertTrue(numpy.array_equal(a, b))
+
     def test_rks_vxc(self):
         numpy.random.seed(10)
         nao = mol.nao_nr()
