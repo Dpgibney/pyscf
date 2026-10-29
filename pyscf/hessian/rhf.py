@@ -357,6 +357,8 @@ def gen_vind(mf, mo_coeff, mo_occ):
     mocc = mo_coeff[:,mo_occ>0]
     nocc = mocc.shape[1]
     vresp = mf.gen_response(mo_coeff, mo_occ, hermi=1)
+    # The XC response from the factors of dm1 where the response function offers it
+    vind_mo = getattr(vresp, 'vind_mo', None)
     def fx(mo1):
         mo1 = mo1.reshape(-1,nmo,nocc)
         nset = len(mo1)
@@ -364,6 +366,8 @@ def gen_vind(mf, mo_coeff, mo_occ):
         for i, x in enumerate(mo1):
             dm = reduce(numpy.dot, (mo_coeff, x*2, mocc.T)) # *2 for double occupancy
             dm1[i] = dm + dm.T
+        if vind_mo is not None:
+            return vind_mo(dm1, mo1*2)
         v1 = vresp(dm1)
         v1vo = numpy.empty_like(mo1)
         for i, x in enumerate(v1):

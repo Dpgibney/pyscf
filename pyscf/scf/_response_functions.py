@@ -22,6 +22,7 @@ Generate SCF response functions
 
 import warnings
 import numpy
+from functools import reduce
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.scf import hf, rohf, uhf, ghf, dhf
@@ -80,20 +81,8 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
 
         if singlet is None:
             # Without specify singlet, used in ground state orbital hessian
-            def vind(dm1):
-                # The singlet hessian
-                if hermi == 2:
-                    v1 = numpy.zeros_like(dm1)
-                else:
-                    v1 = ni.nr_rks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
-                                       rho0, vxc, fxc, max_memory=max_memory)
-                    if with_nlc and mf.do_nlc():
-                        # Cannot import at top due to circular dependency
-                        from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
-                        if mo_coeff is not None and mo_occ is not None:
-                            v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1, max_memory)
-                        else:
-                            v1 += get_vnlc_resp1(mf, mol, dm0, dm1, max_memory)
+            def vind_jk(dm1, v1):
+                '''v1 += the Coulomb and exchange response of dm1'''
                 if hybrid:
                     if omega == 0:
                         vj, vk = mf.get_jk(mol, dm1, hermi)
@@ -117,6 +106,55 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 elif hermi != 2:
                     v1 += mf.get_j(mol, dm1, hermi=hermi)
                 return v1
+
+            def vind_nlc(dm1, v1):
+                if with_nlc and mf.do_nlc():
+                    # Cannot import at top due to circular dependency
+                    from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
+                    if mo_coeff is not None and mo_occ is not None:
+                        v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1, max_memory)
+                    else:
+                        v1 += get_vnlc_resp1(mf, mol, dm0, dm1, max_memory)
+                return v1
+
+            def vind(dm1):
+                # The singlet hessian
+                if hermi == 2:
+                    v1 = numpy.zeros_like(dm1)
+                else:
+                    v1 = ni.nr_rks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
+                                       rho0, vxc, fxc, max_memory=max_memory)
+                    v1 = vind_nlc(dm1, v1)
+                return vind_jk(dm1, v1)
+
+            # For dms of the form mo_coeff x mocc^T + h.c., as in CPHF, the XC
+            # part can take the factors x instead of the dms (fewer flops where
+            # nocc is small next to the AOs of a grid group): vind.vind_mo(dm1,
+            # x) returns mo_coeff^T vind(dm1) mocc by the cheaper path for
+            # len(x) dms.
+            if hermi == 1 and mo_coeff is not None and mo_occ is not None:
+                from pyscf.dft import numint
+                xctype = ni._xc_type(mf.xc)
+                mocc = mo_coeff[:,mo_occ>0]
+                nmo, nocc = mo_coeff.shape[1], mocc.shape[1]
+                fused = numint._fused_xc(ni, mol, grids, mo_coeff.shape[0], xctype,
+                                         max_memory, (mo_coeff,), match_block_loop=False)
+                if fused is not None:
+                    def vind_mo(dm1, x):
+                        '''mo_coeff^T vind(dm1) mocc for the symmetric dms
+                        dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc]'''
+                        x = numpy.asarray(x).reshape(-1,nmo,nocc)
+                        v1mo = numpy.zeros((len(x),nmo,nocc))
+                        if fused.lowrank_cheaper(xctype, nocc, nocc, len(x)):
+                            a = lib.einsum('pa,kai->kpi', mo_coeff, x)
+                            fused.rks_fxc_mo(ni, xctype, fxc, a, mocc, mo_coeff, mocc, v1mo)
+                            v1 = vind_jk(dm1, vind_nlc(dm1, numpy.zeros_like(dm1)))
+                        else:
+                            v1 = vind(dm1)
+                        for i, v in enumerate(v1):
+                            v1mo[i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
+                        return v1mo
+                    vind.vind_mo = vind_mo
 
         elif singlet:
             fxc *= .5

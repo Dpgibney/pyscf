@@ -874,3 +874,359 @@ void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
         }
         free(vprivs);
 }
+
+/*
+ * The densities of the symmetric matrices D[k] = A[k] B^T + B A[k]^T for real
+ * A[nset,nao,r] and B[nao,r] (A[k] and B in C order): rho[k,0], for nderiv >= 1
+ * also rho[k,1:4] (the gradient) and for nderiv == 2 also rho[k,4] (tau) of
+ * rho[nset,nrho,ngrids]. With TA[c] = ao[c] A[k] and TB[c] = ao[c] B,
+ *   rho[0]   = 2 sum_l TA[0]_l TB[0]_l
+ *   rho[1+x] = 2 sum_l TA[1+x]_l TB[0]_l + TA[0]_l TB[1+x]_l
+ *   rho[4]   = sum_x sum_l TA[1+x]_l TB[1+x]_l
+ * TB is shared by the sets. GGA takes sum_l TA[1+x]_l TB[0]_l as
+ * sum_i ao[1+x]_i Z_i with Z = A TB[0]^T: per set two GEMMs of the size of TA
+ * (TA[0] and Z) instead of four.
+ */
+void VXCfused_eval_rho_lowrank(double *rho, double *A, double *B, int nset, int r,
+                               int nderiv, int nao, int ngrids, double *coords, int ldc,
+                               uint8_t *screen_index, int *ao_loc,
+                               int *atm, int natm, int *bas, int nbas, double *env,
+                               double *rcache, int64_t *roffs)
+{
+        const size_t Ngrids = ngrids;
+        const size_t Nr = r;
+        const int deriv = nderiv == 0 ? 0 : 1;
+        const int ncomp = deriv == 0 ? 1 : 4;
+        // the components of TB (GGA and MGGA: 4) and of TA (MGGA: 4)
+        const int ntb = nderiv == 0 ? 1 : 4;
+        const int nta = nderiv == 2 ? 4 : 1;
+        const int nrho = nderiv == 0 ? 1 : (nderiv == 1 ? 4 : 5);
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = MAX(1, _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc));
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *aobuf = malloc(sizeof(double) * (max_nao * (GEMM_NGRIDS*ncomp + Nr*2)
+                                                 + Nr * GEMM_NGRIDS * (ntb + nta)));
+        double *bbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
+        double *abuf = bbuf + max_nao * Nr;
+        double *tb = abuf + max_nao * Nr;
+        double *ta = tb + Nr * GEMM_NGRIDS * ntb;
+        // Z[i,q] (GGA)
+        double *zbuf = nderiv == 1 ? malloc(sizeof(double) * max_nao * GEMM_NGRIDS) : NULL;
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
+        double *rhok, *prho, *pa, *pb, *pa0, *pb0, *pin, *pout, *pao, *pz;
+        int igroup, blk0, blk1, ig0, ng, ns, k, c, i, l, q, s;
+        size_t nseg_r;
+#pragma omp for schedule(dynamic, 4)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0 || r == 0) {
+                        _zero_rho(rho, nset, nrho, Ngrids, ig0, ng);
+                        continue;
+                }
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                // bbuf[n,l] = B[i,l] for the n-th AO i of the group
+                pout = bbuf;
+                for (s = 0; s < g.nseg; s++) {
+                        pin = B + g.seg_ao[s] * Nr;
+                        nseg_r = g.seg_len[s] * Nr;
+                        for (q = 0; q < nseg_r; q++) {
+                                pout[q] = pin[q];
+                        }
+                        pout += nseg_r;
+                }
+                // tb[c,l,q] = sum_n aobuf[c,n,q] * bbuf[n,l]
+                for (c = 0; c < ntb; c++) {
+                        dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
+                               aobuf + c * (size_t)ns * ng, &ng, bbuf, &r,
+                               &D0, tb + c * Nr * ng, &ng);
+                }
+                for (k = 0; k < nset; k++) {
+                        pout = abuf;
+                        for (s = 0; s < g.nseg; s++) {
+                                pin = A + k * nao * Nr + g.seg_ao[s] * Nr;
+                                nseg_r = g.seg_len[s] * Nr;
+                                for (q = 0; q < nseg_r; q++) {
+                                        pout[q] = pin[q];
+                                }
+                                pout += nseg_r;
+                        }
+                        for (c = 0; c < nta; c++) {
+                                dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
+                                       aobuf + c * (size_t)ns * ng, &ng, abuf, &r,
+                                       &D0, ta + c * Nr * ng, &ng);
+                        }
+                        rhok = rho + k * nrho * Ngrids + ig0;
+                        _contract_mo(rhok, ta, tb, r, ng);
+                        for (q = 0; q < ng; q++) {
+                                rhok[q] *= 2;
+                        }
+                        if (nderiv == 0) {
+                                continue;
+                        }
+                        if (nderiv == 1) {
+                                // zbuf[n,q] = sum_l abuf[n,l] tb[0,l,q]
+                                dgemm_(&TRANS_N, &TRANS_N, &ng, &ns, &r, &D1,
+                                       tb, &ng, abuf, &r, &D0, zbuf, &ng);
+                                for (c = 1; c < 4; c++) {
+                                        prho = rhok + c * Ngrids;
+                                        pb = tb + c * Nr * ng;
+                                        _contract_mo(prho, ta, pb, r, ng);
+                                        pao = aobuf + c * (size_t)ns * ng;
+                                        for (i = 0; i < ns; i++) {
+                                                pa = pao + i * (size_t)ng;
+                                                pz = zbuf + i * (size_t)ng;
+                                                for (q = 0; q < ng; q++) {
+                                                        prho[q] += pa[q] * pz[q];
+                                                }
+                                        }
+                                        for (q = 0; q < ng; q++) {
+                                                prho[q] *= 2;
+                                        }
+                                }
+                                continue;
+                        }
+                        for (c = 1; c < 4; c++) {
+                                prho = rhok + c * Ngrids;
+                                pa = ta + c * Nr * ng;
+                                pb = tb + c * Nr * ng;
+                                for (q = 0; q < ng; q++) {
+                                        prho[q] = pa[q] * tb[q] + ta[q] * pb[q];
+                                }
+                                for (l = 1; l < r; l++) {
+                                        pa0 = ta + l * (size_t)ng;
+                                        pb0 = tb + l * (size_t)ng;
+                                        for (q = 0; q < ng; q++) {
+                                                prho[q] += pa[l*ng+q] * pb0[q] + pa0[q] * pb[l*ng+q];
+                                        }
+                                }
+                                for (q = 0; q < ng; q++) {
+                                        prho[q] *= 2;
+                                }
+                        }
+                        prho = rhok + 4 * Ngrids;
+                        for (q = 0; q < ng; q++) {
+                                prho[q] = 0;
+                        }
+                        for (c = 1; c < 4; c++) {
+                                pa = ta + c * Nr * ng;
+                                pb = tb + c * Nr * ng;
+                                for (l = 0; l < r; l++) {
+                                        for (q = 0; q < ng; q++) {
+                                                prho[q] += pa[l*ng+q] * pb[l*ng+q];
+                                        }
+                                }
+                        }
+                }
+        }
+        _gemm_group_free(&g);
+        free(aobuf);
+        free(zbuf);
+        free(work);
+}
+}
+
+/*
+ * The XC matrices of the potentials wv[nset,nwv,ngrids] times the real orbitals
+ * Q[nao,nq] (C order): out[k] += v[k] Q, out[nset,nao,nq], for the matrices
+ * v[k] that the fxc contractions build from the (already halved) weights wv[k]:
+ *   FUSED_LDA:  v = ao[0]^T wv[0] ao[0]
+ *   FUSED_GGA:  v = M + M^T, M = ao[0]^T sum_c wv[c] ao[c] (c < 4)
+ *   FUSED_MGGA: as GGA, plus sum_x ao[x]^T wv[4] ao[x] (x = 1,2,3)
+ * With FQ[c] = ao[c] Q on the points of a group,
+ *   v Q = ao[0]^T (sum_c wv[c] FQ[c]) + (sum_c wv[c] ao[c])^T FQ[0]
+ *         + sum_x ao[x]^T (wv[4] FQ[x])
+ * whose terms are stacked along the points: one GEMM (ns x nq x K) per set and
+ * group for the rows of the ns AOs of the group.
+ */
+void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
+                        double *Q, int nq,
+                        int nao, int ngrids, double *coords, int ldc,
+                        uint8_t *screen_index, int *ao_loc,
+                        int *atm, int natm, int *bas, int nbas, double *env,
+                        double *rcache, int64_t *roffs)
+{
+        const size_t Ngrids = ngrids;
+        const size_t nvq = (size_t)nao * nq;
+        const int nwv = xctype == FUSED_LDA ? 1 : (xctype == FUSED_GGA ? 4 : 5);
+        const int deriv = xctype == FUSED_LDA ? 0 : 1;
+        const int ncomp = deriv == 0 ? 1 : 4;
+        const int nseg = xctype == FUSED_LDA ? 1 : (xctype == FUSED_GGA ? 2 : 5);
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+        int i;
+        if (max_nao > 0 && nset > 0 && nq > 0) {
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *vpriv = calloc(nset * nvq, sizeof(double));
+        // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
+        // visible to the other threads.
+        vprivs[omp_get_thread_num()] = vpriv;
+        double *aobuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*ncomp + (size_t)nq));
+        double *qbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
+        double *fq = malloc(sizeof(double) * ((size_t)nq * GEMM_NGRIDS * (ncomp + nseg)
+                                              + max_nao * ((size_t)GEMM_NGRIDS * nseg + nq)));
+        double *ket = fq + (size_t)nq * GEMM_NGRIDS * ncomp;  // [nq,K]
+        double *bra = ket + (size_t)nq * GEMM_NGRIDS * nseg;  // [ns,K]
+        double *vbuf = bra + (size_t)max_nao * GEMM_NGRIDS * nseg;  // [ns,nq]
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
+        double *wvk, *pw, *src, *dst, *pin, *pout;
+        int igroup, blk0, blk1, ig0, ng, ns, nk, k, c, s, n, p, q, x;
+        size_t nseg_n;
+#pragma omp for schedule(static, 1)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                // the rows of Q of the AOs of the group
+                pout = qbuf;
+                for (s = 0; s < g.nseg; s++) {
+                        pin = Q + g.seg_ao[s] * (size_t)nq;
+                        nseg_n = g.seg_len[s] * (size_t)nq;
+                        for (q = 0; q < nseg_n; q++) {
+                                pout[q] = pin[q];
+                        }
+                        pout += nseg_n;
+                }
+                // fq[c,p,q] = sum_n aobuf[c,n,q] * qbuf[n,p]
+                for (c = 0; c < ncomp; c++) {
+                        dgemm_(&TRANS_N, &TRANS_T, &ng, &nq, &ns, &D1,
+                               aobuf + c * (size_t)ns * ng, &ng, qbuf, &nq,
+                               &D0, fq + c * (size_t)nq * ng, &ng);
+                }
+                nk = nseg * ng;
+                // the segments without weights: bra[:,0] = ao[0]; for MGGA
+                // bra[:,1+x] = ao[x]; for GGA and MGGA ket[:,1] = fq[0]
+                for (n = 0; n < ns; n++) {
+                        src = aobuf + n * (size_t)ng;
+                        dst = bra + n * (size_t)nk;
+                        for (q = 0; q < ng; q++) {
+                                dst[q] = src[q];
+                        }
+                        if (xctype == FUSED_MGGA) {
+                                for (x = 1; x < 4; x++) {
+                                        src = aobuf + (x * (size_t)ns + n) * ng;
+                                        dst = bra + n * (size_t)nk + (1+x) * ng;
+                                        for (q = 0; q < ng; q++) {
+                                                dst[q] = src[q];
+                                        }
+                                }
+                        }
+                }
+                if (xctype != FUSED_LDA) {
+                        for (p = 0; p < nq; p++) {
+                                src = fq + p * (size_t)ng;
+                                dst = ket + p * (size_t)nk + ng;
+                                for (q = 0; q < ng; q++) {
+                                        dst[q] = src[q];
+                                }
+                        }
+                }
+                for (k = 0; k < nset; k++) {
+                        wvk = wv + (size_t)k * nwv * Ngrids + ig0;
+                        // ket[:,0] = sum_c wv[c] fq[c]
+                        for (p = 0; p < nq; p++) {
+                                dst = ket + p * (size_t)nk;
+                                src = fq + p * (size_t)ng;
+                                for (q = 0; q < ng; q++) {
+                                        dst[q] = src[q] * wvk[q];
+                                }
+                                for (c = 1; c < ncomp; c++) {
+                                        src = fq + (c * (size_t)nq + p) * ng;
+                                        pw = wvk + c * Ngrids;
+                                        for (q = 0; q < ng; q++) {
+                                                dst[q] += src[q] * pw[q];
+                                        }
+                                }
+                        }
+                        if (xctype != FUSED_LDA) {
+                                // bra[:,1] = sum_c wv[c] ao[c]
+                                for (n = 0; n < ns; n++) {
+                                        dst = bra + n * (size_t)nk + ng;
+                                        src = aobuf + n * (size_t)ng;
+                                        for (q = 0; q < ng; q++) {
+                                                dst[q] = src[q] * wvk[q];
+                                        }
+                                        for (c = 1; c < 4; c++) {
+                                                src = aobuf + (c * (size_t)ns + n) * ng;
+                                                pw = wvk + c * Ngrids;
+                                                for (q = 0; q < ng; q++) {
+                                                        dst[q] += src[q] * pw[q];
+                                                }
+                                        }
+                                }
+                        }
+                        if (xctype == FUSED_MGGA) {
+                                // ket[:,1+x] = wv[4] fq[x]
+                                pw = wvk + 4 * Ngrids;
+                                for (x = 1; x < 4; x++) {
+                                for (p = 0; p < nq; p++) {
+                                        dst = ket + p * (size_t)nk + (1+x) * ng;
+                                        src = fq + (x * (size_t)nq + p) * ng;
+                                        for (q = 0; q < ng; q++) {
+                                                dst[q] = src[q] * pw[q];
+                                        }
+                                } }
+                        }
+                        // vbuf[n,p] = sum_K bra[n,K] * ket[p,K], added to the
+                        // rows of the group's AOs in vpriv[k]
+                        dgemm_(&TRANS_T, &TRANS_N, &nq, &ns, &nk, &D1, ket, &nk,
+                               bra, &nk, &D0, vbuf, &nq);
+                        pin = vbuf;
+                        for (s = 0; s < g.nseg; s++) {
+                                pout = vpriv + k * nvq + g.seg_ao[s] * (size_t)nq;
+                                nseg_n = g.seg_len[s] * (size_t)nq;
+                                for (q = 0; q < nseg_n; q++) {
+                                        pout[q] += pin[q];
+                                }
+                                pin += nseg_n;
+                        }
+                }
+        }
+        NPomp_dsum_reduce_inplace(vprivs, nset * nvq);
+        double *vsum = vprivs[0];
+#pragma omp for schedule(static)
+        for (i = 0; i < nset; i++) {
+                size_t j;
+                for (j = 0; j < nvq; j++) {
+                        out[i*nvq+j] += vsum[i*nvq+j];
+                }
+        }
+        _gemm_group_free(&g);
+        free(vpriv);
+        free(aobuf);
+        free(fq);
+        free(work);
+}
+        }
+        free(vprivs);
+}

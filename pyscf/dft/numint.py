@@ -964,6 +964,18 @@ class _GridAOData:
                 all(numpy.array_equal(a, b) for a, b in
                     zip((mol._atm, mol._bas, mol._env), self.mol_data)))
 
+    def group_naos(self, mol):
+        '''The number of AOs of the shells unscreened on each group of GEMM_NBLK
+        (4) blocks, as the sparse kernels gather them'''
+        if getattr(self, '_group_naos', None) is None:
+            m = self.non0tab != 0
+            nblk = m.shape[0]
+            ngroup = (nblk + 3) // 4
+            m = numpy.vstack([m, numpy.zeros((ngroup*4-nblk, m.shape[1]), dtype=bool)])
+            m = m.reshape(ngroup, 4, -1).any(axis=1)
+            self._group_naos = (m * numpy.diff(mol.ao_loc_nr())).sum(axis=1).astype(float)
+        return self._group_naos
+
     def radial_sizes(self, mol, deriv):
         nctr = mol._bas[:,NCTR_OF]
         return ((self.non0tab != 0) * ((deriv+1) * BLKSIZE * nctr)).ravel().astype(numpy.int64)
@@ -1019,7 +1031,8 @@ class _FusedXC:
     _eval_rho_sparse, eval_rho2's _dot_ao_dm, _dot_ao_ao_sparse,
     _dot_ao_aow_sparse and _tau_dot_sparse without the AO arrays, and the
     results equal those of the block_loop path on the same blocks bit for bit.
-    The fxc contractions take blocks of their own (_fused_fxc_blksize).
+    The fxc contractions take blocks of their own (_fused_fxc_blksize), and
+    rks_fxc_mo the factors of CPHF-type dms instead of the dms.
     '''
     def __init__(self, mol, grids, nao, data, blocks, max_memory):
         self.mol = mol
@@ -1192,6 +1205,93 @@ class _FusedXC:
             self.dot_terms(ip0, ip1, wv, terms, vmat)
         return vmat
 
+    def rho_lowrank(self, ip0, ip1, A, B, xctype):
+        '''rho[nset,nrho,ngrids] (LDA: [nset,ngrids]) of the symmetric density
+        matrices A[k] B^T + B A[k]^T on the block, A[nset,nao,r] and B[nao,r]'''
+        nderiv = _FUSED_XCTYPE[xctype]
+        A = numpy.asarray(A, order='C')
+        B = numpy.asarray(B, order='C')
+        nset, nao, r = A.shape
+        rho = numpy.empty((nset, _FUSED_NRHO[xctype], ip1-ip0))
+        libdft.VXCfused_eval_rho_lowrank(
+            rho.ctypes.data_as(ctypes.c_void_p), A.ctypes.data_as(ctypes.c_void_p),
+            B.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nset), ctypes.c_int(r),
+            ctypes.c_int(nderiv), *self._args(ip0, ip1, min(nderiv, 1)))
+        if xctype == 'LDA':
+            rho = rho[:,0]
+        return rho
+
+    def dot_ao_mo(self, ip0, ip1, wv, xctype, Q, out):
+        '''out[k] += v[k] Q, out[nset,nao,nq], for the XC matrices v[k] that
+        dot() would add for the potentials wv[k] (halved as _dot_wv does)'''
+        wv = numpy.asarray(wv, order='C')
+        Q = numpy.asarray(Q, order='C')
+        assert out.flags.c_contiguous and out.dtype == numpy.double
+        libdft.VXCfused_dot_ao_mo(
+            out.ctypes.data_as(ctypes.c_void_p), wv.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(len(wv)), ctypes.c_int(_FUSED_XCTYPE[xctype]),
+            Q.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(Q.shape[1]),
+            *self._args(ip0, ip1, 0 if xctype == 'LDA' else 1))
+
+    def mo_chunk(self, nset, nq):
+        '''The number of sets rks_fxc_mo takes per pass over the grids: their
+        matrices v[k] Q, one copy per thread in dot_ao_mo, fit in half of
+        max_memory'''
+        n = self.max_memory*.5e6 / (8 * (lib.num_threads()+1) * self.nao * nq)
+        return max(1, min(nset, int(n)))
+
+    def lowrank_cheaper(self, xctype, r, nq, nset):
+        '''Whether rks_fxc_mo (rho_lowrank, dot_ao_mo) takes fewer flops than
+        rks_fxc (the dm kernels) for nset symmetric dms of rank 2*r and the
+        products of their XC responses with nq orbitals'''
+        ns = self.data.group_naos(self.mol)
+        # flops per grid point of a group of ns AOs, per set: the dm path
+        # c_dm*ns^2 (2*ns^2 per GEMM, ns^2 per component of a dsyrk: LDA the
+        # density and a dsyrk, GGA two GEMMs, meta-GGA five GEMMs and a dsyrk
+        # of 3), the factored path 2*ns*r per GEMM of the density (LDA 1, GGA 2,
+        # meta-GGA 4) and 2*ns*nq per segment of the matrix (LDA 1, GGA 2,
+        # meta-GGA 5); and once per pass of rks_fxc_mo 2*ns*(r+nq) per AO
+        # component (LDA 1, GGA and meta-GGA 4) for the products with B and Q
+        c_dm, c_rho, c_v, c_pass = {'LDA': (3, 2, 2, 2), 'GGA': (4, 4, 4, 8),
+                                    'MGGA': (13, 8, 10, 8)}[xctype]
+        npass = -(-nset // self.mo_chunk(nset, nq))
+        cost_dm = nset * c_dm * (ns**2).sum()
+        cost_lr = (nset * (c_rho*r + c_v*nq) + npass * c_pass*(r+nq)) * ns.sum()
+        return cost_lr < .8 * cost_dm
+
+    def rks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out):
+        '''out[k] += P^T v1[k] Q for the XC responses v1[k] that nr_rks_fxc
+        computes with the kernel fxc for the symmetric dms A[k] B^T + B A[k]^T'''
+        nset = len(A)
+        nq = Q.shape[1]
+        nrho = _FUSED_NRHO[xctype]
+        ngrids = self.grids.weights.size
+        ngemm = BLKSIZE * 4  # the GEMM groups (GEMM_NGRIDS) of the kernels
+        nchunk = self.mo_chunk(nset, nq)
+        for k0, k1 in lib.prange(0, nset, nchunk):
+            n = k1 - k0
+            # rho1 and wv of a block in a quarter of max_memory
+            blksize = int(self.max_memory*.25e6 / (16*n*nrho*ngemm))
+            blksize = max(1, min(blksize, 300)) * ngemm
+            vq = numpy.zeros((n, self.nao, nq))
+            for ip0, ip1 in lib.prange(0, ngrids, blksize):
+                weight = self.grids.weights[ip0:ip1]
+                _fxc = fxc[:,:,ip0:ip1]
+                rho1 = self.rho_lowrank(ip0, ip1, A[k0:k1], B, xctype)
+                wv = numpy.empty((n, nrho, ip1-ip0))
+                for i in range(n):
+                    if xctype == 'LDA':
+                        wv[i] = weight * rho1[i] * _fxc[0]
+                    else:
+                        wv[i] = numpy.einsum('yg,xyg,g->xg', rho1[i], _fxc, weight)
+                if xctype != 'LDA':
+                    wv[:,0] *= .5
+                if xctype == 'MGGA':
+                    wv[:,4] *= .5
+                self.dot_ao_mo(ip0, ip1, wv, xctype, Q, vq)
+            out[k0:k1] += lib.einsum('pa,kpi->kai', P, vq)
+        return out
+
     def nr_rks(self, ni, xc_code, xctype, dms, hermi, nelec, excsum, vmat):
         '''The loop of nr_rks; adds to nelec, excsum and vmat[nset,nao,nao],
         and returns the XC matrices as nr_rks does.'''
@@ -1356,11 +1456,13 @@ def _xc_hess_diag_terms(xctype):
             bras[i] += [[(_AO_D3[i][k], -1)] for k in range(3)]
     return _pack_terms(kets, bras, 3)
 
-def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None):
+def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None,
+              match_block_loop=True):
     '''A _FusedXC for the blocks NumInt.block_loop would give the callers of
     _sparse_reader_kw, if the fused kernels can take them all: FUSED_XC,
     NumInt's own functions and real density matrices (_sparse_reader_kw),
-    spherical GTOs, and the sparse path on every block. Otherwise None.
+    spherical GTOs, and with match_block_loop the sparse path on every block
+    (the kernels give the results of the sparse ones). Otherwise None.
     '''
     if (not FUSED_XC or xctype not in _FUSED_XCTYPE or mol.cart or
             not _sparse_reader_kw(ni, *dms_list)):
@@ -1378,8 +1480,8 @@ def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None):
         blksize = int(max_memory*1e6/((comp+1)*nao*8*BLKSIZE))
         blksize = max(4, min(blksize, ngrids//BLKSIZE+1, 1200)) * BLKSIZE
     blocks = list(lib.prange(0, ngrids, blksize))
-    if nao <= SWITCH_SIZE and not all(_sparse_enough(screen_index[ip0//BLKSIZE:])
-                                      for ip0, ip1 in blocks):
+    if (match_block_loop and nao <= SWITCH_SIZE and
+            not all(_sparse_enough(screen_index[ip0//BLKSIZE:]) for ip0, ip1 in blocks)):
         return None
     data = _grid_ao_data(mol, grids, deriv, max_memory)
     return _FusedXC(mol, grids, nao, data, blocks, max_memory)

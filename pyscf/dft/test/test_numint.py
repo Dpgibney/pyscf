@@ -393,6 +393,35 @@ class KnownValues(unittest.TestCase):
             numint._dot_sets_aow_ao(out, ao, wv, mask, mol.ao_loc_nr())
             self.assertAlmostEqual(abs(out - ref).max(), 0, 12)
 
+    def test_fxc_lowrank(self):
+        # The fxc contraction of the CPHF-type dms mo x_k mocc^T + h.c. from their
+        # factors (numint._FusedXC.rks_fxc_mo), against nr_rks_fxc projected on
+        # the orbitals
+        numpy.random.seed(6)
+        nao = mol.nao_nr()
+        grids = mf.grids
+        mo = numpy.linalg.qr(numpy.random.random((nao,nao)))[0]
+        occ = numpy.zeros(nao)
+        occ[:6] = 2
+        mocc = mo[:,:6]
+        x = numpy.random.random((3,nao,6)) - .5
+        dm1 = lib.einsum('pa,kai,qi->kpq', mo, x, mocc)
+        dm1 = dm1 + dm1.transpose(0,2,1)
+        ni = numint.NumInt()
+        for xc in ('lda,vwn', 'pbe', 'r2scan'):
+            xctype = ni._xc_type(xc)
+            fxc = ni.cache_xc_kernel(mol, grids, xc, mo, occ)[2]
+            v1 = ni.nr_rks_fxc(mol, grids, xc, None, dm1, hermi=1, fxc=fxc)
+            ref = lib.einsum('pa,kpq,qi->kai', mo, v1, mocc)
+            # max_memory 1e-3: one dm per pass over the grids, blocks of 224 points
+            for max_memory in (2000, 1e-3):
+                fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (mo,),
+                                         match_block_loop=False)
+                out = numpy.zeros_like(ref)
+                fused.rks_fxc_mo(ni, xctype, fxc, lib.einsum('pa,kai->kpi', mo, x),
+                                 mocc, mo, mocc, out)
+                self.assertAlmostEqual(abs(out - ref).max() / abs(ref).max(), 0, 13)
+
     def test_fused_xc_deriv(self):
         # The XC terms of gradients and of the Hessian's AO-diagonal part with the
         # AO values computed in the kernels (numint._FusedXC.dot_terms)

@@ -113,6 +113,26 @@ class KnownValues(unittest.TestCase):
                     with self.assertRaisesRegex(NotImplementedError, 'grid response'):
                         hess.make_h1(None, None)
 
+    def test_cphf_xc_lowrank(self):
+        # The CPHF operator with the XC response from the factors of the dms
+        # (vind_mo of the response function, either path) against the one from
+        # the dms
+        from pyscf.dft import numint
+        from pyscf.hessian import rhf as rhf_hess
+        numpy.random.seed(2)
+        for xc in ('lda,vwn', 'b3lyp', 'r2scan'):
+            mf = dft.RKS(mol, xc=xc).run(conv_tol=1e-8)
+            mo, occ = mf.mo_coeff, mf.mo_occ
+            mo1 = numpy.random.random((6, mo.shape[1], (occ > 0).sum())) - .5
+            self.assertTrue(hasattr(mf.gen_response(mo, occ, hermi=1), 'vind_mo'))
+            with lib.temporary_env(numint, FUSED_XC=False):
+                ref = rhf_hess.gen_vind(mf, mo, occ)(mo1)
+            for cheaper in (True, False):
+                with lib.temporary_env(numint._FusedXC,
+                                       lowrank_cheaper=lambda *args: cheaper):
+                    v = rhf_hess.gen_vind(mf, mo, occ)(mo1)
+                self.assertAlmostEqual(abs(v - ref).max() / abs(ref).max(), 0, 13)
+
     def test_rks_hess_atmlst(self):
         mf = dft.RKS(mol)
         mf.xc = 'pbe0'
