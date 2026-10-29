@@ -1018,7 +1018,8 @@ class _FusedXC:
     matrices or potentials of a block at once. They are the sparse kernels
     _eval_rho_sparse, eval_rho2's _dot_ao_dm, _dot_ao_ao_sparse,
     _dot_ao_aow_sparse and _tau_dot_sparse without the AO arrays, and the
-    results equal those of the block_loop path bit for bit.
+    results equal those of the block_loop path on the same blocks bit for bit.
+    The fxc contractions take blocks of their own (_fused_fxc_blksize).
     '''
     def __init__(self, mol, grids, nao, data, blocks, max_memory):
         self.mol = mol
@@ -1243,9 +1244,9 @@ class _FusedXC:
         return self._vmat(xctype, vmat, vtau).reshape(2, nset, nao, nao)
 
     def rks_fxc(self, ni, xctype, fxc, dms, hermi, vmat):
-        '''The loop of nr_rks_fxc (_rks_fxc_batch for LDA and GGA) with the
-        kernel fxc; adds to vmat[nset,nao,nao] and returns the XC response
-        matrices as nr_rks_fxc does.'''
+        '''The loop of nr_rks_fxc (_rks_fxc_batch for LDA and GGA, on the blocks
+        of _fused_fxc_blksize) with the kernel fxc; adds to vmat[nset,nao,nao]
+        and returns the XC response matrices as nr_rks_fxc does.'''
         make_rho1 = self.rho_evaluator(ni, [dms], hermi, xctype)
         nset = vmat.shape[0]
         vtau = numpy.zeros_like(vmat) if xctype == 'MGGA' else None
@@ -2125,6 +2126,18 @@ def _rks_fxc_blksize(xctype, nset, nao, ngrids, max_memory):
     blksize = int(max_memory*1e6/((comp+1+2*nset)*nao*8*BLKSIZE))
     return max(4, min(blksize, ngrids//BLKSIZE+1, 1200)) * BLKSIZE
 
+def _fused_fxc_blksize(xctype, nset, nao, ngrids, max_memory):
+    '''The grid block size of _FusedXC.rks_fxc and uks_fxc for nset dms:
+    block_loop's, with fewer points where rho1 and wv of the dms would take
+    more than a quarter of max_memory. (The kernels hold no AO arrays. The
+    blocks of _rks_fxc_batch, which shrink with nset for its AO arrays, would
+    multiply the private XC matrices that the kernels sum per block.)'''
+    ao_deriv = 0 if xctype == 'LDA' else 1
+    comp = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
+    blksize = min(max_memory*1e6/((comp+1)*nao*8*BLKSIZE),
+                  max_memory*.25e6/(16*nset*_FUSED_NRHO[xctype]*BLKSIZE))
+    return max(4, min(int(blksize), ngrids//BLKSIZE+1, 1200)) * BLKSIZE
+
 def _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1, nbins,
                    pair_mask, ao_loc, max_memory):
     '''nr_rks_fxc for real dms and LDA/GGA kernels. On dense grid blocks the
@@ -2277,9 +2290,7 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     if xctype in _FUSED_XCTYPE and dtype == numpy.double:
         if grids.coords is None:
             grids.build(with_non0tab=True)
-        blksize = None  # block_loop's
-        if xctype != 'MGGA':  # those of _rks_fxc_batch
-            blksize = _rks_fxc_blksize(xctype, nset, nao, grids.weights.size, max_memory)
+        blksize = _fused_fxc_blksize(xctype, nset, nao, grids.weights.size, max_memory)
         fused = _fused_xc(ni, mol, grids, nao, xctype, max_memory, (dms,), blksize)
     if fused is not None:
         vmat = fused.rks_fxc(ni, xctype, fxc, dms, hermi, vmat)
@@ -2564,7 +2575,12 @@ def nr_uks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     pair_mask = mol.get_overlap_cond() < -numpy.log(ni.cutoff)
     vmat = numpy.zeros((2,nset,nao,nao))
     aow = None
-    fused = _fused_xc(ni, mol, grids, nao, xctype, max_memory, (dma, dmb))
+    fused = None
+    if xctype in _FUSED_XCTYPE:
+        if grids.coords is None:
+            grids.build(with_non0tab=True)
+        blksize = _fused_fxc_blksize(xctype, 2*nset, nao, grids.weights.size, max_memory)
+        fused = _fused_xc(ni, mol, grids, nao, xctype, max_memory, (dma, dmb), blksize)
     if fused is not None:
         vmat = fused.uks_fxc(ni, xctype, fxc, dma, dmb, hermi, vmat)
 
