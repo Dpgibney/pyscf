@@ -1038,7 +1038,8 @@ class _FusedXC:
     _rho1_preferred), and the GGA gradient from the orbitals takes one GEMM fewer
     than eval_rho2; both agree with the block_loop path to rounding.
     The fxc contractions take blocks of their own (_fused_fxc_blksize), and
-    rks_fxc_mo the factors of CPHF-type dms instead of the dms.
+    rks_fxc_mo the factors of the response dms of CPHF and TDDFT instead of the
+    dms.
     '''
     def __init__(self, mol, grids, nao, data, blocks, max_memory):
         self.mol = mol
@@ -1510,6 +1511,17 @@ def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None,
         return None
     data = _grid_ao_data(mol, grids, deriv, max_memory)
     return _FusedXC(mol, grids, nao, data, blocks, max_memory)
+
+def _fused_xc_mo(ni, mol, grids, xctype, max_memory):
+    '''A _FusedXC for the XC responses of response dms from their factors
+    (rks_fxc_mo) in place of ni.nr_rks_fxc or ni.nr_rks_fxc_st, if those are
+    NumInt's own (whose results rks_fxc_mo gives to rounding) and the fused
+    kernels apply (_fused_xc); otherwise None. The factors must be real.'''
+    for key in ('nr_rks_fxc', 'nr_rks_fxc_st'):
+        if inspect.getattr_static(ni, key, None) is not inspect.getattr_static(NumInt, key):
+            return None
+    return _fused_xc(ni, mol, grids, mol.nao_nr(), xctype, max_memory, (),
+                     match_block_loop=False)
 
 def _fused_rho_mo(ni, mol, grids, nao, xctype, max_memory, mo_coeff, mo_occ):
     '''make_rho(ip0, ip1) of _FusedXC.rho_mo_evaluator for the densities of

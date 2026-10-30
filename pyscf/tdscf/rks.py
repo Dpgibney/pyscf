@@ -85,6 +85,9 @@ class CasidaTDDFT(TDDFT, TDA):
         hdiag = e_ia.ravel() ** 2
 
         vresp = self.gen_response(singlet=singlet, hermi=1)
+        # The XC response from the factors of the dms where the response
+        # function offers it
+        vind_lowrank = getattr(vresp, 'vind_lowrank', None)
 
         def vind(zs):
             zs = numpy.asarray(zs).reshape(-1,nocc,nvir)
@@ -93,8 +96,15 @@ class CasidaTDDFT(TDDFT, TDA):
             # +cc for A+B and K_{ai,jb} in A == K_{ai,bj} in B
             dms = dms + dms.transpose(0,2,1)
 
-            v1ao = vresp(dms)
-            v1mo = lib.einsum('xpq,qo,pv->xov', v1ao, orbo, orbv)
+            if vind_lowrank is None:
+                v1ao = vresp(dms)
+                v1mo = lib.einsum('xpq,qo,pv->xov', v1ao, orbo, orbv)
+            else:
+                # dms = a orbo^T + orbo a^T, a = orbv (z*d_ia*2)^T
+                a = lib.einsum('xov,pv->xpo', zs * (d_ia*2), orbv)
+                v1ao, v1xc = vind_lowrank(dms, a, orbv, orbo)
+                v1mo = lib.einsum('xpq,qo,pv->xov', v1ao, orbo, orbv)
+                v1mo += v1xc.transpose(0,2,1)
 
             # numpy.sqrt(e_ia) * (e_ia*d_ia*z + v1mo)
             v1mo += numpy.einsum('xov,ov->xov', zs, ed_ia)

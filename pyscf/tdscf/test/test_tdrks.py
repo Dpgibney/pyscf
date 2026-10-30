@@ -520,6 +520,34 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(td._scf.mol is mol1)
         self.assertTrue(td._scf._scf.mol is mol1)
 
+    def test_td_xc_lowrank(self):
+        # The TD operators with the XC response from the factors of the trial
+        # dms (vind_lowrank of the response function, either path) against
+        # those from the dms
+        from pyscf.dft import numint
+        numpy.random.seed(3)
+        for mf1 in (mf_lda, mf_bp86, mf_b3lyp, mf_m06l):
+            nocc = (mf1.mo_occ > 0).sum()
+            nov = nocc * (mf1.mo_occ.size - nocc)
+            methods = [rks.TDA, rks.TDDFT]
+            if not mf1._numint.libxc.is_hybrid_xc(mf1.xc):
+                methods.append(rks.CasidaTDDFT)
+            for method in methods:
+                for singlet in (True, False):
+                    td = method(mf1)
+                    td.singlet = singlet
+                    nvec = 2 * nov if method is rks.TDDFT else nov
+                    x = numpy.random.random((5, nvec)) - .5
+                    self.assertTrue(hasattr(td.gen_response(singlet=singlet, hermi=0),
+                                            'vind_lowrank'))
+                    with lib.temporary_env(numint, FUSED_XC=False):
+                        ref = td.gen_vind()[0](x)
+                    for cheaper in (True, False):
+                        with lib.temporary_env(numint._FusedXC,
+                                               lowrank_cheaper=lambda *args: cheaper):
+                            v = td.gen_vind()[0](x)
+                        self.assertAlmostEqual(abs(v - ref).max() / abs(ref).max(), 0, 13)
+
     @unittest.skipIf(has_xcfun, "xcfun library not found.")
     def test_custom_rsh(self):
         mol = gto.M(atom='H 0 0 0.6; H 0 0 0', basis = "6-31g")

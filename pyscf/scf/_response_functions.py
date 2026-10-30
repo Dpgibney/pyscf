@@ -79,8 +79,8 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
         if not with_nlc and mf.do_nlc():
             logger.warn(mf, "NLC contribution in gen_response is NOT included")
 
-        if singlet is None:
-            # Without specify singlet, used in ground state orbital hessian
+        triplet = singlet is not None and not singlet
+        if not triplet:
             def vind_jk(dm1, v1):
                 '''v1 += the Coulomb and exchange response of dm1'''
                 if hybrid:
@@ -106,106 +106,10 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 elif hermi != 2:
                     v1 += mf.get_j(mol, dm1, hermi=hermi)
                 return v1
-
-            def vind_nlc(dm1, v1):
-                if with_nlc and mf.do_nlc():
-                    # Cannot import at top due to circular dependency
-                    from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
-                    if mo_coeff is not None and mo_occ is not None:
-                        v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1, max_memory)
-                    else:
-                        v1 += get_vnlc_resp1(mf, mol, dm0, dm1, max_memory)
-                return v1
-
-            def vind(dm1):
-                # The singlet hessian
-                if hermi == 2:
-                    v1 = numpy.zeros_like(dm1)
-                else:
-                    v1 = ni.nr_rks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
-                                       rho0, vxc, fxc, max_memory=max_memory)
-                    v1 = vind_nlc(dm1, v1)
-                return vind_jk(dm1, v1)
-
-            # For dms of the form mo_coeff x mocc^T + h.c., as in CPHF, the XC
-            # part can take the factors x instead of the dms (fewer flops where
-            # nocc is small next to the AOs of a grid group): vind.vind_mo(dm1,
-            # x) returns mo_coeff^T vind(dm1) mocc by the cheaper path for
-            # len(x) dms.
-            if hermi == 1 and mo_coeff is not None and mo_occ is not None:
-                from pyscf.dft import numint
-                xctype = ni._xc_type(mf.xc)
-                mocc = mo_coeff[:,mo_occ>0]
-                nmo, nocc = mo_coeff.shape[1], mocc.shape[1]
-                fused = numint._fused_xc(ni, mol, grids, mo_coeff.shape[0], xctype,
-                                         max_memory, (mo_coeff,), match_block_loop=False)
-                if fused is not None:
-                    def vind_mo(dm1, x):
-                        '''mo_coeff^T vind(dm1) mocc for the symmetric dms
-                        dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc]'''
-                        x = numpy.asarray(x).reshape(-1,nmo,nocc)
-                        v1mo = numpy.zeros((len(x),nmo,nocc))
-                        if fused.lowrank_cheaper(xctype, nocc, nocc, len(x)):
-                            a = lib.einsum('pa,kai->kpi', mo_coeff, x)
-                            fused.rks_fxc_mo(ni, xctype, fxc, a, mocc, mo_coeff, mocc, v1mo)
-                            v1 = vind_jk(dm1, vind_nlc(dm1, numpy.zeros_like(dm1)))
-                        else:
-                            v1 = vind(dm1)
-                        for i, v in enumerate(v1):
-                            v1mo[i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
-                        return v1mo
-                    vind.vind_mo = vind_mo
-
-        elif singlet:
-            fxc *= .5
-            def vind(dm1):
-                if hermi == 2:
-                    v1 = numpy.zeros_like(dm1)
-                else:
-                    # nr_rks_fxc_st requires alpha of dm1, dm1*.5 should be scaled
-                    v1 = ni.nr_rks_fxc_st(mol, grids, mf.xc, dm0, dm1, hermi, True,
-                                          rho0, vxc, fxc, max_memory=max_memory)
-                    if with_nlc and mf.do_nlc():
-                        # Cannot import at top due to circular dependency
-                        from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
-                        if mo_coeff is not None and mo_occ is not None:
-                            v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1, max_memory)
-                        else:
-                            v1 += get_vnlc_resp1(mf, mol, dm0, dm1, max_memory)
-                if hybrid:
-                    if omega == 0:
-                        vj, vk = mf.get_jk(mol, dm1, hermi)
-                        vk *= hyb
-                    elif alpha == 0: # LR=0, only SR exchange
-                        vj = mf.get_j(mol, dm1, hermi)
-                        vk = mf.get_k(mol, dm1, hermi, omega=-omega)
-                        vk *= hyb
-                    elif hyb == 0: # SR=0, only LR exchange
-                        vj = mf.get_j(mol, dm1, hermi)
-                        vk = mf.get_k(mol, dm1, hermi, omega=omega)
-                        vk *= alpha
-                    else: # SR and LR exchange with different ratios
-                        vj, vk = mf.get_jk(mol, dm1, hermi)
-                        vk *= hyb
-                        vk += mf.get_k(mol, dm1, hermi, omega=omega) * (alpha-hyb)
-                    if hermi != 2:
-                        v1 += vj - .5 * vk
-                    else:
-                        v1 += -.5 * vk
-                elif hermi != 2:
-                    v1 += mf.get_j(mol, dm1, hermi=hermi)
-                return v1
-        else:  # triplet
-            fxc *= .5
-            def vind(dm1):
-                if hermi == 2:
-                    v1 = numpy.zeros_like(dm1)
-                else:
-                    # nr_rks_fxc_st requires alpha of dm1, dm1*.5 should be scaled
-                    v1 = ni.nr_rks_fxc_st(mol, grids, mf.xc, dm0, dm1, hermi, False,
-                                          rho0, vxc, fxc, max_memory=max_memory)
-                    if with_nlc and mf.do_nlc():
-                        pass # fxc = 0, do nothing
+        else:
+            def vind_jk(dm1, v1):
+                '''v1 += the exchange response of dm1 (triplets have no Coulomb
+                response)'''
                 if hybrid:
                     if omega == 0:
                         vk = mf.get_k(mol, dm1, hermi) * hyb
@@ -218,6 +122,89 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                         vk += mf.get_k(mol, dm1, hermi, omega=omega) * (alpha-hyb)
                     v1 += -.5 * vk
                 return v1
+
+        def vind_nlc(dm1, v1):
+            # The NLC fxc of triplets is 0
+            if with_nlc and mf.do_nlc() and not triplet:
+                # Cannot import at top due to circular dependency
+                from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
+                if mo_coeff is not None and mo_occ is not None:
+                    v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1, max_memory)
+                else:
+                    v1 += get_vnlc_resp1(mf, mol, dm0, dm1, max_memory)
+            return v1
+
+        if singlet is None:
+            # Without specify singlet, used in ground state orbital hessian
+            def vind_xc(dm1):
+                return ni.nr_rks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
+                                     rho0, vxc, fxc, max_memory=max_memory)
+        else:
+            fxc *= .5
+            def vind_xc(dm1):
+                # nr_rks_fxc_st requires alpha of dm1, dm1*.5 should be scaled
+                return ni.nr_rks_fxc_st(mol, grids, mf.xc, dm0, dm1, hermi, not triplet,
+                                        rho0, vxc, fxc, max_memory=max_memory)
+
+        def vind(dm1):
+            if hermi == 2:
+                v1 = numpy.zeros_like(dm1)
+            else:
+                v1 = vind_nlc(dm1, vind_xc(dm1))
+            return vind_jk(dm1, v1)
+
+        # The XC response of dms whose symmetric parts are a[k] Q^T + Q a[k]^T,
+        # as in CPHF (a = mo_coeff x, Q = mocc) and TDDFT (TDA: a = orbv z^T,
+        # Q = orbo), can take the factors instead of the dms, with fewer flops
+        # where Q has few columns next to the AOs of a grid group.
+        # vind.vind_lowrank(dm1, a, P, Q) returns (v1, w) with vind(dm1) = v1 +
+        # v_xc, the XC response, and w[k] = P^T v_xc[k] Q where that path is
+        # cheaper for len(a) dms; otherwise (vind(dm1), 0).
+        fused = None
+        if hermi != 2:
+            from pyscf.dft import numint
+            xctype = ni._xc_type(mf.xc)
+            fused = numint._fused_xc_mo(ni, mol, grids, xctype, max_memory)
+        if fused is not None:
+            fxc_mo = None
+            def vind_lowrank(dm1, a, P, Q):
+                '''(v1, w): vind(dm1) = v1 + v_xc, w[k] = P^T v_xc[k] Q or 0, for
+                dms dm1 whose symmetric parts are a[k] Q^T + Q a[k]^T'''
+                nonlocal fxc_mo
+                a = numpy.asarray(a)
+                w = numpy.zeros((len(a), P.shape[1], Q.shape[1]))
+                if (a.dtype == P.dtype == Q.dtype == numpy.double and
+                        fused.lowrank_cheaper(xctype, a.shape[2], Q.shape[1], len(a))):
+                    if fxc_mo is None:
+                        # the kernel that vind_xc contracts with
+                        if singlet is None:
+                            fxc_mo = fxc
+                        elif not triplet:
+                            fxc_mo = fxc[0,:,0] + fxc[0,:,1]
+                        else:
+                            fxc_mo = fxc[0,:,0] - fxc[0,:,1]
+                    fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w)
+                    v1 = vind_jk(dm1, vind_nlc(dm1, numpy.zeros_like(dm1)))
+                else:
+                    v1 = vind(dm1)
+                return v1, w
+            vind.vind_lowrank = vind_lowrank
+
+            # vind.vind_mo(dm1, x) returns mo_coeff^T vind(dm1) mocc for CPHF's
+            # dms dm1 = mo_coeff x mocc^T + h.c.
+            if singlet is None and mo_coeff is not None and mo_occ is not None:
+                mocc = mo_coeff[:,mo_occ>0]
+                nmo, nocc = mo_coeff.shape[1], mocc.shape[1]
+                def vind_mo(dm1, x):
+                    '''mo_coeff^T vind(dm1) mocc for the symmetric dms
+                    dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc]'''
+                    x = numpy.asarray(x).reshape(-1,nmo,nocc)
+                    a = lib.einsum('pa,kai->kpi', mo_coeff, x)
+                    v1, v1mo = vind_lowrank(dm1, a, mo_coeff, mocc)
+                    for i, v in enumerate(v1):
+                        v1mo[i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
+                    return v1mo
+                vind.vind_mo = vind_mo
 
     else:  # HF
         if (singlet is None or singlet) and hermi != 2:
