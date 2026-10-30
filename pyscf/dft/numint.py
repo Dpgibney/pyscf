@@ -1267,27 +1267,34 @@ class _FusedXC:
         return max(1, min(nset, int(n)))
 
     def lowrank_cheaper(self, xctype, r, nq, nset):
-        '''Whether rks_fxc_mo (rho_lowrank, dot_ao_mo) takes fewer flops than
-        rks_fxc (the dm kernels) for nset symmetric dms of rank 2*r and the
-        products of their XC responses with nq orbitals'''
+        '''Whether rks_fxc_mo in one kernel (VXCfused_fxc_lowrank, Q = B) takes
+        less time than rks_fxc (the dm kernels) for nset symmetric dms of rank
+        2*r and the products of their XC responses with nq orbitals, by a flop
+        model'''
         ns = self.data.group_naos(self.mol)
         # flops per grid point of a group of ns AOs, per set: the dm path
         # c_dm*ns^2 (2*ns^2 per GEMM, ns^2 per component of a dsyrk: LDA the
         # density and a dsyrk, GGA two GEMMs, meta-GGA five GEMMs and a dsyrk
         # of 3), the factored path 2*ns*r per GEMM of the density (LDA 1, GGA 2,
         # meta-GGA 4) and 2*ns*nq per segment of the matrix (LDA 1, GGA 2,
-        # meta-GGA 5); and once per pass of rks_fxc_mo 2*ns*(r+nq) per AO
-        # component (LDA 1, GGA and meta-GGA 4) for the products with B and Q
-        c_dm, c_rho, c_v, c_pass = {'LDA': (3, 2, 2, 2), 'GGA': (4, 4, 4, 8),
-                                    'MGGA': (13, 8, 10, 8)}[xctype]
+        # meta-GGA 5); and once per pass of rks_fxc_mo 2*ns*nq per AO
+        # component (LDA 1, GGA and meta-GGA 4) for the products with Q = B.
+        # A factored flop took 0.6-0.8 (LDA), 0.83-1.0 (GGA) and 0.9-1.0
+        # (meta-GGA) of the time of a dm flop (benzene, caffeine and
+        # n-C20H42/def2-SVP, 1-40 dms, 10 threads), whence the factors w_lr.
+        c_dm, c_rho, c_v, c_pass, w_lr = {'LDA': (3, 2, 2, 2, .8), 'GGA': (4, 4, 4, 8, .9),
+                                          'MGGA': (13, 8, 10, 8, 1.)}[xctype]
         npass = -(-nset // self.mo_chunk(nset, nq))
         cost_dm = nset * c_dm * (ns**2).sum()
-        cost_lr = (nset * (c_rho*r + c_v*nq) + npass * c_pass*(r+nq)) * ns.sum()
-        return cost_lr < .8 * cost_dm
+        cost_lr = (nset * (c_rho*r + c_v*nq) + npass * c_pass*nq) * ns.sum()
+        return w_lr * cost_lr < cost_dm
 
-    def rks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out):
+    def rks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out, one_pass=None):
         '''out[k] += P^T v1[k] Q for the XC responses v1[k] that nr_rks_fxc
-        computes with the kernel fxc for the symmetric dms A[k] B^T + B A[k]^T'''
+        computes with the kernel fxc for the symmetric dms A[k] B^T + B A[k]^T.
+        Where Q is B (one_pass=None) one kernel takes the densities, potentials
+        and v1 Q of each group of points (VXCfused_fxc_lowrank); otherwise
+        rho_lowrank, _fxc_wv and dot_ao_mo do in turn on blocks of points.'''
         nset = len(A)
         nq = Q.shape[1]
         nrho = _FUSED_NRHO[xctype]
@@ -1295,6 +1302,23 @@ class _FusedXC:
         ngemm = BLKSIZE * GEMM_NBLK  # the GEMM groups (GEMM_NGRIDS) of the kernels
         nchunk = self.mo_chunk(nset, nq)
         fxc = numpy.ascontiguousarray(fxc)
+        if one_pass is None:
+            one_pass = Q is B
+        if one_pass:
+            assert Q.shape == B.shape
+            A = numpy.asarray(A, dtype=numpy.double, order='C')
+            B = numpy.asarray(B, dtype=numpy.double, order='C')
+            weights = numpy.asarray(self.grids.weights, dtype=numpy.double, order='C')
+            for k0, k1 in lib.prange(0, nset, nchunk):
+                vq = numpy.zeros((k1-k0, self.nao, nq))
+                libdft.VXCfused_fxc_lowrank(
+                    vq.ctypes.data_as(ctypes.c_void_p), A[k0:k1].ctypes.data_as(ctypes.c_void_p),
+                    B.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(k1-k0), ctypes.c_int(nq),
+                    fxc.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(fxc.shape[2]),
+                    weights.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_FUSED_XCTYPE[xctype]),
+                    *self._args(0, ngrids, 0 if xctype == 'LDA' else 1))
+                out[k0:k1] += lib.einsum('pa,kpi->kai', P, vq)
+            return out
         for k0, k1 in lib.prange(0, nset, nchunk):
             n = k1 - k0
             # rho1 and wv of a block in a quarter of max_memory

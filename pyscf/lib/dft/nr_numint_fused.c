@@ -896,6 +896,107 @@ void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
         free(vprivs);
 }
 
+// out[n,l] = src[i,l] for the n-th AO i of the group, src[nao,ncol]
+static void _gather_rows(double *out, double *src, int ncol, GemmGroup *g)
+{
+        const size_t Ncol = ncol;
+        size_t n, q;
+        int s;
+        for (s = 0; s < g->nseg; s++) {
+                double *pin = src + g->seg_ao[s] * Ncol;
+                n = g->seg_len[s] * Ncol;
+                for (q = 0; q < n; q++) {
+                        out[q] = pin[q];
+                }
+                out += n;
+        }
+}
+
+/*
+ * The densities rho[c*ldrho+q] (c < nrho, q < ng) on a group of the symmetric
+ * matrix D = A B^T + B A^T, from the rows abuf[ns,r] of A for the AOs of the
+ * group and TB[c] = ao[c] B (tb[c,l,q]). TA[c] = ao[c] A goes to ta[c,l,q],
+ * and for GGA Z = A TB[0]^T to zbuf[ns,ng].
+ */
+static void _lowrank_rho(double *rho, size_t ldrho, double *aobuf, double *abuf,
+                         double *ta, double *tb, double *zbuf, int nderiv,
+                         int ns, int ng, int r)
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        const size_t Nr = r;
+        const int nta = nderiv == 2 ? 4 : 1;
+        double *prho, *pa, *pb, *pa0, *pb0, *pao, *pz;
+        int c, i, l, q;
+        for (c = 0; c < nta; c++) {
+                dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
+                       aobuf + c * (size_t)ns * ng, &ng, abuf, &r,
+                       &D0, ta + c * Nr * ng, &ng);
+        }
+        _contract_mo(rho, ta, tb, r, ng);
+        for (q = 0; q < ng; q++) {
+                rho[q] *= 2;
+        }
+        if (nderiv == 0) {
+                return;
+        }
+        if (nderiv == 1) {
+                // zbuf[n,q] = sum_l abuf[n,l] tb[0,l,q]
+                dgemm_(&TRANS_N, &TRANS_N, &ng, &ns, &r, &D1,
+                       tb, &ng, abuf, &r, &D0, zbuf, &ng);
+                for (c = 1; c < 4; c++) {
+                        prho = rho + c * ldrho;
+                        pb = tb + c * Nr * ng;
+                        _contract_mo(prho, ta, pb, r, ng);
+                        pao = aobuf + c * (size_t)ns * ng;
+                        for (i = 0; i < ns; i++) {
+                                pa = pao + i * (size_t)ng;
+                                pz = zbuf + i * (size_t)ng;
+                                for (q = 0; q < ng; q++) {
+                                        prho[q] += pa[q] * pz[q];
+                                }
+                        }
+                        for (q = 0; q < ng; q++) {
+                                prho[q] *= 2;
+                        }
+                }
+                return;
+        }
+        for (c = 1; c < 4; c++) {
+                prho = rho + c * ldrho;
+                pa = ta + c * Nr * ng;
+                pb = tb + c * Nr * ng;
+                for (q = 0; q < ng; q++) {
+                        prho[q] = pa[q] * tb[q] + ta[q] * pb[q];
+                }
+                for (l = 1; l < r; l++) {
+                        pa0 = ta + l * (size_t)ng;
+                        pb0 = tb + l * (size_t)ng;
+                        for (q = 0; q < ng; q++) {
+                                prho[q] += pa[l*ng+q] * pb0[q] + pa0[q] * pb[l*ng+q];
+                        }
+                }
+                for (q = 0; q < ng; q++) {
+                        prho[q] *= 2;
+                }
+        }
+        prho = rho + 4 * ldrho;
+        for (q = 0; q < ng; q++) {
+                prho[q] = 0;
+        }
+        for (c = 1; c < 4; c++) {
+                pa = ta + c * Nr * ng;
+                pb = tb + c * Nr * ng;
+                for (l = 0; l < r; l++) {
+                        for (q = 0; q < ng; q++) {
+                                prho[q] += pa[l*ng+q] * pb[l*ng+q];
+                        }
+                }
+        }
+}
+
 /*
  * The densities of the symmetric matrices D[k] = A[k] B^T + B A[k]^T for real
  * A[nset,nao,r] and B[nao,r] (A[k] and B in C order): rho[k,0], for nderiv >= 1
@@ -942,9 +1043,7 @@ void VXCfused_eval_rho_lowrank(double *rho, double *A, double *B, int nset, int 
         // Z[i,q] (GGA)
         double *zbuf = nderiv == 1 ? malloc(sizeof(double) * max_nao * GEMM_NGRIDS) : NULL;
         double *work = malloc(sizeof(double) * EVAL_WORK(4));
-        double *rhok, *prho, *pa, *pb, *pa0, *pb0, *pin, *pout, *pao, *pz;
-        int igroup, blk0, blk1, ig0, ng, ns, k, c, i, l, q, s;
-        size_t nseg_r;
+        int igroup, blk0, blk1, ig0, ng, ns, k, c;
 #pragma omp for schedule(dynamic, 4)
         for (igroup = 0; igroup < ngroup; igroup++) {
                 blk0 = igroup * GEMM_NBLK;
@@ -959,16 +1058,7 @@ void VXCfused_eval_rho_lowrank(double *rho, double *A, double *B, int nset, int 
                 }
                 _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
                             nbas, atm, bas, env, work);
-                // bbuf[n,l] = B[i,l] for the n-th AO i of the group
-                pout = bbuf;
-                for (s = 0; s < g.nseg; s++) {
-                        pin = B + g.seg_ao[s] * Nr;
-                        nseg_r = g.seg_len[s] * Nr;
-                        for (q = 0; q < nseg_r; q++) {
-                                pout[q] = pin[q];
-                        }
-                        pout += nseg_r;
-                }
+                _gather_rows(bbuf, B, r, &g);
                 // tb[c,l,q] = sum_n aobuf[c,n,q] * bbuf[n,l]
                 for (c = 0; c < ntb; c++) {
                         dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
@@ -976,81 +1066,9 @@ void VXCfused_eval_rho_lowrank(double *rho, double *A, double *B, int nset, int 
                                &D0, tb + c * Nr * ng, &ng);
                 }
                 for (k = 0; k < nset; k++) {
-                        pout = abuf;
-                        for (s = 0; s < g.nseg; s++) {
-                                pin = A + k * nao * Nr + g.seg_ao[s] * Nr;
-                                nseg_r = g.seg_len[s] * Nr;
-                                for (q = 0; q < nseg_r; q++) {
-                                        pout[q] = pin[q];
-                                }
-                                pout += nseg_r;
-                        }
-                        for (c = 0; c < nta; c++) {
-                                dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
-                                       aobuf + c * (size_t)ns * ng, &ng, abuf, &r,
-                                       &D0, ta + c * Nr * ng, &ng);
-                        }
-                        rhok = rho + k * nrho * Ngrids + ig0;
-                        _contract_mo(rhok, ta, tb, r, ng);
-                        for (q = 0; q < ng; q++) {
-                                rhok[q] *= 2;
-                        }
-                        if (nderiv == 0) {
-                                continue;
-                        }
-                        if (nderiv == 1) {
-                                // zbuf[n,q] = sum_l abuf[n,l] tb[0,l,q]
-                                dgemm_(&TRANS_N, &TRANS_N, &ng, &ns, &r, &D1,
-                                       tb, &ng, abuf, &r, &D0, zbuf, &ng);
-                                for (c = 1; c < 4; c++) {
-                                        prho = rhok + c * Ngrids;
-                                        pb = tb + c * Nr * ng;
-                                        _contract_mo(prho, ta, pb, r, ng);
-                                        pao = aobuf + c * (size_t)ns * ng;
-                                        for (i = 0; i < ns; i++) {
-                                                pa = pao + i * (size_t)ng;
-                                                pz = zbuf + i * (size_t)ng;
-                                                for (q = 0; q < ng; q++) {
-                                                        prho[q] += pa[q] * pz[q];
-                                                }
-                                        }
-                                        for (q = 0; q < ng; q++) {
-                                                prho[q] *= 2;
-                                        }
-                                }
-                                continue;
-                        }
-                        for (c = 1; c < 4; c++) {
-                                prho = rhok + c * Ngrids;
-                                pa = ta + c * Nr * ng;
-                                pb = tb + c * Nr * ng;
-                                for (q = 0; q < ng; q++) {
-                                        prho[q] = pa[q] * tb[q] + ta[q] * pb[q];
-                                }
-                                for (l = 1; l < r; l++) {
-                                        pa0 = ta + l * (size_t)ng;
-                                        pb0 = tb + l * (size_t)ng;
-                                        for (q = 0; q < ng; q++) {
-                                                prho[q] += pa[l*ng+q] * pb0[q] + pa0[q] * pb[l*ng+q];
-                                        }
-                                }
-                                for (q = 0; q < ng; q++) {
-                                        prho[q] *= 2;
-                                }
-                        }
-                        prho = rhok + 4 * Ngrids;
-                        for (q = 0; q < ng; q++) {
-                                prho[q] = 0;
-                        }
-                        for (c = 1; c < 4; c++) {
-                                pa = ta + c * Nr * ng;
-                                pb = tb + c * Nr * ng;
-                                for (l = 0; l < r; l++) {
-                                        for (q = 0; q < ng; q++) {
-                                                prho[q] += pa[l*ng+q] * pb[l*ng+q];
-                                        }
-                                }
-                        }
+                        _gather_rows(abuf, A + k * nao * Nr, r, &g);
+                        _lowrank_rho(rho + k * nrho * Ngrids + ig0, Ngrids, aobuf, abuf,
+                                     ta, tb, zbuf, nderiv, ns, ng, r);
                 }
         }
         _gemm_group_free(&g);
@@ -1058,6 +1076,121 @@ void VXCfused_eval_rho_lowrank(double *rho, double *A, double *B, int nset, int 
         free(zbuf);
         free(work);
 }
+}
+
+/*
+ * The parts of the stacked GEMM of _ao_mo_dot that all sets share:
+ * bra[:,0] = ao[0]; for MGGA bra[:,1+x] = ao[x]; for GGA and MGGA
+ * ket[:,1] = fq[0].
+ */
+static void _ao_mo_shared(double *bra, double *ket, double *aobuf, double *fq,
+                          int xctype, int nseg, int ns, int ng, int nq)
+{
+        const size_t nk = nseg * ng;
+        double *src, *dst;
+        int n, p, q, x;
+        for (n = 0; n < ns; n++) {
+                src = aobuf + n * (size_t)ng;
+                dst = bra + n * nk;
+                for (q = 0; q < ng; q++) {
+                        dst[q] = src[q];
+                }
+                if (xctype == FUSED_MGGA) {
+                        for (x = 1; x < 4; x++) {
+                                src = aobuf + (x * (size_t)ns + n) * ng;
+                                dst = bra + n * nk + (1+x) * ng;
+                                for (q = 0; q < ng; q++) {
+                                        dst[q] = src[q];
+                                }
+                        }
+                }
+        }
+        if (xctype != FUSED_LDA) {
+                for (p = 0; p < nq; p++) {
+                        src = fq + p * (size_t)ng;
+                        dst = ket + p * nk + ng;
+                        for (q = 0; q < ng; q++) {
+                                dst[q] = src[q];
+                        }
+                }
+        }
+}
+
+/*
+ * vk[i,:] += (v Q)[i,:] for the AOs i of a group, v the XC matrix of the
+ * potential wv[c*ldwv+q] (q < ng) on the group, from fq[c,p,q] = (ao[c] Q)
+ * and the shared parts that _ao_mo_shared set in bra and ket.
+ */
+static void _ao_mo_dot(double *vk, double *wvk, size_t ldwv, double *aobuf, double *fq,
+                       double *ket, double *bra, double *vbuf, GemmGroup *g,
+                       int xctype, int nseg, int ns, int ng, int nq)
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        const int ncomp = xctype == FUSED_LDA ? 1 : 4;
+        const int nk = nseg * ng;
+        double *pw, *src, *dst, *pin, *pout;
+        int c, s, n, p, q, x;
+        size_t nseg_n;
+        // ket[:,0] = sum_c wv[c] fq[c]
+        for (p = 0; p < nq; p++) {
+                dst = ket + p * (size_t)nk;
+                src = fq + p * (size_t)ng;
+                for (q = 0; q < ng; q++) {
+                        dst[q] = src[q] * wvk[q];
+                }
+                for (c = 1; c < ncomp; c++) {
+                        src = fq + (c * (size_t)nq + p) * ng;
+                        pw = wvk + c * ldwv;
+                        for (q = 0; q < ng; q++) {
+                                dst[q] += src[q] * pw[q];
+                        }
+                }
+        }
+        if (xctype != FUSED_LDA) {
+                // bra[:,1] = sum_c wv[c] ao[c]
+                for (n = 0; n < ns; n++) {
+                        dst = bra + n * (size_t)nk + ng;
+                        src = aobuf + n * (size_t)ng;
+                        for (q = 0; q < ng; q++) {
+                                dst[q] = src[q] * wvk[q];
+                        }
+                        for (c = 1; c < 4; c++) {
+                                src = aobuf + (c * (size_t)ns + n) * ng;
+                                pw = wvk + c * ldwv;
+                                for (q = 0; q < ng; q++) {
+                                        dst[q] += src[q] * pw[q];
+                                }
+                        }
+                }
+        }
+        if (xctype == FUSED_MGGA) {
+                // ket[:,1+x] = wv[4] fq[x]
+                pw = wvk + 4 * ldwv;
+                for (x = 1; x < 4; x++) {
+                for (p = 0; p < nq; p++) {
+                        dst = ket + p * (size_t)nk + (1+x) * ng;
+                        src = fq + (x * (size_t)nq + p) * ng;
+                        for (q = 0; q < ng; q++) {
+                                dst[q] = src[q] * pw[q];
+                        }
+                } }
+        }
+        // vbuf[n,p] = sum_K bra[n,K] * ket[p,K], added to the rows of the
+        // group's AOs in vk
+        dgemm_(&TRANS_T, &TRANS_N, &nq, &ns, &nk, &D1, ket, &nk,
+               bra, &nk, &D0, vbuf, &nq);
+        pin = vbuf;
+        for (s = 0; s < g->nseg; s++) {
+                pout = vk + g->seg_ao[s] * (size_t)nq;
+                nseg_n = g->seg_len[s] * (size_t)nq;
+                for (q = 0; q < nseg_n; q++) {
+                        pout[q] += pin[q];
+                }
+                pin += nseg_n;
+        }
 }
 
 /*
@@ -1112,9 +1245,7 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
         double *bra = ket + (size_t)nq * GEMM_NGRIDS * nseg;  // [ns,K]
         double *vbuf = bra + (size_t)max_nao * GEMM_NGRIDS * nseg;  // [ns,nq]
         double *work = malloc(sizeof(double) * EVAL_WORK(4));
-        double *wvk, *pw, *src, *dst, *pin, *pout;
-        int igroup, blk0, blk1, ig0, ng, ns, nk, k, c, s, n, p, q, x;
-        size_t nseg_n;
+        int igroup, blk0, blk1, ig0, ng, ns, k, c;
 #pragma omp for schedule(static, 1)
         for (igroup = 0; igroup < ngroup; igroup++) {
                 blk0 = igroup * GEMM_NBLK;
@@ -1129,108 +1260,18 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
                 _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
                             nbas, atm, bas, env, work);
                 // the rows of Q of the AOs of the group
-                pout = qbuf;
-                for (s = 0; s < g.nseg; s++) {
-                        pin = Q + g.seg_ao[s] * (size_t)nq;
-                        nseg_n = g.seg_len[s] * (size_t)nq;
-                        for (q = 0; q < nseg_n; q++) {
-                                pout[q] = pin[q];
-                        }
-                        pout += nseg_n;
-                }
+                _gather_rows(qbuf, Q, nq, &g);
                 // fq[c,p,q] = sum_n aobuf[c,n,q] * qbuf[n,p]
                 for (c = 0; c < ncomp; c++) {
                         dgemm_(&TRANS_N, &TRANS_T, &ng, &nq, &ns, &D1,
                                aobuf + c * (size_t)ns * ng, &ng, qbuf, &nq,
                                &D0, fq + c * (size_t)nq * ng, &ng);
                 }
-                nk = nseg * ng;
-                // the segments without weights: bra[:,0] = ao[0]; for MGGA
-                // bra[:,1+x] = ao[x]; for GGA and MGGA ket[:,1] = fq[0]
-                for (n = 0; n < ns; n++) {
-                        src = aobuf + n * (size_t)ng;
-                        dst = bra + n * (size_t)nk;
-                        for (q = 0; q < ng; q++) {
-                                dst[q] = src[q];
-                        }
-                        if (xctype == FUSED_MGGA) {
-                                for (x = 1; x < 4; x++) {
-                                        src = aobuf + (x * (size_t)ns + n) * ng;
-                                        dst = bra + n * (size_t)nk + (1+x) * ng;
-                                        for (q = 0; q < ng; q++) {
-                                                dst[q] = src[q];
-                                        }
-                                }
-                        }
-                }
-                if (xctype != FUSED_LDA) {
-                        for (p = 0; p < nq; p++) {
-                                src = fq + p * (size_t)ng;
-                                dst = ket + p * (size_t)nk + ng;
-                                for (q = 0; q < ng; q++) {
-                                        dst[q] = src[q];
-                                }
-                        }
-                }
+                _ao_mo_shared(bra, ket, aobuf, fq, xctype, nseg, ns, ng, nq);
                 for (k = 0; k < nset; k++) {
-                        wvk = wv + (size_t)k * nwv * Ngrids + ig0;
-                        // ket[:,0] = sum_c wv[c] fq[c]
-                        for (p = 0; p < nq; p++) {
-                                dst = ket + p * (size_t)nk;
-                                src = fq + p * (size_t)ng;
-                                for (q = 0; q < ng; q++) {
-                                        dst[q] = src[q] * wvk[q];
-                                }
-                                for (c = 1; c < ncomp; c++) {
-                                        src = fq + (c * (size_t)nq + p) * ng;
-                                        pw = wvk + c * Ngrids;
-                                        for (q = 0; q < ng; q++) {
-                                                dst[q] += src[q] * pw[q];
-                                        }
-                                }
-                        }
-                        if (xctype != FUSED_LDA) {
-                                // bra[:,1] = sum_c wv[c] ao[c]
-                                for (n = 0; n < ns; n++) {
-                                        dst = bra + n * (size_t)nk + ng;
-                                        src = aobuf + n * (size_t)ng;
-                                        for (q = 0; q < ng; q++) {
-                                                dst[q] = src[q] * wvk[q];
-                                        }
-                                        for (c = 1; c < 4; c++) {
-                                                src = aobuf + (c * (size_t)ns + n) * ng;
-                                                pw = wvk + c * Ngrids;
-                                                for (q = 0; q < ng; q++) {
-                                                        dst[q] += src[q] * pw[q];
-                                                }
-                                        }
-                                }
-                        }
-                        if (xctype == FUSED_MGGA) {
-                                // ket[:,1+x] = wv[4] fq[x]
-                                pw = wvk + 4 * Ngrids;
-                                for (x = 1; x < 4; x++) {
-                                for (p = 0; p < nq; p++) {
-                                        dst = ket + p * (size_t)nk + (1+x) * ng;
-                                        src = fq + (x * (size_t)nq + p) * ng;
-                                        for (q = 0; q < ng; q++) {
-                                                dst[q] = src[q] * pw[q];
-                                        }
-                                } }
-                        }
-                        // vbuf[n,p] = sum_K bra[n,K] * ket[p,K], added to the
-                        // rows of the group's AOs in vpriv[k]
-                        dgemm_(&TRANS_T, &TRANS_N, &nq, &ns, &nk, &D1, ket, &nk,
-                               bra, &nk, &D0, vbuf, &nq);
-                        pin = vbuf;
-                        for (s = 0; s < g.nseg; s++) {
-                                pout = vpriv + k * nvq + g.seg_ao[s] * (size_t)nq;
-                                nseg_n = g.seg_len[s] * (size_t)nq;
-                                for (q = 0; q < nseg_n; q++) {
-                                        pout[q] += pin[q];
-                                }
-                                pin += nseg_n;
-                        }
+                        _ao_mo_dot(vpriv + k * nvq, wv + (size_t)k * nwv * Ngrids + ig0,
+                                   Ngrids, aobuf, fq, ket, bra, vbuf, &g,
+                                   xctype, nseg, ns, ng, nq);
                 }
         }
         NPomp_dsum_reduce_inplace(vprivs, nset * nvq);
@@ -1254,53 +1295,186 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
 
 #define WV_POINTS       512
 /*
- * The potentials of the fxc contractions for nset sets: for each point g,
- *   wv[k,x,g] = sum_y rho1[k,y,g] fxc[x,y,g] weight[g]
- * with each term taken as (rho1 * fxc) * weight and the terms added in the
- * order of y, as numpy.einsum('yg,xyg,g->xg', rho1[k], fxc, weight) computes
- * them; for nvar == 1, wv[k] = (weight * rho1[k]) * fxc, as numpy evaluates
- * weight * rho1[k] * fxc[0]. rho1 and wv are [nset,nvar,ngrids], weight
- * [ngrids], and fxc[x,y,g] is fxc[(x*nvar+y)*ldfxc+g]. The points go in blocks
- * whose fxc stays in cache for all sets.
+ * wv[x*ldwv+g] = sum_y rho1[y*ldrho+g] fxc[(x*nvar+y)*ldfxc+g] weight[g] for
+ * the points g < n, each term taken as (rho1 * fxc) * weight and the terms
+ * added in the order of y, as numpy.einsum('yg,xyg,g->xg') computes them; for
+ * nvar == 1, wv = (weight * rho1) * fxc, as numpy evaluates
+ * weight * rho1 * fxc[0].
+ */
+static void _fxc_wv_points(double *wv, size_t ldwv, double *rho1, size_t ldrho,
+                           double *fxc, size_t ldfxc, double *weight, int nvar, int n)
+{
+        double *r, *wx, *f;
+        int x, y, g;
+        if (nvar == 1) {
+                for (g = 0; g < n; g++) {
+                        wv[g] = weight[g] * rho1[g] * fxc[g];
+                }
+                return;
+        }
+        for (x = 0; x < nvar; x++) {
+                wx = wv + x * ldwv;
+                f = fxc + x * nvar * ldfxc;
+                for (g = 0; g < n; g++) {
+                        wx[g] = rho1[g] * f[g] * weight[g];
+                }
+                for (y = 1; y < nvar; y++) {
+                        r = rho1 + y * ldrho;
+                        f = fxc + (x * nvar + y) * ldfxc;
+                        for (g = 0; g < n; g++) {
+                                wx[g] += r[g] * f[g] * weight[g];
+                        }
+                }
+        }
+}
+
+/*
+ * The potentials of the fxc contractions for nset sets: wv[k] =
+ * numpy.einsum('yg,xyg,g->xg', rho1[k], fxc, weight) (nvar == 1: weight *
+ * rho1[k] * fxc[0]) bit for bit, see _fxc_wv_points. rho1 and wv are
+ * [nset,nvar,ngrids], weight [ngrids], and fxc[x,y,g] is
+ * fxc[(x*nvar+y)*ldfxc+g]. The points go in blocks whose fxc stays in cache for
+ * all sets.
  */
 void VXCfused_fxc_wv(double *wv, double *rho1, double *fxc, double *weight,
                      int nset, int nvar, int ngrids, int ldfxc)
 {
         const size_t Ngrids = ngrids;
-        const size_t Ldfxc = ldfxc;
         const int nblk = (ngrids + WV_POINTS - 1) / WV_POINTS;
 #pragma omp parallel
 {
-        int ib, g0, g1, k, x, y, g;
-        double *r, *rk, *w, *wx, *f;
+        int ib, g0, k;
 #pragma omp for schedule(static)
         for (ib = 0; ib < nblk; ib++) {
                 g0 = ib * WV_POINTS;
-                g1 = MIN(g0 + WV_POINTS, ngrids);
                 for (k = 0; k < nset; k++) {
-                        rk = rho1 + k * nvar * Ngrids;
-                        w = wv + k * nvar * Ngrids;
-                        if (nvar == 1) {
-                                for (g = g0; g < g1; g++) {
-                                        w[g] = weight[g] * rk[g] * fxc[g];
-                                }
-                                continue;
-                        }
-                        for (x = 0; x < nvar; x++) {
-                                wx = w + x * Ngrids;
-                                f = fxc + x * nvar * Ldfxc;
-                                for (g = g0; g < g1; g++) {
-                                        wx[g] = rk[g] * f[g] * weight[g];
-                                }
-                                for (y = 1; y < nvar; y++) {
-                                        r = rk + y * Ngrids;
-                                        f = fxc + (x * nvar + y) * Ldfxc;
-                                        for (g = g0; g < g1; g++) {
-                                                wx[g] += r[g] * f[g] * weight[g];
-                                        }
-                                }
-                        }
+                        _fxc_wv_points(wv + k * nvar * Ngrids + g0, Ngrids,
+                                       rho1 + k * nvar * Ngrids + g0, Ngrids,
+                                       fxc + g0, ldfxc, weight + g0, nvar,
+                                       MIN(WV_POINTS, ngrids - g0));
                 }
         }
 }
+}
+
+/*
+ * The XC responses of the symmetric matrices D[k] = A[k] B^T + B A[k]^T (A
+ * [nset,nao,r] and B[nao,r] real, in C order) times B, in one pass over the
+ * grid: out[k] += v1[k] B, out[nset,nao,r], for the potentials v1[k] of the
+ * fxc contractions with the kernel fxc[x,y,g] = fxc[(x*nvar+y)*ldfxc+g] and
+ * the grid weights. Each group of points evaluates its AO values and
+ * TB[c] = ao[c] B once for all sets; per set it takes the densities as
+ * VXCfused_eval_rho_lowrank, the potentials as VXCfused_fxc_wv and halves them
+ * as _dot_wv does, and adds v1 B as VXCfused_dot_ao_mo with Q = B, whose
+ * products FQ[c] = ao[c] Q are TB[c]. These equal the results of those kernels
+ * on the same points to rounding (the sums over the groups go in another
+ * order).
+ */
+void VXCfused_fxc_lowrank(double *out, double *A, double *B, int nset, int r,
+                          double *fxc, int ldfxc, double *weight, int nderiv,
+                          int nao, int ngrids, double *coords, int ldc,
+                          uint8_t *screen_index, int *ao_loc,
+                          int *atm, int natm, int *bas, int nbas, double *env,
+                          double *rcache, int64_t *roffs)
+{
+        const size_t Nr = r;
+        const size_t nvq = (size_t)nao * r;
+        const int xctype = nderiv;
+        const int nrho = nderiv == 0 ? 1 : (nderiv == 1 ? 4 : 5);
+        const int deriv = nderiv == 0 ? 0 : 1;
+        const int ncomp = deriv == 0 ? 1 : 4;
+        const int nta = nderiv == 2 ? 4 : 1;
+        const int nseg = xctype == FUSED_LDA ? 1 : (xctype == FUSED_GGA ? 2 : 5);
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+        int i;
+        if (max_nao > 0 && nset > 0 && r > 0) {
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *vpriv = calloc(nset * nvq, sizeof(double));
+        // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
+        // visible to the other threads.
+        vprivs[omp_get_thread_num()] = vpriv;
+        double *aobuf = malloc(sizeof(double) * (max_nao * (GEMM_NGRIDS*ncomp + Nr*2)
+                                                 + Nr * GEMM_NGRIDS * (ncomp + nta)
+                                                 + GEMM_NGRIDS * nrho * 2));
+        double *bbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
+        double *abuf = bbuf + max_nao * Nr;
+        double *tb = abuf + max_nao * Nr;  // TB[c] = FQ[c]
+        double *ta = tb + Nr * GEMM_NGRIDS * ncomp;
+        double *rho = ta + Nr * GEMM_NGRIDS * nta;  // [nrho,ng]
+        double *wv = rho + GEMM_NGRIDS * nrho;  // [nrho,ng]
+        double *ket = malloc(sizeof(double) * (Nr * GEMM_NGRIDS * nseg
+                                               + max_nao * ((size_t)GEMM_NGRIDS * (nseg+1) + Nr)));
+        double *bra = ket + Nr * GEMM_NGRIDS * nseg;  // [ns,K]
+        double *vbuf = bra + (size_t)max_nao * GEMM_NGRIDS * nseg;  // [ns,r]
+        double *zbuf = vbuf + max_nao * Nr;  // Z[i,q] (GGA)
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
+        int igroup, blk0, blk1, ig0, ng, ns, k, c, q;
+#pragma omp for schedule(static, 1)
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                _gather_rows(bbuf, B, r, &g);
+                // tb[c,l,q] = sum_n aobuf[c,n,q] * bbuf[n,l]
+                for (c = 0; c < ncomp; c++) {
+                        dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
+                               aobuf + c * (size_t)ns * ng, &ng, bbuf, &r,
+                               &D0, tb + c * Nr * ng, &ng);
+                }
+                _ao_mo_shared(bra, ket, aobuf, tb, xctype, nseg, ns, ng, r);
+                for (k = 0; k < nset; k++) {
+                        _gather_rows(abuf, A + k * nao * Nr, r, &g);
+                        _lowrank_rho(rho, ng, aobuf, abuf, ta, tb, zbuf, nderiv,
+                                     ns, ng, r);
+                        _fxc_wv_points(wv, ng, rho, ng, fxc + ig0, ldfxc, weight + ig0,
+                                       nrho, ng);
+                        if (xctype != FUSED_LDA) {
+                                for (q = 0; q < ng; q++) {
+                                        wv[q] *= .5;
+                                }
+                        }
+                        if (xctype == FUSED_MGGA) {
+                                for (q = 0; q < ng; q++) {
+                                        wv[4*ng+q] *= .5;
+                                }
+                        }
+                        _ao_mo_dot(vpriv + k * nvq, wv, ng, aobuf, tb, ket, bra, vbuf, &g,
+                                   xctype, nseg, ns, ng, r);
+                }
+        }
+        NPomp_dsum_reduce_inplace(vprivs, nset * nvq);
+        double *vsum = vprivs[0];
+#pragma omp for schedule(static)
+        for (i = 0; i < nset; i++) {
+                size_t j;
+                for (j = 0; j < nvq; j++) {
+                        out[i*nvq+j] += vsum[i*nvq+j];
+                }
+        }
+        _gemm_group_free(&g);
+        free(vpriv);
+        free(aobuf);
+        free(ket);
+        free(work);
+}
+        }
+        free(vprivs);
 }
