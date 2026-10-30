@@ -28,6 +28,11 @@ from pyscf import lib
 from pyscf.lib import logger
 from pyscf.scf import hf, _vhf
 from pyscf.gto.mole import is_au
+from pyscf import __config__
+
+# grad_elec takes the two-electron term from jk_energy_per_atom when the gradient object computes
+# J/K with the direct drivers of GradientsBase
+JK_ENERGY = getattr(__config__, 'grad_rhf_jk_energy', True)
 
 
 def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
@@ -60,7 +65,7 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 
     t0 = (logger.process_clock(), logger.perf_counter())
     log.debug('Computing Gradients of NR-HF Coulomb repulsion')
-    vhf = mf_grad.get_veff(mol, dm0)
+    vhf, de_jk = _get_veff_jk_energy(mf_grad, mol, dm0)
     log.timer('gradients of 2e part', *t0)
 
     if atmlst is None:
@@ -74,7 +79,10 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         h1ao = hcore_deriv(ia)
         de[k] += numpy.einsum('xij,ij->x', h1ao, dm0)
 # nabla was applied on bra in vhf, *2 for the contributions of nabla|ket>
-        de[k] += numpy.einsum('xij,ij->x', vhf[:,p0:p1], dm0[p0:p1]) * 2
+        if vhf is not None:
+            de[k] += numpy.einsum('xij,ij->x', vhf[:,p0:p1], dm0[p0:p1]) * 2
+        if de_jk is not None:
+            de[k] += de_jk[ia]
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], dme0[p0:p1]) * 2
 
         de[k] += mf_grad.extra_force(ia, locals())
@@ -233,10 +241,82 @@ def get_k(mol, dm):
                            mol._atm, mol._bas, mol._env, vhfopt=vhfopt)
     return -vk
 
+def jk_energy_per_atom(mol, dm, j_factor=1., k_factor=1., omega=None, screen=None):
+    '''Two-electron part of the nuclear gradient, contracted with the densities inside the
+    integral loop: no J/K matrices are built, and translational invariance spares the integrals of
+    one center of each shell quartet (lib/vhf/grad_jk_energy.c).
+
+    For a total density dm [nao,nao] the energy is
+        E2 = j_factor/2 (pq|rs) D_pq D_rs - k_factor/4 (pq|rs) D_pr D_qs,
+    for spin densities dm [2,nao,nao]
+        E2 = j_factor/2 (pq|rs) Dt_pq Dt_rs - k_factor/2 sum_s (pq|rs) Ds_pr Ds_qs,  Dt = Da + Db.
+
+    Returns dE2/dR [natm,3]: what grad_elec gets by contracting j_factor*vj - k_factor*.5*vk
+    (or j_factor*(vj[0]+vj[1]) - k_factor*vk) of get_jk(mol, dm) with dm. The densities must be
+    symmetric.
+
+    screen ('jk', 'j' or 'k') is the prescreen of the get_jk, get_j or get_k call replaced; it
+    defaults to the terms present. Each shell quartet is computed if the s2kl driver of get_jk
+    would compute any of its orderings.
+    '''
+    dm = numpy.asarray(dm, order='C', dtype=numpy.double)
+    if dm.ndim == 2:
+        dmj = dm
+        dmk = dm[None]
+        ck = k_factor * .5
+    else:
+        assert dm.shape[0] == 2
+        dmj = dm[0] + dm[1]
+        dmk = dm
+        ck = k_factor
+    if screen is None:
+        screen = 'j' * (j_factor != 0) + 'k' * (k_factor != 0)
+    prescreen = {'jk': 'CVHFgrad_jk_prescreen', 'j': 'CVHFgrad_j_prescreen',
+                 'k': 'CVHFgrad_k_prescreen'}[screen]
+    de = numpy.zeros((mol.natm, 3))
+    if j_factor == 0 and k_factor == 0:
+        return de
+    with mol.with_range_coulomb(omega):
+        vhfopt = _vhf._VHFOpt(mol, 'int2e_ip1', prescreen, dmcondname='CVHFnr_dm_cond1')
+        vhfopt.q_cond = _calc_q_cond(mol, vhfopt)
+        vhfopt.set_dm(dm, mol._atm, mol._bas, mol._env)
+        intor = mol._add_suffix('int2e_ip1')
+        ao_loc = _vhf.make_loc(mol._bas, intor)
+        _vhf.libcvhf.CVHFgrad_jk_energy(
+            de.ctypes, getattr(_vhf.libcvhf, intor), vhfopt._cintopt, ctypes.byref(vhfopt._this),
+            dmj.ctypes, dmk.ctypes, ctypes.c_int(len(dmk)),
+            ctypes.c_double(j_factor), ctypes.c_double(ck),
+            ctypes.c_int('j' in screen), ctypes.c_int('k' in screen), lib.c_null_ptr(),
+            ao_loc.ctypes, mol._atm.ctypes, ctypes.c_int(mol.natm),
+            mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
+    return de
+
 def get_veff(mf_grad, mol, dm):
     '''NR Hartree-Fock Coulomb repulsion'''
     vj, vk = mf_grad.get_jk(mol, dm)
     return vj - vk * .5
+
+def _get_veff_split(mf_grad, mol, dm):
+    '''get_veff for grad_elec: no potential besides J/K, and their energy gradient per atom'''
+    return None, jk_energy_per_atom(mol, dm)
+
+# get_veff functions of the gradient classes -> functions that return (the potential without J/K,
+# or None; the J/K energy gradient [natm,3]) for grad_elec
+_VEFF_SPLIT = {}
+
+def _get_veff_jk_energy(mf_grad, mol, dm):
+    '''(veff, None) from mf_grad.get_veff, or (veff without J/K, the J/K energy gradient per atom)
+    when get_veff is one of _VEFF_SPLIT and J/K come from the direct drivers of GradientsBase (not
+    density fitting, SGX or overridden methods)'''
+    split = None
+    if JK_ENERGY:
+        split = _VEFF_SPLIT.get(getattr(mf_grad.get_veff, '__func__', None))
+        for name in ('get_jk', 'get_j', 'get_k'):
+            if getattr(getattr(mf_grad, name), '__func__', None) is not getattr(GradientsBase, name):
+                split = None
+    if split is None:
+        return mf_grad.get_veff(mol, dm), None
+    return split(mf_grad, mol, dm)
 
 def make_rdm1e(mo_energy, mo_coeff, mo_occ):
     '''Energy weighted density matrix'''
@@ -505,6 +585,8 @@ class Gradients(GradientsBase):
     grad_elec = grad_elec
 
 Grad = Gradients
+
+_VEFF_SPLIT[Gradients.get_veff] = _get_veff_split
 
 from pyscf import scf
 # Inject to RHF class

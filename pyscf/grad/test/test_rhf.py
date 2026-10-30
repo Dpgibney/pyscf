@@ -287,6 +287,64 @@ class KnownValues(unittest.TestCase):
         e2 = numpy.einsum('ij,ij', dm, pp_int.get_gth_pp(mol))
         self.assertAlmostEqual(de[1, 2], (e1 - e2) / 2e-3, 6)
 
+    def test_jk_energy_per_atom(self):
+        mol = gto.M(atom='''O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47; H 1.3 0 1.2''',
+                    basis={'O': 'cc-pvdz', 'H': '6-31g*'}, charge=1, verbose=0)
+        nao = mol.nao
+        aoslices = mol.aoslice_by_atom()
+        numpy.random.seed(2)
+        a = numpy.random.rand(nao, nao) - .5
+        dm = a.dot(a.T) * .2
+        b = numpy.random.rand(nao, nao) - .5
+        dms = numpy.asarray([dm, b.dot(b.T) * .1])
+
+        def contract(v, d):
+            de = numpy.zeros((mol.natm, 3))
+            v = v.reshape(-1, 3, nao, nao)
+            d = d.reshape(-1, nao, nao)
+            for ia in range(mol.natm):
+                p0, p1 = aoslices[ia,2:]
+                de[ia] = numpy.einsum('sxij,sij->x', v[:,:,p0:p1], d[:,p0:p1]) * 2
+            return de
+
+        vj, vk = grad.rhf.get_jk(mol, dm)
+        ref = contract(vj * .7 - vk * .5 * .3, dm)
+        self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dm, .7, .3) - ref).max(), 0, 12)
+        ref = contract(vj, dm)
+        self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dm, 1, 0) - ref).max(), 0, 12)
+        vj, vk = grad.rhf.get_jk(mol, dms)
+        ref = contract(vj[0] + vj[1] - vk, dms)
+        self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dms) - ref).max(), 0, 12)
+        with mol.with_range_coulomb(.4):
+            vk = grad.rhf.get_k(mol, dms)
+        ref = contract(-vk * .6, dms)
+        self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dms, 0, .6, omega=.4) - ref).max(),
+                               0, 12)
+        with mol.with_range_coulomb(-.4):
+            vk = grad.rhf.get_k(mol, dm)
+        ref = contract(-vk * .5, dm)
+        self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dm, 0, 1, omega=-.4) - ref).max(),
+                               0, 12)
+
+    def test_grad_elec_jk_energy(self):
+        from pyscf import dft
+        mol = gto.M(atom='''O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47''',
+                    basis='6-31g*', verbose=0)
+        molp = mol.copy()
+        molp.charge = 1
+        molp.spin = 1
+        molp.build()
+        for mf in (scf.RHF(mol), scf.UHF(molp), scf.ROHF(molp), dft.RKS(mol, xc='PBE'),
+                   dft.RKS(mol, xc='CAM-B3LYP'), dft.UKS(molp, xc='wB97X'),
+                   dft.ROKS(molp, xc='B3LYP')):
+            mf.conv_tol = 1e-10
+            g = mf.run().nuc_grad_method()
+            self.assertIsNotNone(grad.rhf._VEFF_SPLIT.get(g.get_veff.__func__))
+            with lib.temporary_env(grad.rhf, JK_ENERGY=False):
+                ref = g.kernel()
+            self.assertAlmostEqual(abs(g.kernel() - ref).max(), 0, 12)
+            self.assertAlmostEqual(abs(g.kernel(atmlst=[2, 0]) - ref[[2, 0]]).max(), 0, 12)
+
 def grad_nuc(mol):
     gs = numpy.zeros((mol.natm,3))
     for j in range(mol.natm):

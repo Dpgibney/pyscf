@@ -39,6 +39,58 @@ def get_veff(ks_grad, mol=None, dm=None):
     '''
     if mol is None: mol = ks_grad.mol
     if dm is None: dm = ks_grad.base.make_rdm1()
+    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+
+    mf = ks_grad.base
+    ni = mf._numint
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        vj = ks_grad.get_j(mol, dm)
+        vxc += vj
+    else:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+        vj, vk = ks_grad.get_jk(mol, dm)
+        vk *= hyb
+        if omega != 0:
+            vk += ks_grad.get_k(mol, dm, omega=omega) * (alpha - hyb)
+        vxc += vj - vk * .5
+        """
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks_grad.xc, spin=mol.spin)
+        if omega == 0:
+            vj, vk = ks_grad.get_jk(mol, dm)
+            vk *= hyb
+        elif alpha == 0: # LR=0, only SR exchange
+            vj = ks_grad.get_j(mol, dm)
+            vk = ks_grad.get_k(mol, dm, omega=-omega)
+            vk *= hyb
+        elif hyb == 0: # SR=0, only LR exchange
+            vj = ks_grad.get_j(mol, dm)
+            vk = ks_grad.get_k(mol, dm, omega=omega)
+            vk *= alpha
+        else: # SR and LR exchange with different ratios
+            vj, vk = ks_grad.get_jk(mol, dm)
+            vk *= hyb
+            vklr = ks_grad.get_k(mol, dm, omega=omega)
+            vklr *= (alpha - hyb)
+            vk += vklr
+        """
+    return lib.tag_array(vxc, exc1_grid=exc)
+
+def _get_veff_split(ks_grad, mol, dm):
+    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom'''
+    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+    mf = ks_grad.base
+    ni = mf._numint
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        de = rhf_grad.jk_energy_per_atom(mol, dm, 1, 0)
+    else:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+        de = rhf_grad.jk_energy_per_atom(mol, dm, 1, hyb, screen='jk')
+        if omega != 0:
+            de += rhf_grad.jk_energy_per_atom(mol, dm, 0, alpha - hyb, omega=omega)
+    return lib.tag_array(vxc, exc1_grid=exc), de
+
+def _get_vxc_veff(ks_grad, mol, dm):
+    '''The XC part of get_veff, and the grid response exc1_grid'''
     t0 = (logger.process_clock(), logger.perf_counter())
 
     mf = ks_grad.base
@@ -75,38 +127,7 @@ def get_veff(ks_grad, mol=None, dm=None):
                 max_memory=max_memory, verbose=ks_grad.verbose)
             vxc += vnlc
     t0 = logger.timer(ks_grad, 'vxc', *t0)
-
-    if not ni.libxc.is_hybrid_xc(mf.xc):
-        vj = ks_grad.get_j(mol, dm)
-        vxc += vj
-    else:
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
-        vj, vk = ks_grad.get_jk(mol, dm)
-        vk *= hyb
-        if omega != 0:
-            vk += ks_grad.get_k(mol, dm, omega=omega) * (alpha - hyb)
-        vxc += vj - vk * .5
-        """
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks_grad.xc, spin=mol.spin)
-        if omega == 0:
-            vj, vk = ks_grad.get_jk(mol, dm)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vj = ks_grad.get_j(mol, dm)
-            vk = ks_grad.get_k(mol, dm, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vj = ks_grad.get_j(mol, dm)
-            vk = ks_grad.get_k(mol, dm, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vj, vk = ks_grad.get_jk(mol, dm)
-            vk *= hyb
-            vklr = ks_grad.get_k(mol, dm, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
-        """
-    return lib.tag_array(vxc, exc1_grid=exc)
+    return exc, vxc
 
 def _initialize_grids(ks_grad):
     mf = ks_grad.base
@@ -788,6 +809,8 @@ class Gradients(rhf_grad.Gradients):
             return 0
 
 Grad = Gradients
+
+rhf_grad._VEFF_SPLIT[get_veff] = _get_veff_split
 
 from pyscf import dft
 dft.rks.RKS.Gradients = dft.rks_symm.RKS.Gradients = lib.class_as_method(Gradients)

@@ -59,7 +59,7 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 
     t0 = (logger.process_clock(), logger.perf_counter())
     log.debug('Computing Gradients of NR-UHF Coulomb repulsion')
-    vhf = mf_grad.get_veff(mol, dm0)
+    vhf, de_jk = rhf_grad._get_veff_jk_energy(mf_grad, mol, dm0)
     log.timer('gradients of 2e part', *t0)
 
     if atmlst is None:
@@ -73,7 +73,10 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         h1ao = hcore_deriv(ia)
         de[k] += numpy.einsum('xij,ij->x', h1ao, dm0_sf)
 # s1, vhf are \nabla <i|h|j>, the nuclear gradients = -\nabla
-        de[k] += numpy.einsum('sxij,sij->x', vhf[:,:,p0:p1], dm0[:,p0:p1]) * 2
+        if vhf is not None:
+            de[k] += numpy.einsum('sxij,sij->x', vhf[:,:,p0:p1], dm0[:,p0:p1]) * 2
+        if de_jk is not None:
+            de[k] += de_jk[ia]
         de[k] -= numpy.einsum('xij,ij->x', s1[:,p0:p1], dme0_sf[p0:p1]) * 2
 
         de[k] += mf_grad.extra_force(ia, locals())
@@ -92,6 +95,10 @@ def get_veff(mf_grad, mol, dm):
     '''
     vj, vk = mf_grad.get_jk(mol, dm)
     return vj[0]+vj[1] - vk
+
+def _get_veff_split(mf_grad, mol, dm):
+    '''get_veff for grad_elec: no potential besides J/K, and their energy gradient per atom'''
+    return None, rhf_grad.jk_energy_per_atom(mol, dm)
 
 def make_rdm1e(mo_energy, mo_coeff, mo_occ):
     '''Energy weighted density matrix'''
@@ -116,6 +123,10 @@ class Gradients(rhf_grad.GradientsBase):
     grad_elec = grad_elec
 
 Grad = Gradients
+
+# get_veff of rohf.Gradients is the module function
+rhf_grad._VEFF_SPLIT[Gradients.get_veff] = _get_veff_split
+rhf_grad._VEFF_SPLIT[get_veff] = _get_veff_split
 
 from pyscf import scf
 scf.uhf.UHF.Gradients = lib.class_as_method(Gradients)

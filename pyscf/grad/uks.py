@@ -22,6 +22,7 @@
 import numpy
 from pyscf import lib
 from pyscf.lib import logger
+from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import rks as rks_grad
 from pyscf.grad import uhf as uhf_grad
 from pyscf.dft import numint, gen_grid
@@ -37,6 +38,38 @@ def get_veff(ks_grad, mol=None, dm=None):
     '''
     if mol is None: mol = ks_grad.mol
     if dm is None: dm = ks_grad.base.make_rdm1()
+    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+
+    mf = ks_grad.base
+    ni = mf._numint
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        vj = ks_grad.get_j(mol, dm)
+        vxc += vj[0] + vj[1]
+    else:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+        vj, vk = ks_grad.get_jk(mol, dm)
+        vk *= hyb
+        if omega != 0:
+            vk += ks_grad.get_k(mol, dm, omega=omega) * (alpha - hyb)
+        vxc += vj[0] + vj[1] - vk
+    return lib.tag_array(vxc, exc1_grid=exc)
+
+def _get_veff_split(ks_grad, mol, dm):
+    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom'''
+    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+    mf = ks_grad.base
+    ni = mf._numint
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        de = rhf_grad.jk_energy_per_atom(mol, dm, 1, 0)
+    else:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+        de = rhf_grad.jk_energy_per_atom(mol, dm, 1, hyb, screen='jk')
+        if omega != 0:
+            de += rhf_grad.jk_energy_per_atom(mol, dm, 0, alpha - hyb, omega=omega)
+    return lib.tag_array(vxc, exc1_grid=exc), de
+
+def _get_vxc_veff(ks_grad, mol, dm):
+    '''The XC part of get_veff, and the grid response exc1_grid'''
     t0 = (logger.process_clock(), logger.perf_counter())
 
     mf = ks_grad.base
@@ -74,19 +107,7 @@ def get_veff(ks_grad, mol=None, dm=None):
                 max_memory=max_memory, verbose=ks_grad.verbose)
             vxc += vnlc
     t0 = logger.timer(ks_grad, 'vxc', *t0)
-
-    if not ni.libxc.is_hybrid_xc(mf.xc):
-        vj = ks_grad.get_j(mol, dm)
-        vxc += vj[0] + vj[1]
-    else:
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
-        vj, vk = ks_grad.get_jk(mol, dm)
-        vk *= hyb
-        if omega != 0:
-            vk += ks_grad.get_k(mol, dm, omega=omega) * (alpha - hyb)
-        vxc += vj[0] + vj[1] - vk
-
-    return lib.tag_array(vxc, exc1_grid=exc)
+    return exc, vxc
 
 
 def get_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
@@ -279,6 +300,8 @@ class Gradients(uhf_grad.Gradients):
             return 0
 
 Grad = Gradients
+
+rhf_grad._VEFF_SPLIT[get_veff] = _get_veff_split
 
 from pyscf import dft
 dft.uks.UKS.Gradients = dft.uks_symm.UKS.Gradients = lib.class_as_method(Gradients)
