@@ -27,6 +27,24 @@
 #define MAX(X,Y)        ((X) > (Y) ? (X) : (Y))
 
 /*
+ * The m and n splits of NPdgemm take chunks of rows or columns, about
+ * NPDGEMM_CHUNKS_PER_THREAD per thread and multiples of NPDGEMM_CHUNK_ALIGN, by a
+ * dynamic schedule: each element is still computed by one dgemm over all of k,
+ * whichever thread takes its chunk, so the result does not depend on the
+ * schedule, while the threads stay balanced on CPUs with faster and slower
+ * cores (an equal split waits for the slowest).
+ */
+#define NPDGEMM_CHUNKS_PER_THREAD       4
+#define NPDGEMM_CHUNK_ALIGN             64
+
+static int _npdgemm_chunk(int n)
+{
+        int nchunk = NPDGEMM_CHUNKS_PER_THREAD * omp_get_max_threads();
+        int chunk = (n + nchunk - 1) / nchunk;
+        return (chunk + NPDGEMM_CHUNK_ALIGN - 1) / NPDGEMM_CHUNK_ALIGN * NPDGEMM_CHUNK_ALIGN;
+}
+
+/*
  * numpy.dot may call unoptimized blas
  */
 void NPdgemm(const char trans_a, const char trans_b,
@@ -106,12 +124,13 @@ void NPdgemm(const char trans_a, const char trans_b,
 
         } else if (m > n*2) { // parallelize m
 
-#pragma omp parallel
-{
-                size_t m0, m1;
-                NPomp_split(&m0, &m1, m);
-                int dm = m1 - m0;
-                if (dm > 0) {
+                const int chunk = _npdgemm_chunk(m);
+                const int nchunk = (m + chunk - 1) / chunk;
+                int ic;
+#pragma omp parallel for schedule(dynamic, 1)
+                for (ic = 0; ic < nchunk; ic++) {
+                        size_t m0 = (size_t)ic * chunk;
+                        int dm = MIN(chunk, m - (int)m0);
                         size_t astride = m0;
                         if (trans_a != 'N') {
                                 astride *= lda;
@@ -120,16 +139,16 @@ void NPdgemm(const char trans_a, const char trans_b,
                                &alpha, a+astride, &lda, b, &ldb,
                                &beta, c+m0, &ldc);
                 }
-}
 
         } else { // parallelize n
 
-#pragma omp parallel
-{
-                size_t n0, n1;
-                NPomp_split(&n0, &n1, n);
-                int dn = n1 - n0;
-                if (dn > 0) {
+                const int chunk = _npdgemm_chunk(n);
+                const int nchunk = (n + chunk - 1) / chunk;
+                int ic;
+#pragma omp parallel for schedule(dynamic, 1)
+                for (ic = 0; ic < nchunk; ic++) {
+                        size_t n0 = (size_t)ic * chunk;
+                        int dn = MIN(chunk, n - (int)n0);
                         size_t bstride = n0;
                         if (trans_b == 'N') {
                                 bstride *= ldb;
@@ -138,7 +157,6 @@ void NPdgemm(const char trans_a, const char trans_b,
                                &alpha, a, &lda, b+bstride, &ldb,
                                &beta, c+Ldc*n0, &ldc);
                 }
-}
         }
 }
 
