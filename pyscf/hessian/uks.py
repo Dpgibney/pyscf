@@ -68,60 +68,24 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                                              atmlst, max_memory, verbose,
                                              with_k=hybrid)
     de2 += ej - hyb * ek  # (A,B,dR_A,dR_B)
+    if hybrid and omega != 0:
+        ek_lr = rhf_hess._partial_hess_2e(mol, None, [dm0a, dm0b], 2, atmlst, with_j=False,
+                                          omega=omega, verbose=log)[1]
+        de2 -= (alpha - hyb) * ek_lr
+        t1 = log.timer_debug1('range-separated exchange', *t1)
 
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.9-mem_now)
     veffa_diag, veffb_diag = _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory)
-    if hybrid and omega != 0:
-        with mol.with_range_coulomb(omega):
-            vk1a, vk1b = _get_jk(mol, 'int2e_ipip1', 9, 's2kl',
-                                 ['jk->s1il', dm0a, 'jk->s1il', dm0b])
-        veffa_diag -= (alpha-hyb) * vk1a.reshape(3,3,nao,nao)
-        veffb_diag -= (alpha-hyb) * vk1b.reshape(3,3,nao,nao)
-    vk1a = vk1b = None
-    t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
 
     aoslices = mol.aoslice_by_atom()
     vxc_dma, vxc_dmb = _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
-
-        veffa = veffb = None
-        shls_slice = (shl0, shl1) + (0, mol.nbas)*3
-        if hybrid and omega != 0:
-            veffa = numpy.zeros((3,3,nao,nao))
-            veffb = numpy.zeros((3,3,nao,nao))
-            with mol.with_range_coulomb(omega):
-                vk1a, vk1b, vk2a, vk2b = \
-                        _get_jk(mol, 'int2e_ip1ip2', 9, 's1',
-                                ['li->s1kj', dm0a[:,p0:p1],
-                                 'li->s1kj', dm0b[:,p0:p1],
-                                 'lj->s1ki', dm0a         ,
-                                 'lj->s1ki', dm0b         ],
-                                shls_slice=shls_slice)
-            veffa -= (alpha-hyb) * vk1a.reshape(3,3,nao,nao)
-            veffb -= (alpha-hyb) * vk1b.reshape(3,3,nao,nao)
-            veffa[:,:,:,p0:p1] -= (alpha-hyb) * vk2a.reshape(3,3,nao,p1-p0)
-            veffb[:,:,:,p0:p1] -= (alpha-hyb) * vk2b.reshape(3,3,nao,p1-p0)
-            t1 = log.timer_debug1('range-separated int2e_ip1ip2 for atom %d'%ia, *t1)
-            with mol.with_range_coulomb(omega):
-                vk1a, vk1b = _get_jk(mol, 'int2e_ipvip1', 9, 's2kl',
-                                     ['li->s1kj', dm0a[:,p0:p1],
-                                      'li->s1kj', dm0b[:,p0:p1]],
-                                     shls_slice=shls_slice)
-            veffa -= (alpha-hyb) * vk1a.transpose(0,2,1).reshape(3,3,nao,nao)
-            veffb -= (alpha-hyb) * vk1b.transpose(0,2,1).reshape(3,3,nao,nao)
-            t1 = log.timer_debug1('range-separated int2e_ipvip1 for atom %d'%ia, *t1)
-        vk1a = vk1b = vk2a = vk2b = None
-
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veffa_diag[:,:,p0:p1], dm0a[p0:p1])*2
         de2[i0,i0] += numpy.einsum('xypq,pq->xy', veffb_diag[:,:,p0:p1], dm0b[p0:p1])*2
         for j0, ja in enumerate(atmlst[:i0+1]):
-            q0, q1 = aoslices[ja][2:]
             de2[i0,j0] += (vxc_dma[ia,ja] + vxc_dmb[ia,ja]) * 2
-            if veffa is not None:
-                de2[i0,j0] += numpy.einsum('xypq,pq->xy', veffa[:,:,q0:q1], dm0a[q0:q1])*2
-                de2[i0,j0] += numpy.einsum('xypq,pq->xy', veffb[:,:,q0:q1], dm0b[q0:q1])*2
 
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T

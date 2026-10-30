@@ -71,6 +71,24 @@ class KnownValues(unittest.TestCase):
         hess_2 = mf.Hessian().kernel(atmlst=atmlst)
         self.assertAlmostEqual(abs(hess_1-hess_2).max(), 0.0, 4)
 
+    def test_partial_hess_2e_translational_invariance(self):
+        # With every atom, _partial_hess_2e takes the diagonal blocks from translational
+        # invariance; with one atom, from int2e_ipip1
+        from pyscf.hessian import rhf as rhf_hess
+        dm = scf.RHF(mol).run().make_rdm1()
+        natm = mol.natm
+        for dm_j, dms_k, k_fac, omega in ((dm, [dm], 1, None),
+                                          (dm, [dm*.6, dm*.4], 2, None),
+                                          (None, [dm], 1, .4)):
+            with_j = dm_j is not None
+            ej, ek = rhf_hess._partial_hess_2e(mol, dm_j, dms_k, k_fac, range(natm),
+                                               with_j=with_j, omega=omega)
+            for ia in range(natm):
+                ej1, ek1 = rhf_hess._partial_hess_2e(mol, dm_j, dms_k, k_fac, [ia],
+                                                     with_j=with_j, omega=omega)
+                self.assertAlmostEqual(abs(ej1[0,0] - ej[ia,ia]).max(), 0, 9)
+                self.assertAlmostEqual(abs(ek1[0,0] - ek[ia,ia]).max(), 0, 9)
+
     def test_finite_diff_x2c_rhf_hess(self):
         mf = scf.RHF(mol).x2c()
         mf.conv_tol = 1e-14

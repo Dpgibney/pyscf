@@ -108,7 +108,6 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     if mo_coeff is None:  mo_coeff = mf.mo_coeff
     if atmlst is None: atmlst = range(mol.natm)
 
-    nao, nmo = mo_coeff.shape
     mocc = mo_coeff[:,mo_occ>0]
     dm0 = numpy.dot(mocc, mocc.T) * 2
     # Energy weighted density matrix
@@ -118,62 +117,18 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     s1aa, s1ab, s1a = get_ovlp(mol)
 
     # Skip the K-type contractions when no exact exchange is needed (with_k=False)
-    jk_diag = ['lk->s1ij', dm0]           # vj1
-    if with_k:
-        jk_diag += ['jk->s1il', dm0]      # vk1
-    vjk1_diag = _get_jk(mol, 'int2e_ipip1', 9, 's2kl', jk_diag,
-                        vhfopt=_make_vhfopt(mol, dm0, 'ipip1', 'int2e_ipip1ipip2'))
-    vj1_diag = vjk1_diag[0].reshape(3,3,nao,nao)
-    if with_k:
-        vk1_diag = vjk1_diag[1].reshape(3,3,nao,nao)
-    t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
+    ej, ek = _partial_hess_2e(mol, dm0, [dm0], 1, atmlst, with_k=with_k, verbose=log)
+    t1 = log.timer_debug1('two-electron terms', *t1)
 
-    ip1ip2_opt = _make_vhfopt(mol, dm0, 'ip1ip2', 'int2e_ip1ip2')
-    ipvip1_opt = _make_vhfopt(mol, dm0, 'ipvip1', 'int2e_ipvip1ipvip2')
     aoslices = mol.aoslice_by_atom()
-
     natm = len(atmlst)
     e1 = numpy.zeros((natm, natm, 3, 3))
-    ej = numpy.zeros((natm, natm, 3, 3))
-    ek = numpy.zeros((natm, natm, 3, 3))
-
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
-        shls_slice = (shl0, shl1) + (0, mol.nbas)*3
-        jk1 = ['ji->s1kl', dm0[:,p0:p1]]          # vj1
-        if with_k:
-            jk1 += ['li->s1kj', dm0[:,p0:p1],      # vk1
-                    'lj->s1ki', dm0         ]      # vk2
-        vjk1 = _get_jk(mol, 'int2e_ip1ip2', 9, 's1', jk1,
-                       shls_slice=shls_slice, vhfopt=ip1ip2_opt)
-        vj1 = vjk1[0]
-        if with_k:
-            vk1, vk2 = vjk1[1:]
-            vk1[:,:,p0:p1] += vk2
-        t1 = log.timer_debug1('contracting int2e_ip1ip2 for atom %d'%ia, *t1)
-        jk2 = ['lk->s1ij', dm0         ]          # vj1
-        if with_k:
-            jk2 += ['li->s1kj', dm0[:,p0:p1]]      # vk1
-        vjk2 = _get_jk(mol, 'int2e_ipvip1', 9, 's2kl', jk2,
-                       shls_slice=shls_slice, vhfopt=ipvip1_opt)
-        vj1[:,:,p0:p1] += vjk2[0].transpose(0,2,1) * .5
-        vj1 = vj1.reshape(3,3,nao,nao)
-        if with_k:
-            vk1 += vjk2[1].transpose(0,2,1)
-            vk1 = vk1.reshape(3,3,nao,nao)
-        t1 = log.timer_debug1('contracting int2e_ipvip1 for atom %d'%ia, *t1)
-
-        ej[i0, i0] += numpy.einsum('xypq,pq->xy', vj1_diag[:,:,p0:p1], dm0[p0:p1])*2
-        if with_k:
-            ek[i0, i0] += numpy.einsum('xypq,pq->xy', vk1_diag[:,:,p0:p1], dm0[p0:p1])
         e1[i0, i0] -= numpy.einsum('xypq,pq->xy', s1aa[:,:,p0:p1], dme0[p0:p1])*2
 
         for j0, ja in enumerate(atmlst[:i0+1]):
             q0, q1 = aoslices[ja][2:]
-            # *2 for +c.c.
-            ej[i0, j0] += numpy.einsum('xypq,pq->xy', vj1[:,:,q0:q1], dm0[q0:q1])*4
-            if with_k:
-                ek[i0, j0] += numpy.einsum('xypq,pq->xy', vk1[:,:,q0:q1], dm0[q0:q1])
             e1[i0, j0] -= numpy.einsum('xypq,pq->xy', s1ab[:,:,p0:p1,q0:q1], dme0[p0:p1,q0:q1])*2
 
             h1ao = hcore_deriv(ia, ja)
@@ -181,11 +136,120 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
 
         for j0 in range(i0):
             e1[j0, i0] = e1[i0, j0].T
-            ej[j0, i0] = ej[i0, j0].T
-            ek[j0, i0] = ek[i0, j0].T
 
     log.timer('RHF partial hessian', *time0)
     return e1, ej, ek
+
+def _partial_hess_2e(mol, dm_j, dms_k, k_fac, atmlst, with_j=True, with_k=True,
+                     omega=None, verbose=None):
+    '''The two-electron blocks ej, ek of _partial_hess_ejk: the second derivatives of the
+    Coulomb energy of dm_j and of the exchange energies of dms_k at fixed densities, each exchange
+    term weighted by k_fac (1 for the RHF dm0, 2 for the UHF spin densities). omega selects the
+    range-separated Coulomb operator.
+
+    The atom-pair loop reads, for atom A of atmlst, only the rows of the int2e_ip1ip2 and
+    int2e_ipvip1 contractions that belong to the atoms before A in atmlst, so only those rows are
+    computed. When atmlst holds every atom, the diagonal blocks follow from translational
+    invariance, sum_B d2E/dR_A dR_B = 0, without int2e_ipip1. Otherwise ipip1 gives them and the
+    rows of A itself are computed as well.
+    '''
+    log = logger.new_logger(mol, verbose)
+    t1 = (logger.process_clock(), logger.perf_counter())
+    atmlst = list(atmlst)
+    natm = len(atmlst)
+    nao = mol.nao
+    nbas = mol.nbas
+    ej = numpy.zeros((natm, natm, 3, 3))
+    ek = numpy.zeros((natm, natm, 3, 3))
+    if not with_k:
+        dms_k = []
+    nset = len(dms_k)
+    if not with_j and nset == 0:
+        return ej, ek
+    nj = int(with_j)
+    if omega is None:
+        ipip1_opt = _make_vhfopt(mol, dm_j, 'ipip1', 'int2e_ipip1ipip2')
+        ip1ip2_opt = _make_vhfopt(mol, dm_j, 'ip1ip2', 'int2e_ip1ip2')
+        ipvip1_opt = _make_vhfopt(mol, dm_j, 'ipvip1', 'int2e_ipvip1ipvip2')
+    else:
+        ipip1_opt = ip1ip2_opt = ipvip1_opt = None
+    aoslices = mol.aoslice_by_atom()
+    by_ti = sorted(atmlst) == list(range(mol.natm))
+
+    with mol.with_range_coulomb(omega):
+        if not by_ti:
+            jk_diag = []
+            if with_j:
+                jk_diag += ['lk->s1ij', dm_j]     # vj1
+            for dm in dms_k:
+                jk_diag += ['jk->s1il', dm]       # vk1
+            vjk1_diag = _get_jk(mol, 'int2e_ipip1', 9, 's2kl', jk_diag, vhfopt=ipip1_opt)
+            vjk1_diag = [v.reshape(3,3,nao,nao) for v in vjk1_diag]
+            t1 = log.timer_debug1('contracting int2e_ipip1', *t1)
+
+        for i0, ia in enumerate(atmlst):
+            shl0, shl1, p0, p1 = aoslices[ia]
+            if by_ti:
+                atms_b = atmlst[:i0]
+            else:
+                if with_j:
+                    ej[i0, i0] += numpy.einsum('xypq,pq->xy', vjk1_diag[0][:,:,p0:p1], dm_j[p0:p1])*2
+                for v, dm in zip(vjk1_diag[nj:], dms_k):
+                    ek[i0, i0] += numpy.einsum('xypq,pq->xy', v[:,:,p0:p1], dm[p0:p1]) * k_fac
+                atms_b = atmlst[:i0+1]
+            if not atms_b:
+                continue
+            # Rows of the shells up to the last of atms_b (more than atms_b if atmlst is not ordered)
+            ksh1 = max(aoslices[ja][1] for ja in atms_b)
+            nk = max(aoslices[ja][3] for ja in atms_b)
+
+            jk1 = []
+            if with_j:
+                jk1 += ['ji->s1kl', dm_j[:,p0:p1]]    # vj1
+            for dm in dms_k:
+                jk1 += ['li->s1kj', dm[:,p0:p1]]      # vk1
+            for dm in dms_k:
+                jk1 += ['lj->s1ki', dm]               # vk2
+            vjk1 = _get_jk(mol, 'int2e_ip1ip2', 9, 's1', jk1, vhfopt=ip1ip2_opt,
+                           shls_slice=(shl0, shl1, 0, nbas, 0, ksh1, 0, nbas))
+            t1 = log.timer_debug1('contracting int2e_ip1ip2 for atom %d'%ia, *t1)
+            jk2 = []
+            if with_j:
+                jk2 += ['lk->s1ij', dm_j]             # vj1
+            for dm in dms_k:
+                jk2 += ['li->s1kj', dm[:,p0:p1]]      # vk1
+            vjk2 = _get_jk(mol, 'int2e_ipvip1', 9, 's2kl', jk2, vhfopt=ipvip1_opt,
+                           shls_slice=(shl0, shl1, 0, ksh1, 0, nbas, 0, nbas))
+            t1 = log.timer_debug1('contracting int2e_ipvip1 for atom %d'%ia, *t1)
+
+            if with_j:
+                vj1 = vjk1[0]
+                vj1[:,:,p0:p1] += vjk2[0].transpose(0,2,1) * .5
+                vj1 = vj1.reshape(3,3,nk,nao)
+            vk1 = []
+            for s in range(nset):
+                vk = vjk1[nj+s]
+                vk[:,:,p0:p1] += vjk1[nj+nset+s]
+                vk += vjk2[nj+s].transpose(0,2,1)
+                vk1.append(vk.reshape(3,3,nk,nao))
+
+            for j0, ja in enumerate(atms_b):
+                q0, q1 = aoslices[ja][2:]
+                # *2 for +c.c.
+                if with_j:
+                    ej[i0, j0] += numpy.einsum('xypq,pq->xy', vj1[:,:,q0:q1], dm_j[q0:q1])*4
+                for vk, dm in zip(vk1, dms_k):
+                    ek[i0, j0] += numpy.einsum('xypq,pq->xy', vk[:,:,q0:q1], dm[q0:q1]) * k_fac
+
+            for j0 in range(i0):
+                ej[j0, i0] = ej[i0, j0].T
+                ek[j0, i0] = ek[i0, j0].T
+
+    if by_ti:
+        for i0 in range(natm):
+            ej[i0, i0] = -ej[i0].sum(axis=0)
+            ek[i0, i0] = -ek[i0].sum(axis=0)
+    return ej, ek
 
 def _make_vhfopt(mol, dms, key, vhf_intor):
     libcvhf = _vhf.libcvhf
