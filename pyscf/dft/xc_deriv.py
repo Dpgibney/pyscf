@@ -499,9 +499,11 @@ def _unfold_gga(rho, xc_val, spin, order, nvar, xlen, reserve=0):
         drv = libdft.VXCunfold_sigma_spin1
 
     # xc_val[idx] expands unique xc elements to n-order tensors
-    idx = _product_uniq_indices(xlen, order)
+    idx = np.asarray(_product_uniq_indices(xlen, order).ravel(), dtype=np.int32)
+    xc_val = np.asarray(xc_val, dtype=np.double, order='C')
     xc_tensor = np.empty((xlen**reserve * nvar2**n_transform, ngrids))
-    xc_tensor[:idx.size] = xc_val[idx.ravel()]
+    libdft.VXCgather_rows(xc_tensor.ctypes, xc_val.ctypes, idx.ctypes,
+                          ctypes.c_int(idx.size), ctypes.c_int(ngrids))
     buf = np.empty_like(xc_tensor)
     for i in range(n_transform):
         xc_tensor, buf = buf, xc_tensor
@@ -558,6 +560,12 @@ def transform_xc(rho, xc_val, xctype, spin, order):
     assert rho.size == (spin+1) * nvar * ngrids
     xc_tensor = _unfold_gga(rho, xc_val[p0:p1], spin, order, nvar, xlen)
     nabla_idx = np.arange(1, 4)
+    # The sigma terms are added to the rows (all but the last axis) of xc_tensor. Each
+    # update xc_tensor.transpose(...)[diag_idx] += xc_sub below is recorded as a list of
+    # (row of xc_tensor, row of xc_sub) pairs, by applying the same transpose and indexing to
+    # arrays of row numbers. Within one update the rows of xc_tensor are distinct, so
+    # _add_rows, which applies the pairs in order, gives the same sums.
+    tensor_rows = np.arange(np.prod(xc_tensor.shape[:-1])).reshape(xc_tensor.shape[:-1])
     if spin == 0:
         for n_pairs in range(1, order//2+1):
             p0, p1 = offsets[order-n_pairs:order-n_pairs+2]
@@ -565,6 +573,7 @@ def transform_xc(rho, xc_val, xctype, spin, order):
                                  nvar, xlen, n_pairs)
             # Just the sigma components
             xc_sub = xc_sub[(1,)*n_pairs] * 2**n_pairs
+            sub_rows = np.arange(np.prod(xc_sub.shape[:-1])).reshape(xc_sub.shape[:-1])
 
             # low_sigmas indicates the index for the extra sigma terms
             low_sigmas = itertools.combinations(range(order), n_pairs*2)
@@ -572,12 +581,16 @@ def transform_xc(rho, xc_val, xctype, spin, order):
                           for p in _pair_combinations(list(range(n_pairs*2)))]
             diag_idx = _diagonal_indices(nabla_idx, n_pairs)
 
+            tgt = []
+            src = []
             for dim_lst in low_sigmas:
-                rest_dims = [i for i in range(xc_tensor.ndim) if i not in dim_lst]
+                rest_dims = [i for i in range(tensor_rows.ndim) if i not in dim_lst]
                 for pair_comb in pair_combs:
-                    xc_tensor_1 = xc_tensor.transpose(
-                        [dim_lst[i] for i in pair_comb] + rest_dims)
-                    xc_tensor_1[diag_idx] += xc_sub
+                    rows = tensor_rows.transpose(
+                        [dim_lst[i] for i in pair_comb] + rest_dims)[diag_idx]
+                    tgt.append(rows.ravel())
+                    src.append(np.broadcast_to(sub_rows, rows.shape).ravel())
+            _add_rows(xc_tensor, xc_sub, tgt, src)
     else:
         i3to2x2 = _product_uniq_indices(2, 2)
         for n_pairs in range(1, order//2+1):
@@ -592,20 +605,35 @@ def transform_xc(rho, xc_val, xctype, spin, order):
             sigma_idx = (i3to2x2[(slice(None),)*2 + (np.newaxis,)*(i*2)]
                          for i in reversed(range(n_pairs)))
             xc_sub = xc_sub[tuple(sigma_idx)]
+            sub_rows = np.arange(np.prod(xc_sub.shape[:-1])).reshape(xc_sub.shape[:-1])
 
             low_sigmas = itertools.combinations(range(order), n_pairs*2)
             pair_combs = [list(itertools.chain(*p[::-1]))
                           for p in _pair_combinations(list(range(n_pairs*2)))]
             diag_idx = _diagonal_indices(nabla_idx, n_pairs)
 
+            tgt = []
+            src = []
             for dim_lst in low_sigmas:
                 dim_lst2 = np.array(dim_lst)*2 + np.array([1, 0])[:,None]
-                rest_dims = [i for i in range(xc_tensor.ndim) if i not in dim_lst2]
+                rest_dims = [i for i in range(tensor_rows.ndim) if i not in dim_lst2]
                 for pair_comb in pair_combs:
                     leading_dims = list(dim_lst2[:,pair_comb].ravel())
-                    xc_tensor_1 = xc_tensor.transpose(leading_dims + rest_dims)
-                    xc_tensor_1[diag_idx] += xc_sub
+                    rows = tensor_rows.transpose(leading_dims + rest_dims)[diag_idx]
+                    tgt.append(rows.ravel())
+                    src.append(np.broadcast_to(sub_rows, rows.shape).ravel())
+            _add_rows(xc_tensor, xc_sub, tgt, src)
     return xc_tensor
+
+def _add_rows(xc_tensor, xc_sub, tgt, src):
+    '''xc_tensor rows tgt[k] += xc_sub rows src[k], in the order of k, at every grid point'''
+    ngrids = xc_tensor.shape[-1]
+    tgt = np.asarray(np.hstack(tgt), dtype=np.int32)
+    src = np.asarray(np.hstack(src), dtype=np.int32)
+    xc_sub = np.asarray(xc_sub, dtype=np.double, order='C')
+    assert xc_tensor.flags.c_contiguous and xc_sub.shape[-1] == ngrids
+    libdft.VXCadd_rows_indexed(xc_tensor.ctypes, xc_sub.ctypes, tgt.ctypes, src.ctypes,
+                               ctypes.c_int(tgt.size), ctypes.c_int(ngrids))
 
 def count_combinations(nvar, order):
     '''sum(len(combinations_with_replacement(range(nvar), o) for o in range(order))'''
