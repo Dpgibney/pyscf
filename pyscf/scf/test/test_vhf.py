@@ -90,6 +90,35 @@ class KnownValues(unittest.TestCase):
             vk1 = _vhf.incore(mf._eri, dms, hermi, with_j=False)[1]
             self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+            # BLAS-3 instead of the one-pass kernel for a few symmetric dms
+            with lib.temporary_env(_vhf, INCORE_FUSED_MAX=0, INCORE_FUSED_J_MAX=0):
+                for with_j, with_k in ((True, True), (True, False), (False, True)):
+                    vj2, vk2 = _vhf.incore(mf._eri, dms, hermi, with_j, with_k)
+                    if with_j:
+                        self.assertAlmostEqual(abs(vj2 - vj0).max(), 0, 12)
+                    if with_k:
+                        self.assertAlmostEqual(abs(vk2 - vk0).max(), 0, 12)
+
+    def test_incore_s8_fused(self):
+        # The one-pass kernel takes the dms JK_NDM_CHUNK = 4 at a time; each dm's
+        # results do not depend on the number of dms
+        numpy.random.seed(3)
+        eri1 = ao2mo.restore(1, mf._eri, nao)
+        a = numpy.random.random((6,nao,nao)) - .5
+        dms = a + a.transpose(0,2,1)
+        vj0 = numpy.einsum('ijkl,nlk->nij', eri1, dms)
+        vk0 = numpy.einsum('ijkl,njk->nil', eri1, dms)
+        vj1, vk1 = _vhf.incore(mf._eri, dms, 1)
+        self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+        self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+        for n in (1, 2, 3, 5):
+            vj2, vk2 = _vhf.incore(mf._eri, dms[:n], 1)
+            self.assertTrue(numpy.array_equal(vj2, vj1[:n]))
+            self.assertTrue(numpy.array_equal(vk2, vk1[:n]))
+        vk2 = _vhf.incore(mf._eri, dms[:2], 1, with_j=False)[1]
+        self.assertTrue(numpy.array_equal(vk2, vk1[:2]))
+        vj2 = _vhf.incore(mf._eri, dms[:2], 1, with_k=False)[0]
+        self.assertTrue(numpy.array_equal(vj2, vj1[:2]))
 
     def test_direct_s8_batch(self):
         numpy.random.seed(2)

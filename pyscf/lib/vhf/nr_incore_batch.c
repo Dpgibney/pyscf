@@ -185,13 +185,16 @@ void CVHFnrs8_incore_vk_batch(double *zout, double *eri, double *y,
 }
 
 /*
- * J and K of a single symmetric dm (SCF), in one pass over the ERI rows:
- * vj[ij] = sum_kl V[ij,kl] dmtri[kl] as in CVHFnrs8_incore_vj_batch, and K by
- * the formulation of CVHFnrs8_incore_vk_batch for hermi = 1, with the packed
- * row used directly as the lower triangle of M:
+ * J and K of a few symmetric dms (SCF: one; UHF and ROHF: the alpha and beta
+ * densities) in one pass over the ERI rows: vj[ij] = sum_kl V[ij,kl]
+ * dmtri[kl] as in CVHFnrs8_incore_vj_batch, and K by the formulation of
+ * CVHFnrs8_incore_vk_batch for hermi = 1, with the packed row used directly
+ * as the lower triangle of M:
  *      zout[ic] += M dm[jc],   zout[jc] += M dm[ic],   vk = Z + Z^T
  * The dot products are summed in 4-wide vectors, as the compiler does not
- * reorder floating-point sums by itself.
+ * reorder floating-point sums by itself. The sums of all dms go side by side,
+ * as one chain of dependent additions would wait for each of its own, and
+ * each row is read from memory once for all dms.
  */
 // aligned(8): loaded from arbitrary offsets
 typedef double dvec4 __attribute__((vector_size(32), aligned(8)));
@@ -202,95 +205,233 @@ double _hsum(dvec4 v)
         return (v[0] + v[1]) + (v[2] + v[3]);
 }
 
-// sum_l e[l] x[l], and y[l] += e[l] * xk, for l < n
+// The dms that _jk_row_body takes at once. The loops over them are unrolled
+// (GCC unroll 4), which keeps their sums in registers.
+#define JK_NDM_CHUNK    4
+
+/*
+ * For N dms (N <= JK_NDM_CHUNK, a constant after inlining): s1[n] =
+ * sum_l e[l] x1[n][l] and y1[n][l] += e[l] * xk1[n] for l < len, and if TWO
+ * the same with x2, y2, xk2 and s2. Each sum goes in the same order for any N.
+ */
 static inline __attribute__((always_inline))
-double _dot_axpy(const double *e, const double *x, double *y, double xk, int n)
+void _dot_axpy_n(const double *e, int len,
+                 const double **x1, double **y1, const double *xk1, double *s1,
+                 const double **x2, double **y2, const double *xk2, double *s2,
+                 const int N, const int TWO)
 {
-        dvec4 acc = {0};
-        double s;
-        int l;
-        for (l = 0; l + 4 <= n; l += 4) {
+        dvec4 acc1[JK_NDM_CHUNK];
+        dvec4 acc2[JK_NDM_CHUNK];
+        int l, n;
+#pragma GCC unroll 4
+        for (n = 0; n < N; n++) {
+                acc1[n] = (dvec4){0};
+                acc2[n] = (dvec4){0};
+        }
+        for (l = 0; l + 4 <= len; l += 4) {
                 dvec4 e4 = *(dvec4 *)(e + l);
-                *(dvec4 *)(y + l) += e4 * xk;
-                acc += e4 * *(dvec4 *)(x + l);
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        *(dvec4 *)(y1[n] + l) += e4 * xk1[n];
+                        acc1[n] += e4 * *(dvec4 *)(x1[n] + l);
+                        if (TWO) {
+                                *(dvec4 *)(y2[n] + l) += e4 * xk2[n];
+                                acc2[n] += e4 * *(dvec4 *)(x2[n] + l);
+                        }
+                }
         }
-        s = _hsum(acc);
-        for (; l < n; l++) {
-                y[l] += e[l] * xk;
-                s += e[l] * x[l];
+#pragma GCC unroll 4
+        for (n = 0; n < N; n++) {
+                s1[n] = _hsum(acc1[n]);
+                if (TWO) {
+                        s2[n] = _hsum(acc2[n]);
+                }
         }
-        return s;
+        for (; l < len; l++) {
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        y1[n][l] += e[l] * xk1[n];
+                        s1[n] += e[l] * x1[n][l];
+                        if (TWO) {
+                                y2[n][l] += e[l] * xk2[n];
+                                s2[n] += e[l] * x2[n][l];
+                        }
+                }
+        }
 }
 
+/*
+ * Row ij of the ERIs for N dms, dmtri[N,npair] and dm[N,nao,nao], into their
+ * accumulators vpriv[N,npair] and zpriv[N,nao,nao]: one loop over the row for
+ * J, and one over each segment of the row (k fixed) for K, while it is in
+ * cache. Either accumulator can be NULL.
+ */
 static inline __attribute__((always_inline))
-void _jk_1dm_row_body(const double *row, size_t ij, double *vpriv, double *zpriv,
-                      const double *dmtri, const double *dm, size_t Nao)
+void _jk_row_body(const double *row, size_t ij, double *vpriv, double *zpriv,
+                  const double *dmtri, const double *dm, size_t Nao, const int N)
 {
+        const size_t npair = Nao * (Nao + 1) / 2;
+        const size_t nn = Nao * Nao;
+        const double *x1[JK_NDM_CHUNK];
+        const double *x2[JK_NDM_CHUNK];
+        double *y1[JK_NDM_CHUNK];
+        double *y2[JK_NDM_CHUNK];
+        double xk1[JK_NDM_CHUNK];
+        double xk2[JK_NDM_CHUNK];
+        double s1[JK_NDM_CHUNK];
+        double s2[JK_NDM_CHUNK];
+        int n;
         if (vpriv != NULL) {
-                vpriv[ij] += _dot_axpy(row, dmtri, vpriv, dmtri[ij], ij)
-                        + row[ij] * dmtri[ij];
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        x1[n] = dmtri + n * npair;
+                        y1[n] = vpriv + n * npair;
+                        xk1[n] = x1[n][ij];
+                }
+                _dot_axpy_n(row, ij, x1, y1, xk1, s1, NULL, NULL, NULL, NULL, N, 0);
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        y1[n][ij] += s1[n] + row[ij] * xk1[n];
+                }
         }
         if (zpriv == NULL) {
                 return;
         }
         const int ic = (int)(sqrt(2*ij+.25) - .5 + 1e-7);
         const int jc = ij - (size_t)ic*(ic+1)/2;
-        const double *x1 = dm + jc * Nao;
-        const double *x2 = dm + ic * Nao;
-        double *y1 = zpriv + ic * Nao;
-        double *y2 = zpriv + jc * Nao;
         const double *ek = row;
         double e;
         int k;
-        for (k = 0; k < ic; k++) {
-                y1[k] += _dot_axpy(ek, x1, y1, x1[k], k) + ek[k] * x1[k];
-                if (ic != jc) {
-                        y2[k] += _dot_axpy(ek, x2, y2, x2[k], k) + ek[k] * x2[k];
-                }
-                ek += k + 1;
+#pragma GCC unroll 4
+        for (n = 0; n < N; n++) {
+                x1[n] = dm + n * nn + jc * Nao;
+                x2[n] = dm + n * nn + ic * Nao;
+                y1[n] = zpriv + n * nn + ic * Nao;
+                y2[n] = zpriv + n * nn + jc * Nao;
         }
-        // k = ic: l <= jc, M[ic,jc] = (ij|ij) halved
-        e = ek[jc] * .5;
         if (ic != jc) {
-                y1[ic] += _dot_axpy(ek, x1, y1, x1[ic], jc) + e * x1[jc];
-                y1[jc] += e * x1[ic];
-                y2[ic] += _dot_axpy(ek, x2, y2, x2[ic], jc) + e * x2[jc];
-                y2[jc] += e * x2[ic];
+                for (k = 0; k < ic; k++) {
+#pragma GCC unroll 4
+                        for (n = 0; n < N; n++) {
+                                xk1[n] = x1[n][k];
+                                xk2[n] = x2[n][k];
+                        }
+                        _dot_axpy_n(ek, k, x1, y1, xk1, s1, x2, y2, xk2, s2, N, 1);
+#pragma GCC unroll 4
+                        for (n = 0; n < N; n++) {
+                                y1[n][k] += s1[n] + ek[k] * xk1[n];
+                                y2[n][k] += s2[n] + ek[k] * xk2[n];
+                        }
+                        ek += k + 1;
+                }
+                // k = ic: l <= jc, M[ic,jc] = (ij|ij) halved
+                e = ek[jc] * .5;
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        xk1[n] = x1[n][ic];
+                        xk2[n] = x2[n][ic];
+                }
+                _dot_axpy_n(ek, jc, x1, y1, xk1, s1, x2, y2, xk2, s2, N, 1);
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        y1[n][ic] += s1[n] + e * x1[n][jc];
+                        y1[n][jc] += e * xk1[n];
+                        y2[n][ic] += s2[n] + e * x2[n][jc];
+                        y2[n][jc] += e * xk2[n];
+                }
         } else {
-                y1[ic] += _dot_axpy(ek, x1, y1, x1[ic], ic) + e * x1[ic];
+                for (k = 0; k < ic; k++) {
+#pragma GCC unroll 4
+                        for (n = 0; n < N; n++) {
+                                xk1[n] = x1[n][k];
+                        }
+                        _dot_axpy_n(ek, k, x1, y1, xk1, s1, NULL, NULL, NULL, NULL, N, 0);
+#pragma GCC unroll 4
+                        for (n = 0; n < N; n++) {
+                                y1[n][k] += s1[n] + ek[k] * xk1[n];
+                        }
+                        ek += k + 1;
+                }
+                e = ek[jc] * .5;
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        xk1[n] = x1[n][ic];
+                }
+                _dot_axpy_n(ek, ic, x1, y1, xk1, s1, NULL, NULL, NULL, NULL, N, 0);
+#pragma GCC unroll 4
+                for (n = 0; n < N; n++) {
+                        y1[n][ic] += s1[n] + e * xk1[n];
+                }
         }
 }
 
-static void _jk_1dm_row(const double *row, size_t ij, double *vpriv, double *zpriv,
-                        const double *dmtri, const double *dm, size_t Nao)
+// Row ij for all n_dm dms, JK_NDM_CHUNK at a time
+static inline __attribute__((always_inline))
+void _jk_rows_body(const double *row, size_t ij, double *vpriv, double *zpriv,
+                   const double *dmtri, const double *dm, int n_dm, size_t Nao)
 {
-        _jk_1dm_row_body(row, ij, vpriv, zpriv, dmtri, dm, Nao);
+        const size_t npair = Nao * (Nao + 1) / 2;
+        const size_t nn = Nao * Nao;
+        const double *t, *d;
+        double *v, *z;
+        int n0, n;
+        for (n0 = 0; n0 < n_dm; n0 += n) {
+                n = MIN(n_dm - n0, JK_NDM_CHUNK);
+                t = dmtri + n0 * npair;
+                d = dm + n0 * nn;
+                v = vpriv == NULL ? NULL : vpriv + n0 * npair;
+                z = zpriv == NULL ? NULL : zpriv + n0 * nn;
+                switch (n) {
+                case 1:
+                        _jk_row_body(row, ij, v, z, t, d, Nao, 1);
+                        break;
+                case 2:
+                        _jk_row_body(row, ij, v, z, t, d, Nao, 2);
+                        break;
+                case 3:
+                        _jk_row_body(row, ij, v, z, t, d, Nao, 3);
+                        break;
+                default:
+                        _jk_row_body(row, ij, v, z, t, d, Nao, JK_NDM_CHUNK);
+                }
+        }
+}
+
+static void _jk_rows(const double *row, size_t ij, double *vpriv, double *zpriv,
+                     const double *dmtri, const double *dm, int n_dm, size_t Nao)
+{
+        _jk_rows_body(row, ij, vpriv, zpriv, dmtri, dm, n_dm, Nao);
 }
 #if defined(__x86_64__) && defined(__GNUC__)
-#define HAVE_JK_1DM_AVX2
+#define HAVE_JK_AVX2
 __attribute__((target("avx2,fma")))
-static void _jk_1dm_row_avx2(const double *row, size_t ij, double *vpriv, double *zpriv,
-                             const double *dmtri, const double *dm, size_t Nao)
+static void _jk_rows_avx2(const double *row, size_t ij, double *vpriv, double *zpriv,
+                          const double *dmtri, const double *dm, int n_dm, size_t Nao)
 {
-        _jk_1dm_row_body(row, ij, vpriv, zpriv, dmtri, dm, Nao);
+        _jk_rows_body(row, ij, vpriv, zpriv, dmtri, dm, n_dm, Nao);
 }
 #endif
 
 /*
- * vj (npair) or zout (nao*nao) can be NULL to skip J or K.
+ * J and K of n_dm symmetric dms: vj[n_dm,npair] from dmtri[n_dm,npair]
+ * (dmtri as in CVHFnrs8_incore_vj_batch), and zout[n_dm,nao,nao] from
+ * dm[n_dm,nao,nao], with vk = Z + Z^T. Either output can be NULL to skip J
+ * or K. The results of each dm do not depend on n_dm (bit for bit, for a
+ * given number of threads).
  */
-void CVHFnrs8_incore_jk_1dm(double *vj, double *zout, double *eri,
-                            double *dmtri, double *dm, int nao)
+void CVHFnrs8_incore_jk_ndm(double *vj, double *zout, double *eri,
+                            double *dmtri, double *dm, int n_dm, int nao)
 {
         const size_t Nao = nao;
         const size_t npair = Nao * (Nao + 1) / 2;
-        const size_t nn = Nao * Nao;
+        const size_t vsize = npair * n_dm;
+        const size_t zsize = Nao * Nao * n_dm;
         void (*frow)(const double *, size_t, double *, double *,
-                     const double *, const double *, size_t) = _jk_1dm_row;
-#ifdef HAVE_JK_1DM_AVX2
+                     const double *, const double *, int, size_t) = _jk_rows;
+#ifdef HAVE_JK_AVX2
         __builtin_cpu_init();
         if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-                frow = _jk_1dm_row_avx2;
+                frow = _jk_rows_avx2;
         }
 #endif
         double **vprivs = malloc(sizeof(double *) * omp_get_max_threads() * 2);
@@ -298,27 +439,27 @@ void CVHFnrs8_incore_jk_1dm(double *vj, double *zout, double *eri,
 #pragma omp parallel
 {
         int thread_id = omp_get_thread_num();
-        double *vpriv = vj == NULL ? NULL : calloc(npair, sizeof(double));
-        double *zpriv = zout == NULL ? NULL : calloc(nn, sizeof(double));
+        double *vpriv = vj == NULL ? NULL : calloc(vsize, sizeof(double));
+        double *zpriv = zout == NULL ? NULL : calloc(zsize, sizeof(double));
         vprivs[thread_id] = vpriv;
         zprivs[thread_id] = zpriv;
         size_t ij, i;
 // static round robin, as in CVHFnrs8_incore_vj_batch
 #pragma omp for schedule(static, 1)
         for (ij = 0; ij < npair; ij++) {
-                (*frow)(eri + ij * (ij + 1) / 2, ij, vpriv, zpriv, dmtri, dm, Nao);
+                (*frow)(eri + ij * (ij + 1) / 2, ij, vpriv, zpriv, dmtri, dm, n_dm, Nao);
         }
         if (vpriv != NULL) {
-                NPomp_dsum_reduce_inplace(vprivs, npair);
+                NPomp_dsum_reduce_inplace(vprivs, vsize);
 #pragma omp for schedule(static)
-                for (i = 0; i < npair; i++) {
+                for (i = 0; i < vsize; i++) {
                         vj[i] = vprivs[0][i];
                 }
         }
         if (zpriv != NULL) {
-                NPomp_dsum_reduce_inplace(zprivs, nn);
+                NPomp_dsum_reduce_inplace(zprivs, zsize);
 #pragma omp for schedule(static)
-                for (i = 0; i < nn; i++) {
+                for (i = 0; i < zsize; i++) {
                         zout[i] = zprivs[0][i];
                 }
         }

@@ -502,9 +502,13 @@ def incore(eri, dms, hermi=0, with_j=True, with_k=True):
     return vj, vk
 
 # Number of density matrices from which incore() contracts s8 ERIs with the
-# kernels of nr_incore_batch.c instead of one kernel per dm: BLAS-3 for
-# several dms, and one fused J/K pass for a single symmetric dm.
+# kernels of nr_incore_batch.c instead of one kernel per dm: one J/K pass for
+# up to INCORE_FUSED_MAX symmetric dms (SCF; UHF's alpha and beta densities),
+# or INCORE_FUSED_J_MAX dms for J alone, and BLAS-3 for more dms and for
+# other dms (crossovers on caffeine/def2-SVP, 10 threads).
 INCORE_BATCH_MIN = 1
+INCORE_FUSED_MAX = 6
+INCORE_FUSED_J_MAX = 3
 
 def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
     '''J and K of all dms from s8 ERIs, see nr_incore_batch.c'''
@@ -515,23 +519,24 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
     # dms take the general one and its lower triangle.
     sym_k = with_k and hermi == 1 and (
         abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
-    if n_dm == 1 and (sym_k or not with_k):
+    if (n_dm <= INCORE_FUSED_MAX and sym_k) or (n_dm <= INCORE_FUSED_J_MAX and not with_k):
+        # J and K of each dm in one pass over the ERIs
         null = lib.c_null_ptr()
-        dm = numpy.asarray(dms[0], order='C')
-        dmtri = lib.pack_tril(dm + dm.T)
+        dms = numpy.asarray(dms, order='C')
+        dmtri = lib.pack_tril(dms + dms.transpose(0,2,1))
         idx = numpy.arange(nao)
-        dmtri[idx*(idx+1)//2+idx] *= .5
+        dmtri[:,idx*(idx+1)//2+idx] *= .5
         vjtri = numpy.empty_like(dmtri) if with_j else None
-        z = numpy.empty_like(dm) if with_k else None
-        libcvhf.CVHFnrs8_incore_jk_1dm(
+        z = numpy.empty_like(dms) if with_k else None
+        libcvhf.CVHFnrs8_incore_jk_ndm(
             null if vjtri is None else vjtri.ctypes.data_as(ctypes.c_void_p),
             null if z is None else z.ctypes.data_as(ctypes.c_void_p),
             eri.ctypes.data_as(ctypes.c_void_p), dmtri.ctypes.data_as(ctypes.c_void_p),
-            dm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nao))
+            dms.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(n_dm), ctypes.c_int(nao))
         if with_j:
-            vj = lib.unpack_tril(vjtri)[None]
+            vj = lib.unpack_tril(vjtri)
         if with_k:
-            vk = (z + z.T)[None]
+            vk = z + z.transpose(0,2,1)
         return vj, vk
 
     if with_j:
