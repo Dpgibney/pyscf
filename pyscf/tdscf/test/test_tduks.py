@@ -496,6 +496,30 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(lib.fp(es), 0.15403661700414412, 6)
         td.analyze()
 
+    def test_td_xc_lowrank(self):
+        # The TD operators with the XC response from the factors of the trial
+        # dms (vind_lowrank of the response function, either path) against
+        # those from the dms
+        from pyscf.dft import numint
+        numpy.random.seed(3)
+        for mf1 in (mf_lda, mf_bp86, mf_b3lyp, mf_m06l):
+            nov = sum((occ > 0).sum() * (occ == 0).sum() for occ in mf1.mo_occ)
+            methods = [tdscf.uks.TDA, tdscf.uks.TDDFT]
+            if not mf1._numint.libxc.is_hybrid_xc(mf1.xc):
+                methods.append(tdscf.uks.CasidaTDDFT)
+            for method in methods:
+                td = method(mf1)
+                nvec = 2 * nov if method is tdscf.uks.TDDFT else nov
+                x = numpy.random.random((5, nvec)) - .5
+                self.assertTrue(hasattr(td.gen_response(hermi=0), 'vind_lowrank'))
+                with lib.temporary_env(numint, FUSED_XC=False):
+                    ref = td.gen_vind()[0](x)
+                for cheaper in (True, False):
+                    with lib.temporary_env(numint._FusedXC,
+                                           lowrank_cheaper=lambda *args, **kwargs: cheaper):
+                        v = td.gen_vind()[0](x)
+                    self.assertAlmostEqual(abs(v - ref).max() / abs(ref).max(), 0, 13)
+
 if __name__ == "__main__":
     print("Full Tests for TD-UKS")
     unittest.main()

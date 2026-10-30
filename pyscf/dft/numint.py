@@ -1041,8 +1041,8 @@ class _FusedXC:
     _rho1_preferred), and the GGA gradient from the orbitals takes one GEMM fewer
     than eval_rho2; both agree with the block_loop path to rounding.
     The fxc contractions take blocks of their own (_fused_fxc_blksize), and
-    rks_fxc_mo the factors of the response dms of CPHF and TDDFT instead of the
-    dms.
+    rks_fxc_mo (uks_fxc_mo for UKS) the factors of the response dms of CPHF and
+    TDDFT instead of the dms.
     '''
     def __init__(self, mol, grids, nao, data, blocks, max_memory):
         self.mol = mol
@@ -1274,11 +1274,12 @@ class _FusedXC:
         n = self.max_memory*.5e6 / (8 * (nparts+1) * self.nao * nq)
         return max(1, min(nset, int(n)))
 
-    def lowrank_cheaper(self, xctype, r, nq, nset):
+    def lowrank_cheaper(self, xctype, r, nq, nset, nspin=1):
         '''Whether rks_fxc_mo in one kernel (VXCfused_fxc_lowrank, Q = B) takes
         less time than rks_fxc (the dm kernels) for nset symmetric dms of rank
         2*r and the products of their XC responses with nq orbitals, by a flop
-        model'''
+        model. For UKS (nspin=2: uks_fxc_mo against uks_fxc, which takes 2*nset
+        dms) r and nq are the sums over the spins.'''
         ns = self.data.group_naos(self.mol)
         # flops per grid point of a group of ns AOs, per set: the dm path
         # c_dm*ns^2 (2*ns^2 per GEMM, ns^2 per component of a dsyrk: LDA the
@@ -1293,7 +1294,7 @@ class _FusedXC:
         c_dm, c_rho, c_v, c_pass, w_lr = {'LDA': (3, 2, 2, 2, .8), 'GGA': (4, 4, 4, 8, .9),
                                           'MGGA': (13, 8, 10, 8, 1.)}[xctype]
         npass = -(-nset // self.mo_chunk(nset, nq))
-        cost_dm = nset * c_dm * (ns**2).sum()
+        cost_dm = nspin * nset * c_dm * (ns**2).sum()
         cost_lr = (nset * (c_rho*r + c_v*nq) + npass * c_pass*nq) * ns.sum()
         return w_lr * cost_lr < cost_dm
 
@@ -1342,6 +1343,37 @@ class _FusedXC:
                     wv[:,4] *= .5
                 self.dot_ao_mo(ip0, ip1, wv, xctype, Q, vq)
             out[k0:k1] += lib.einsum('pa,kpi->kai', P, vq)
+        return out
+
+    def uks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out):
+        '''rks_fxc_mo for UKS: out[s][k] += P[s]^T v1[s][k] Q[s] (s = alpha,
+        beta) for the XC responses v1 that nr_uks_fxc computes with the kernel
+        fxc (cache_xc_kernel with spin=1) for the symmetric spin dms
+        A[s][k] B[s]^T + B[s] A[s][k]^T. Q must be B: one kernel takes the
+        densities, potentials and v1 Q of each group of points for both spins
+        (VXCfused_fxc_lowrank_uks).'''
+        A = [numpy.asarray(a, dtype=numpy.double, order='C') for a in A]
+        B = [numpy.asarray(b, dtype=numpy.double, order='C') for b in B]
+        assert all(q.shape == b.shape for q, b in zip(Q, B))
+        nset = len(A[0])
+        nq = [b.shape[1] for b in B]
+        ngrids = self.grids.weights.size
+        nchunk = self.mo_chunk(nset, sum(nq))
+        fxc = numpy.ascontiguousarray(fxc)
+        weights = numpy.asarray(self.grids.weights, dtype=numpy.double, order='C')
+        for k0, k1 in lib.prange(0, nset, nchunk):
+            vq = [numpy.zeros((k1-k0, self.nao, n)) for n in nq]
+            libdft.VXCfused_fxc_lowrank_uks(
+                vq[0].ctypes.data_as(ctypes.c_void_p), vq[1].ctypes.data_as(ctypes.c_void_p),
+                A[0][k0:k1].ctypes.data_as(ctypes.c_void_p),
+                A[1][k0:k1].ctypes.data_as(ctypes.c_void_p),
+                B[0].ctypes.data_as(ctypes.c_void_p), B[1].ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_int(k1-k0), ctypes.c_int(nq[0]), ctypes.c_int(nq[1]),
+                fxc.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(fxc.shape[-1]),
+                weights.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(_FUSED_XCTYPE[xctype]),
+                *self._args(0, ngrids, 0 if xctype == 'LDA' else 1))
+            for s in range(2):
+                out[s][k0:k1] += lib.einsum('pa,kpi->kai', P[s], vq[s])
         return out
 
     def nr_rks(self, ni, xc_code, xctype, dms, hermi, nelec, excsum, vmat):
@@ -1531,12 +1563,13 @@ def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None,
     data = _grid_ao_data(mol, grids, deriv, max_memory)
     return _FusedXC(mol, grids, nao, data, blocks, max_memory)
 
-def _fused_xc_mo(ni, mol, grids, xctype, max_memory):
+def _fused_xc_mo(ni, mol, grids, xctype, max_memory, spin=0):
     '''A _FusedXC for the XC responses of response dms from their factors
-    (rks_fxc_mo) in place of ni.nr_rks_fxc or ni.nr_rks_fxc_st, if those are
-    NumInt's own (whose results rks_fxc_mo gives to rounding) and the fused
-    kernels apply (_fused_xc); otherwise None. The factors must be real.'''
-    for key in ('nr_rks_fxc', 'nr_rks_fxc_st'):
+    (rks_fxc_mo; spin=1: uks_fxc_mo) in place of ni.nr_rks_fxc or
+    ni.nr_rks_fxc_st (ni.nr_uks_fxc), if those are NumInt's own (whose results
+    the factored path gives to rounding) and the fused kernels apply
+    (_fused_xc); otherwise None. The factors must be real.'''
+    for key in (('nr_rks_fxc', 'nr_rks_fxc_st') if spin == 0 else ('nr_uks_fxc',)):
         if inspect.getattr_static(ni, key, None) is not inspect.getattr_static(NumInt, key):
             return None
     return _fused_xc(ni, mol, grids, mol.nao_nr(), xctype, max_memory, (),

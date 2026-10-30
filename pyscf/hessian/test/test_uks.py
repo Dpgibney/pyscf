@@ -105,6 +105,29 @@ class KnownValues(unittest.TestCase):
     def tearDownClass(cls):
         dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = cls.original_grids
 
+    def test_cphf_xc_lowrank(self):
+        # The CPHF operator with the XC response from the factors of the dms
+        # (vind_mo of the response function, either path) against the one from
+        # the dms
+        from pyscf.dft import numint
+        from pyscf.hessian import uhf as uhf_hess
+        numpy.random.seed(2)
+        # H2+: no beta electrons
+        h2p = gto.M(atom='H 0 0 0; H 0 0 .74', basis='6-31g', charge=1, spin=1)
+        for m, xc in ((mol, 'lda,vwn'), (mol, 'b3lyp'), (mol, 'r2scan'), (h2p, 'pbe')):
+            mf = dft.UKS(m, xc=xc).run(conv_tol=1e-8)
+            mo, occ = mf.mo_coeff, mf.mo_occ
+            nov = sum(c.shape[1] * (o > 0).sum() for c, o in zip(mo, occ))
+            mo1 = numpy.random.random((6, nov)) - .5
+            self.assertTrue(hasattr(mf.gen_response(mo, occ, hermi=1), 'vind_mo'))
+            with lib.temporary_env(numint, FUSED_XC=False):
+                ref = uhf_hess.gen_vind(mf, mo, occ)(mo1)
+            for cheaper in (True, False):
+                with lib.temporary_env(numint._FusedXC,
+                                       lowrank_cheaper=lambda *args, **kwargs: cheaper):
+                    v = uhf_hess.gen_vind(mf, mo, occ)(mo1)
+                self.assertAlmostEqual(abs(v - ref).max() / abs(ref).max(), 0, 13)
+
     def test_uks_hess_atmlst(self):
         mf = dft.UKS(mol)
         mf.xc = 'pbe0'

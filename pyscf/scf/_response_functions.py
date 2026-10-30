@@ -258,19 +258,8 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
         if not with_nlc and mf.do_nlc():
             logger.warn(mf, "NLC contribution in gen_response is NOT included")
 
-        def vind(dm1):
-            if hermi == 2:
-                v1 = numpy.zeros_like(dm1)
-            else:
-                v1 = ni.nr_uks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
-                                   rho0, vxc, fxc, max_memory=max_memory)
-                if with_nlc and mf.do_nlc():
-                    # Cannot import at top due to circular dependency
-                    from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
-                    if mo_coeff is not None and mo_occ is not None:
-                        v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1[0] + dm1[1], max_memory)
-                    else:
-                        v1 += get_vnlc_resp1(mf, mol, dm0[0] + dm0[1], dm1[0] + dm1[1], max_memory)
+        def vind_jk(dm1, v1):
+            '''v1 += the Coulomb and exchange response of dm1'''
             if not hybrid:
                 if with_j:
                     vj = mf.get_j(mol, dm1, hermi=hermi)
@@ -298,6 +287,81 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 else:
                     v1 -= vk
             return v1
+
+        def vind_nlc(dm1, v1):
+            if with_nlc and mf.do_nlc():
+                # Cannot import at top due to circular dependency
+                from pyscf.hessian.rks import get_vnlc_resp, get_vnlc_resp1
+                if mo_coeff is not None and mo_occ is not None:
+                    v1 += get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1[0] + dm1[1], max_memory)
+                else:
+                    v1 += get_vnlc_resp1(mf, mol, dm0[0] + dm0[1], dm1[0] + dm1[1], max_memory)
+            return v1
+
+        def vind(dm1):
+            if hermi == 2:
+                v1 = numpy.zeros_like(dm1)
+            else:
+                v1 = ni.nr_uks_fxc(mol, grids, mf.xc, dm0, dm1, 0, hermi,
+                                   rho0, vxc, fxc, max_memory=max_memory)
+                v1 = vind_nlc(dm1, v1)
+            return vind_jk(dm1, v1)
+
+        # As in _gen_rhf_response, the XC response of spin dms whose symmetric
+        # parts are a[s][k] Q[s]^T + Q[s] a[s][k]^T (s = alpha, beta), as in
+        # CPHF (a = mo_coeff x, Q = mocc) and TDDFT (TDA: a = orbv z^T / 2,
+        # Q = orbo), can take the factors instead of the dms.
+        # vind.vind_lowrank(dm1, a, P, Q) returns (v1, w) with vind(dm1) = v1 +
+        # v_xc, the XC response, and w[s][k] = P[s]^T v_xc[s][k] Q[s] where that
+        # path is cheaper for len(a[0]) dms of each spin; otherwise
+        # (vind(dm1), 0).
+        fused = None
+        if hermi != 2:
+            from pyscf.dft import numint
+            xctype = ni._xc_type(mf.xc)
+            fused = numint._fused_xc_mo(ni, mol, grids, xctype, max_memory, spin=1)
+        if fused is not None:
+            def vind_lowrank(dm1, a, P, Q):
+                '''(v1, w): vind(dm1) = v1 + v_xc, w[s][k] = P[s]^T v_xc[s][k] Q[s]
+                or 0, for spin dms dm1 whose symmetric parts are
+                a[s][k] Q[s]^T + Q[s] a[s][k]^T'''
+                a = [numpy.asarray(x) for x in a]
+                nset = len(a[0])
+                w = [numpy.zeros((nset, P[s].shape[1], Q[s].shape[1])) for s in range(2)]
+                if (all(x.dtype == numpy.double for x in (*a, *P, *Q)) and
+                        fused.lowrank_cheaper(xctype, a[0].shape[2] + a[1].shape[2],
+                                              Q[0].shape[1] + Q[1].shape[1], nset, nspin=2)):
+                    fused.uks_fxc_mo(ni, xctype, fxc, a, Q, P, Q, w)
+                    v1 = vind_jk(dm1, vind_nlc(dm1, numpy.zeros_like(dm1)))
+                else:
+                    v1 = vind(dm1)
+                return v1, w
+            vind.vind_lowrank = vind_lowrank
+
+            # vind.vind_mo(dm1, x) returns (mo_coeff[s]^T vind(dm1)[s] mocc[s])
+            # for CPHF's dms dm1[s] = mo_coeff[s] x[s] mocc[s]^T + h.c., given
+            # the orbitals of each spin (not ROHF's mo_coeff and mo_occ)
+            if (mo_coeff is not None and mo_occ is not None and
+                    numpy.ndim(mo_occ[0]) == 1):
+                mocc = [mo_coeff[s][:,mo_occ[s]>0] for s in range(2)]
+                shapes = [(mo_coeff[s].shape[1], mocc[s].shape[1]) for s in range(2)]
+                # the spin whose x tells the number of sets (the other may have
+                # no occupied orbitals)
+                s0 = int(numpy.prod(shapes[1]) > numpy.prod(shapes[0]))
+                def vind_mo(dm1, x):
+                    '''(mo_coeff[s]^T vind(dm1)[s] mocc[s]) for s = alpha, beta, for
+                    the symmetric spin dms dm1[s] = mo_coeff[s] x[s] mocc[s]^T + h.c.,
+                    x[s][nset,nmo_s,nocc_s]'''
+                    x = [numpy.asarray(xs) for xs in x]
+                    nset = x[s0].size // numpy.prod(shapes[s0])
+                    a = [lib.einsum('pa,kai->kpi', mo_coeff[s], x[s].reshape(nset, *shapes[s]))
+                         for s in range(2)]
+                    v1, v1mo = vind_lowrank(dm1, a, mo_coeff, mocc)
+                    for s in range(2):
+                        for i, v in enumerate(v1[s]):
+                            v1mo[s][i] += reduce(numpy.dot, (mo_coeff[s].T, v, mocc[s]))
+                    return v1mo
+                vind.vind_mo = vind_mo
 
     elif with_j:
         def vind(dm1):

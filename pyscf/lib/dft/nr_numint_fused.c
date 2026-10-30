@@ -1319,11 +1319,15 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
  * the points g < n, each term taken as (rho1 * fxc) * weight and the terms
  * added in the order of y, as numpy.einsum('yg,xyg,g->xg') computes them; for
  * nvar == 1, wv = (weight * rho1) * fxc, as numpy evaluates
- * weight * rho1 * fxc[0].
+ * weight * rho1 * fxc[0]. With trans, fxc[(y*nvar+x)*ldfxc+g] instead, the
+ * contraction of nr_uks_fxc over the first index of the kernel.
  */
 static void _fxc_wv_points(double *wv, size_t ldwv, double *rho1, size_t ldrho,
-                           double *fxc, size_t ldfxc, double *weight, int nvar, int n)
+                           double *fxc, size_t ldfxc, double *weight, int nvar, int n,
+                           int trans)
 {
+        const size_t sx = trans ? 1 : nvar;
+        const size_t sy = trans ? nvar : 1;
         double *r, *wx, *f;
         int x, y, g;
         if (nvar == 1) {
@@ -1334,13 +1338,13 @@ static void _fxc_wv_points(double *wv, size_t ldwv, double *rho1, size_t ldrho,
         }
         for (x = 0; x < nvar; x++) {
                 wx = wv + x * ldwv;
-                f = fxc + x * nvar * ldfxc;
+                f = fxc + x * sx * ldfxc;
                 for (g = 0; g < n; g++) {
                         wx[g] = rho1[g] * f[g] * weight[g];
                 }
                 for (y = 1; y < nvar; y++) {
                         r = rho1 + y * ldrho;
-                        f = fxc + (x * nvar + y) * ldfxc;
+                        f = fxc + (x * sx + y * sy) * ldfxc;
                         for (g = 0; g < n; g++) {
                                 wx[g] += r[g] * f[g] * weight[g];
                         }
@@ -1371,10 +1375,168 @@ void VXCfused_fxc_wv(double *wv, double *rho1, double *fxc, double *weight,
                         _fxc_wv_points(wv + k * nvar * Ngrids + g0, Ngrids,
                                        rho1 + k * nvar * Ngrids + g0, Ngrids,
                                        fxc + g0, ldfxc, weight + g0, nvar,
-                                       MIN(WV_POINTS, ngrids - g0));
+                                       MIN(WV_POINTS, ngrids - g0), 0);
                 }
         }
 }
+}
+
+/*
+ * The body of VXCfused_fxc_lowrank (nspin = 1) and VXCfused_fxc_lowrank_uks
+ * (nspin = 2), with out[s], A[s], B[s] and r[s] for the spins s < nspin. The
+ * kernel fxc has nspin*nrho rows; for two spins they are (s,x) of
+ * cache_xc_kernel's fxc[s,x,t,y], and the potential of spin t is that of
+ * nr_uks_fxc, wv[t,y] = sum_{s,x} rho1[s,x] fxc[s,x,t,y] weight.
+ */
+static void _fxc_lowrank(int nspin, double **out, double **A, double **B, int *r, int nset,
+                         double *fxc, int ldfxc, double *weight, int nderiv,
+                         int nao, int ngrids, double *coords, int ldc,
+                         uint8_t *screen_index, int *ao_loc,
+                         int *atm, int natm, int *bas, int nbas, double *env,
+                         double *rcache, int64_t *roffs)
+{
+        const int xctype = nderiv;
+        const int nrho = nderiv == 0 ? 1 : (nderiv == 1 ? 4 : 5);
+        const int nvar = nrho * nspin;
+        const int deriv = nderiv == 0 ? 0 : 1;
+        const int ncomp = deriv == 0 ? 1 : 4;
+        const int nta = nderiv == 2 ? 4 : 1;
+        const int nseg = xctype == FUSED_LDA ? 1 : (xctype == FUSED_GGA ? 2 : 5);
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        const int nstream = _slot_nstreams(ngroup);
+        const size_t nrow = (size_t)nset * nao;  // the rows of out[s]
+        // a partial matrix holds out[0] and then out[1], from voff[s]
+        size_t nvq[2], voff[2], rsum = 0, rmax = 0;
+        int i;
+        for (i = 0; i < nspin; i++) {
+                nvq[i] = (size_t)nao * r[i];
+                voff[i] = nrow * rsum;
+                rsum += r[i];
+                rmax = MAX(rmax, (size_t)r[i]);
+        }
+        const size_t vsize = nrow * rsum;
+        if (max_nao > 0 && nset > 0 && rsum > 0) {
+        SlotStreams st;
+        _slot_streams_init(&st, ngroup, nstream);
+        double **vparts = _slot_parts_alloc(nstream, vsize);
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        char *skip = malloc(sizeof(char) * nstream);
+        double *aobuf = malloc(sizeof(double) * (max_nao * (GEMM_NGRIDS*ncomp + rsum + rmax)
+                                                 + GEMM_NGRIDS * (rsum * ncomp + rmax * nta)
+                                                 + GEMM_NGRIDS * nvar * 2));
+        // the rows of B[s] and TB[s][c] = FQ[c] = ao[c] B[s] for each spin
+        double *bbuf[2], *tb[2], *ket[2];
+        bbuf[0] = aobuf + max_nao * GEMM_NGRIDS * ncomp;
+        bbuf[1] = bbuf[0] + max_nao * r[0];
+        double *abuf = bbuf[0] + max_nao * rsum;
+        tb[0] = abuf + max_nao * rmax;
+        tb[1] = tb[0] + (size_t)r[0] * GEMM_NGRIDS * ncomp;
+        double *ta = tb[0] + rsum * GEMM_NGRIDS * ncomp;
+        double *rho = ta + rmax * GEMM_NGRIDS * nta;  // [nvar,ng]
+        double *wv = rho + GEMM_NGRIDS * nvar;  // [nvar,ng]
+        ket[0] = malloc(sizeof(double) * (rsum * GEMM_NGRIDS * nseg
+                                          + max_nao * ((size_t)GEMM_NGRIDS * (nseg+1) + rmax)));
+        ket[1] = ket[0] + (size_t)r[0] * GEMM_NGRIDS * nseg;
+        double *bra = ket[0] + rsum * GEMM_NGRIDS * nseg;  // [ns,K]
+        double *vbuf = bra + (size_t)max_nao * GEMM_NGRIDS * nseg;  // [ns,r]
+        double *zbuf = vbuf + max_nao * rmax;  // Z[i,q] (GGA)
+        double *work = malloc(sizeof(double) * EVAL_WORK(4));
+        int igroup, blk0, blk1, ig0, ng, ns, k, c, q, s, slot, stream;
+        double *vpriv, *prho, *pwv;
+// the deterministic dynamic schedule of _slot_take: out is reproducible for a
+// given number of threads
+        stream = -1;
+        while ((slot = _slot_take(&st, &stream, skip)) >= 0) {
+        vpriv = _slot_part(&st, vparts, stream, slot, vsize);
+        for (igroup = slot * SLOT_GROUPS;
+             igroup < MIN((slot+1) * SLOT_GROUPS, ngroup); igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                for (s = 0; s < nspin; s++) {
+                        if (r[s] == 0) {
+                                continue;
+                        }
+                        _gather_rows(bbuf[s], B[s], r[s], &g);
+                        // tb[s][c,l,q] = sum_n aobuf[c,n,q] * bbuf[s][n,l]
+                        for (c = 0; c < ncomp; c++) {
+                                dgemm_(&TRANS_N, &TRANS_T, &ng, r + s, &ns, &D1,
+                                       aobuf + c * (size_t)ns * ng, &ng, bbuf[s], r + s,
+                                       &D0, tb[s] + c * (size_t)r[s] * ng, &ng);
+                        }
+                        _ao_mo_shared(bra, ket[s], aobuf, tb[s], xctype, nseg, ns, ng, r[s]);
+                }
+                for (k = 0; k < nset; k++) {
+                        for (s = 0; s < nspin; s++) {
+                                prho = rho + s * nrho * ng;
+                                if (r[s] == 0) {
+                                        for (q = 0; q < nrho * ng; q++) {
+                                                prho[q] = 0;
+                                        }
+                                        continue;
+                                }
+                                _gather_rows(abuf, A[s] + k * nvq[s], r[s], &g);
+                                _lowrank_rho(prho, ng, aobuf, abuf, ta, tb[s], zbuf, nderiv,
+                                             ns, ng, r[s]);
+                        }
+                        _fxc_wv_points(wv, ng, rho, ng, fxc + ig0, ldfxc, weight + ig0,
+                                       nvar, ng, nspin == 2);
+                        for (s = 0; s < nspin; s++) {
+                                pwv = wv + s * nrho * ng;
+                                if (xctype != FUSED_LDA) {
+                                        for (q = 0; q < ng; q++) {
+                                                pwv[q] *= .5;
+                                        }
+                                }
+                                if (xctype == FUSED_MGGA) {
+                                        for (q = 0; q < ng; q++) {
+                                                pwv[4*ng+q] *= .5;
+                                        }
+                                }
+                                if (r[s] > 0) {
+                                        _ao_mo_dot(vpriv + voff[s] + k * nvq[s], pwv, ng,
+                                                   aobuf, tb[s], ket[s], bra, vbuf, &g,
+                                                   xctype, nseg, ns, ng, r[s]);
+                                }
+                        }
+                }
+        }
+        _slot_release(&st, stream);
+        }
+#pragma omp barrier
+#pragma omp for schedule(static)
+        for (i = 0; i < nspin * nrow; i++) {
+                s = i >= nrow;
+                k = i - s * nrow;
+                _slot_streams_add(out[s] + k * (size_t)r[s], vparts, nstream,
+                                  voff[s] + k * (size_t)r[s], r[s]);
+        }
+        _gemm_group_free(&g);
+        free(skip);
+        free(aobuf);
+        free(ket[0]);
+        free(work);
+}
+        _slot_parts_free(vparts, nstream);
+        _slot_streams_free(&st);
+        }
 }
 
 /*
@@ -1397,110 +1559,32 @@ void VXCfused_fxc_lowrank(double *out, double *A, double *B, int nset, int r,
                           int *atm, int natm, int *bas, int nbas, double *env,
                           double *rcache, int64_t *roffs)
 {
-        const size_t Nr = r;
-        const size_t nvq = (size_t)nao * r;
-        const int xctype = nderiv;
-        const int nrho = nderiv == 0 ? 1 : (nderiv == 1 ? 4 : 5);
-        const int deriv = nderiv == 0 ? 0 : 1;
-        const int ncomp = deriv == 0 ? 1 : 4;
-        const int nta = nderiv == 2 ? 4 : 1;
-        const int nseg = xctype == FUSED_LDA ? 1 : (xctype == FUSED_GGA ? 2 : 5);
-        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
-        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
-        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
-        const int nstream = _slot_nstreams(ngroup);
-        int i;
-        if (max_nao > 0 && nset > 0 && r > 0) {
-        SlotStreams st;
-        _slot_streams_init(&st, ngroup, nstream);
-        double **vparts = _slot_parts_alloc(nstream, nset * nvq);
-#pragma omp parallel
-{
-        const char TRANS_N = 'N';
-        const char TRANS_T = 'T';
-        const double D0 = 0;
-        const double D1 = 1;
-        GemmGroup g;
-        _gemm_group_init(&g, nbas);
-        char *skip = malloc(sizeof(char) * nstream);
-        double *aobuf = malloc(sizeof(double) * (max_nao * (GEMM_NGRIDS*ncomp + Nr*2)
-                                                 + Nr * GEMM_NGRIDS * (ncomp + nta)
-                                                 + GEMM_NGRIDS * nrho * 2));
-        double *bbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
-        double *abuf = bbuf + max_nao * Nr;
-        double *tb = abuf + max_nao * Nr;  // TB[c] = FQ[c]
-        double *ta = tb + Nr * GEMM_NGRIDS * ncomp;
-        double *rho = ta + Nr * GEMM_NGRIDS * nta;  // [nrho,ng]
-        double *wv = rho + GEMM_NGRIDS * nrho;  // [nrho,ng]
-        double *ket = malloc(sizeof(double) * (Nr * GEMM_NGRIDS * nseg
-                                               + max_nao * ((size_t)GEMM_NGRIDS * (nseg+1) + Nr)));
-        double *bra = ket + Nr * GEMM_NGRIDS * nseg;  // [ns,K]
-        double *vbuf = bra + (size_t)max_nao * GEMM_NGRIDS * nseg;  // [ns,r]
-        double *zbuf = vbuf + max_nao * Nr;  // Z[i,q] (GGA)
-        double *work = malloc(sizeof(double) * EVAL_WORK(4));
-        int igroup, blk0, blk1, ig0, ng, ns, k, c, q, slot, stream;
-        double *vpriv;
-// the deterministic dynamic schedule of _slot_take: out is reproducible for a
-// given number of threads
-        stream = -1;
-        while ((slot = _slot_take(&st, &stream, skip)) >= 0) {
-        vpriv = _slot_part(&st, vparts, stream, slot, nset * nvq);
-        for (igroup = slot * SLOT_GROUPS;
-             igroup < MIN((slot+1) * SLOT_GROUPS, ngroup); igroup++) {
-                blk0 = igroup * GEMM_NBLK;
-                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
-                ig0 = blk0 * BLKSIZE;
-                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
-                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
-                ns = g.nao;
-                if (ns == 0) {
-                        continue;
-                }
-                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
-                            nbas, atm, bas, env, work);
-                _gather_rows(bbuf, B, r, &g);
-                // tb[c,l,q] = sum_n aobuf[c,n,q] * bbuf[n,l]
-                for (c = 0; c < ncomp; c++) {
-                        dgemm_(&TRANS_N, &TRANS_T, &ng, &r, &ns, &D1,
-                               aobuf + c * (size_t)ns * ng, &ng, bbuf, &r,
-                               &D0, tb + c * Nr * ng, &ng);
-                }
-                _ao_mo_shared(bra, ket, aobuf, tb, xctype, nseg, ns, ng, r);
-                for (k = 0; k < nset; k++) {
-                        _gather_rows(abuf, A + k * nao * Nr, r, &g);
-                        _lowrank_rho(rho, ng, aobuf, abuf, ta, tb, zbuf, nderiv,
-                                     ns, ng, r);
-                        _fxc_wv_points(wv, ng, rho, ng, fxc + ig0, ldfxc, weight + ig0,
-                                       nrho, ng);
-                        if (xctype != FUSED_LDA) {
-                                for (q = 0; q < ng; q++) {
-                                        wv[q] *= .5;
-                                }
-                        }
-                        if (xctype == FUSED_MGGA) {
-                                for (q = 0; q < ng; q++) {
-                                        wv[4*ng+q] *= .5;
-                                }
-                        }
-                        _ao_mo_dot(vpriv + k * nvq, wv, ng, aobuf, tb, ket, bra, vbuf, &g,
-                                   xctype, nseg, ns, ng, r);
-                }
-        }
-        _slot_release(&st, stream);
-        }
-#pragma omp barrier
-#pragma omp for schedule(static)
-        for (i = 0; i < nset * nao; i++) {
-                _slot_streams_add(out + i * (size_t)r, vparts, nstream, i * (size_t)r,
-                                  r);
-        }
-        _gemm_group_free(&g);
-        free(skip);
-        free(aobuf);
-        free(ket);
-        free(work);
+        _fxc_lowrank(1, &out, &A, &B, &r, nset, fxc, ldfxc, weight, nderiv,
+                     nao, ngrids, coords, ldc, screen_index, ao_loc,
+                     atm, natm, bas, nbas, env, rcache, roffs);
 }
-        _slot_parts_free(vparts, nstream);
-        _slot_streams_free(&st);
-        }
+
+/*
+ * VXCfused_fxc_lowrank for the spin densities of UKS, D_s[k] = A_s[k] B_s^T +
+ * B_s A_s[k]^T (s = a, b; A_s[nset,nao,r_s] and B_s[nao,r_s]):
+ * out_s[k] += v1_s[k] B_s, out_s[nset,nao,r_s], for the potentials of
+ * nr_uks_fxc with the kernel fxc[s,x,t,y,g] of cache_xc_kernel (spin=1),
+ * fxc[((s*nrho+x)*2*nrho+t*nrho+y)*ldfxc+g]. The AO values of a group serve
+ * both spins.
+ */
+void VXCfused_fxc_lowrank_uks(double *outa, double *outb, double *Aa, double *Ab,
+                              double *Ba, double *Bb, int nset, int ra, int rb,
+                              double *fxc, int ldfxc, double *weight, int nderiv,
+                              int nao, int ngrids, double *coords, int ldc,
+                              uint8_t *screen_index, int *ao_loc,
+                              int *atm, int natm, int *bas, int nbas, double *env,
+                              double *rcache, int64_t *roffs)
+{
+        double *out[2] = {outa, outb};
+        double *A[2] = {Aa, Ab};
+        double *B[2] = {Ba, Bb};
+        int r[2] = {ra, rb};
+        _fxc_lowrank(2, out, A, B, r, nset, fxc, ldfxc, weight, nderiv,
+                     nao, ngrids, coords, ldc, screen_index, ao_loc,
+                     atm, natm, bas, nbas, env, rcache, roffs);
 }

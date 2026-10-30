@@ -251,6 +251,8 @@ def gen_vind(mf, mo_coeff, mo_occ):
     noccb = moccb.shape[1]
 
     vresp = mf.gen_response(mo_coeff, mo_occ, hermi=1)
+    # The XC response from the factors of dm1 where the response function offers it
+    vind_mo = getattr(vresp, 'vind_mo', None)
     def fx(mo1):
         mo1 = mo1.reshape(-1,nmoa*nocca+nmob*noccb)
         nset = len(mo1)
@@ -262,6 +264,12 @@ def gen_vind(mf, mo_coeff, mo_occ):
             dmb = reduce(numpy.dot, (mo_coeff[1], xb, moccb.T))
             dm1[0,i] = dma + dma.T
             dm1[1,i] = dmb + dmb.T
+        if vind_mo is not None:
+            v1a, v1b = vind_mo(dm1, (mo1[:,:nmoa*nocca], mo1[:,nmoa*nocca:]))
+            v1vo = numpy.empty_like(mo1)
+            v1vo[:,:nmoa*nocca] = v1a.reshape(nset,-1)
+            v1vo[:,nmoa*nocca:] = v1b.reshape(nset,-1)
+            return v1vo
         v1 = vresp(dm1)
         v1vo = numpy.empty_like(mo1)
         for i in range(nset):

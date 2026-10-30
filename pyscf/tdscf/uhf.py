@@ -86,6 +86,9 @@ def _gen_tda_operation(td, fock_ao=None, wfnsym=None):
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.8-mem_now)
     vresp = td.gen_response(hermi=0, max_memory=max_memory)
+    # The XC response from the factors of the dms where the response function
+    # offers it
+    vind_lowrank = getattr(vresp, 'vind_lowrank', None)
 
     def vind(zs):
         nz = len(zs)
@@ -99,10 +102,21 @@ def _gen_tda_operation(td, fock_ao=None, wfnsym=None):
         dmsa = lib.einsum('xov,pv,qo->xpq', za, orbva, orboa.conj())
         dmsb = lib.einsum('xov,pv,qo->xpq', zb, orbvb, orbob.conj())
 
-        v1ao = vresp(numpy.asarray((dmsa,dmsb)))
-
-        v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva.conj())
-        v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb.conj())
+        if vind_lowrank is None:
+            v1ao = vresp(numpy.asarray((dmsa,dmsb)))
+            v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva.conj())
+            v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb.conj())
+        else:
+            # The symmetric parts of the dms are (a orbo^T + orbo a^T) / 2,
+            # a = orbv z^T
+            a = (lib.einsum('xov,pv->xpo', za, orbva*.5),
+                 lib.einsum('xov,pv->xpo', zb, orbvb*.5))
+            v1ao, v1xc = vind_lowrank(numpy.asarray((dmsa,dmsb)), a, (orbva, orbvb),
+                                      (orboa, orbob))
+            v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva.conj())
+            v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb.conj())
+            v1a += v1xc[0].transpose(0,2,1)
+            v1b += v1xc[1].transpose(0,2,1)
         v1a += numpy.einsum('xia,ia->xia', za, e_ia_a)
         v1b += numpy.einsum('xia,ia->xia', zb, e_ia_b)
 
@@ -861,6 +875,9 @@ def _gen_tdhf_operation(td, fock_ao=None, wfnsym=None):
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.8-mem_now)
     vresp = td.gen_response(hermi=0, max_memory=max_memory)
+    # The XC response from the factors of the dms where the response function
+    # offers it
+    vind_lowrank = getattr(vresp, 'vind_lowrank', None)
 
     def vind(xys):
         nz = len(xys)
@@ -879,11 +896,26 @@ def _gen_tdhf_operation(td, fock_ao=None, wfnsym=None):
         dmsb  = lib.einsum('xov,pv,qo->xpq', xb, orbvb, orbob.conj())
         dmsa += lib.einsum('xov,qv,po->xpq', ya, orbva.conj(), orboa)
         dmsb += lib.einsum('xov,qv,po->xpq', yb, orbvb.conj(), orbob)
-        v1ao = vresp(numpy.asarray((dmsa,dmsb)))
+        if vind_lowrank is None:
+            v1ao = vresp(numpy.asarray((dmsa,dmsb)))
+            v1xc = None
+        else:
+            # The symmetric parts of the dms are (a orbo^T + orbo a^T) / 2,
+            # a = orbv (X+Y)^T. The XC response is symmetric: it adds the same
+            # to both blocks.
+            a = (lib.einsum('xov,pv->xpo', xa+ya, orbva*.5),
+                 lib.einsum('xov,pv->xpo', xb+yb, orbvb*.5))
+            v1ao, v1xc = vind_lowrank(numpy.asarray((dmsa,dmsb)), a, (orbva, orbvb),
+                                      (orboa, orbob))
         v1a_top = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva.conj())
         v1b_top = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb.conj())
         v1a_bot = lib.einsum('xpq,po,qv->xov', v1ao[0], orboa.conj(), orbva)
         v1b_bot = lib.einsum('xpq,po,qv->xov', v1ao[1], orbob.conj(), orbvb)
+        if v1xc is not None:
+            v1a_top += v1xc[0].transpose(0,2,1)
+            v1a_bot += v1xc[0].transpose(0,2,1)
+            v1b_top += v1xc[1].transpose(0,2,1)
+            v1b_bot += v1xc[1].transpose(0,2,1)
 
         v1_top = xs * e_ia  # AX
         v1_bot = ys * e_ia  # AY

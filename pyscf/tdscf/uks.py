@@ -90,6 +90,9 @@ class CasidaTDDFT(TDDFT, TDA):
         hdiag = e_ia.ravel() ** 2
 
         vresp = self.gen_response(mo_coeff, mo_occ, hermi=1)
+        # The XC response from the factors of the dms where the response
+        # function offers it
+        vind_lowrank = getattr(vresp, 'vind_lowrank', None)
 
         def vind(zs):
             nz = len(zs)
@@ -98,17 +101,27 @@ class CasidaTDDFT(TDDFT, TDA):
                 zs = numpy.copy(zs)
                 zs[:,sym_forbid] = 0
 
-            dmsa = (zs[:,:nocca*nvira] * d_ia[:nocca*nvira]).reshape(nz,nocca,nvira)
-            dmsb = (zs[:,nocca*nvira:] * d_ia[nocca*nvira:]).reshape(nz,noccb,nvirb)
-            dmsa = lib.einsum('xov,pv,qo->xpq', dmsa, orbva, orboa)
-            dmsb = lib.einsum('xov,pv,qo->xpq', dmsb, orbvb, orbob)
+            zda = (zs[:,:nocca*nvira] * d_ia[:nocca*nvira]).reshape(nz,nocca,nvira)
+            zdb = (zs[:,nocca*nvira:] * d_ia[nocca*nvira:]).reshape(nz,noccb,nvirb)
+            dmsa = lib.einsum('xov,pv,qo->xpq', zda, orbva, orboa)
+            dmsb = lib.einsum('xov,pv,qo->xpq', zdb, orbvb, orbob)
             dmsa = dmsa + dmsa.transpose(0,2,1)
             dmsb = dmsb + dmsb.transpose(0,2,1)
 
-            v1ao = vresp(numpy.asarray((dmsa,dmsb)))
-
-            v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva)
-            v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb)
+            if vind_lowrank is None:
+                v1ao = vresp(numpy.asarray((dmsa,dmsb)))
+                v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva)
+                v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb)
+            else:
+                # dms = a orbo^T + orbo a^T, a = orbv (z*d_ia)^T
+                a = (lib.einsum('xov,pv->xpo', zda, orbva),
+                     lib.einsum('xov,pv->xpo', zdb, orbvb))
+                v1ao, v1xc = vind_lowrank(numpy.asarray((dmsa,dmsb)), a, (orbva, orbvb),
+                                          (orboa, orbob))
+                v1a = lib.einsum('xpq,qo,pv->xov', v1ao[0], orboa, orbva)
+                v1b = lib.einsum('xpq,qo,pv->xov', v1ao[1], orbob, orbvb)
+                v1a += v1xc[0].transpose(0,2,1)
+                v1b += v1xc[1].transpose(0,2,1)
 
             hx = numpy.hstack((v1a.reshape(nz,-1), v1b.reshape(nz,-1)))
             hx += ed_ia * zs
