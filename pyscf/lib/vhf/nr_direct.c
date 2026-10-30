@@ -21,7 +21,9 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-//#include <omp.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "config.h"
 #include "cint.h"
 #include "optimizer.h"
@@ -233,6 +235,15 @@ void CVHFdot_nrs8(int (*intor)(), JKOperator **jkop, JKArray **vjk,
 JKArray *CVHFallocate_JKArray(JKOperator *op, int *shls_slice, int *ao_loc,
                               int ncomp, int nblock, int size_limit)
 {
+        return CVHFallocate_JKArray_bs(op, shls_slice, ao_loc, ncomp, nblock,
+                                       size_limit, AO_BLOCK_SIZE);
+}
+
+// block_size: the AOs per block of the shell partition. The stack holds about
+// size_limit/(block_size^2*ncomp) blocks, so keys_cache grows as blocks shrink.
+JKArray *CVHFallocate_JKArray_bs(JKOperator *op, int *shls_slice, int *ao_loc,
+                                 int ncomp, int nblock, int size_limit, int block_size)
+{
         JKArray *jkarray = malloc(sizeof(JKArray));
         int ibra = op->ibra_shl0;
         int iket = op->iket_shl0;
@@ -259,7 +270,7 @@ JKArray *CVHFallocate_JKArray(JKOperator *op, int *shls_slice, int *ao_loc,
                 exit(1);
         }
         jkarray->ncomp = ncomp;
-        int keys_max = size_limit / (AO_BLOCK_SIZE*AO_BLOCK_SIZE*ncomp);
+        int keys_max = size_limit / (block_size*block_size*ncomp);
         jkarray->keys_cache = malloc(sizeof(int) * keys_max);
         jkarray->key_counts = 0;
         return jkarray;
@@ -345,6 +356,44 @@ int CVHFshls_block_partition(int *block_loc, int *shls_slice, int *ao_loc,
         return count;
 }
 
+static int _shls_block_partition_lim(int *block_loc, int *shls_slice,
+                                     int *shls_lim, int *ao_loc, int block_size);
+
+/*
+ * The tasks of CVHFnr_direct_drv and CVHFnr_direct_ex_drv are the (j,k,l)
+ * blocks; each loops over all i blocks. A call on few AOs, or one cut to the
+ * shells of an atom (gradients, Hessians), can have fewer 64-AO tasks than
+ * threads. Halve the blocks, down to AO_BLOCK_SIZE_MIN AOs, until there are
+ * TASKS_PER_THREAD tasks per thread. shls_lim: the excluded ranges of
+ * CVHFnr_direct_ex_drv, or NULL.
+ */
+static int _jkl_block_partition(int *block_jloc, int *block_kloc, int *block_lloc,
+                                size_t *nblock_j, size_t *nblock_k, size_t *nblock_l,
+                                int *shls_slice, int *shls_lim, int *ao_loc)
+{
+        int nthreads = 1;
+#ifdef _OPENMP
+        nthreads = omp_get_max_threads();
+#endif
+        int block_size = AO_BLOCK_SIZE;
+        while (1) {
+                if (shls_lim == NULL) {
+                        *nblock_j = CVHFshls_block_partition(block_jloc, shls_slice+2, ao_loc, block_size);
+                        *nblock_k = CVHFshls_block_partition(block_kloc, shls_slice+4, ao_loc, block_size);
+                        *nblock_l = CVHFshls_block_partition(block_lloc, shls_slice+6, ao_loc, block_size);
+                } else {
+                        *nblock_j = _shls_block_partition_lim(block_jloc, shls_slice+2, shls_lim+2, ao_loc, block_size);
+                        *nblock_k = _shls_block_partition_lim(block_kloc, shls_slice+4, shls_lim+4, ao_loc, block_size);
+                        *nblock_l = _shls_block_partition_lim(block_lloc, shls_slice+6, shls_lim+6, ao_loc, block_size);
+                }
+                if (block_size <= AO_BLOCK_SIZE_MIN ||
+                    *nblock_j * *nblock_k * *nblock_l >= (size_t)TASKS_PER_THREAD * nthreads) {
+                        return block_size;
+                }
+                block_size /= 2;
+        }
+}
+
 
 /*
  * drv loop over ij, generate eris of kl for given ij, call fjk to
@@ -395,10 +444,11 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         int *block_lloc = block_kloc + nksh + 1;
         // size_t to keep nblock^3 from overflowing for large molecules. The
         // same fix was applied to nr_sr_vhf.c.
-        size_t nblock_i = CVHFshls_block_partition(block_iloc, shls_slice+0, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_j = CVHFshls_block_partition(block_jloc, shls_slice+2, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_k = CVHFshls_block_partition(block_kloc, shls_slice+4, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_l = CVHFshls_block_partition(block_lloc, shls_slice+6, ao_loc, AO_BLOCK_SIZE);
+        size_t nblock_j, nblock_k, nblock_l;
+        int block_size = _jkl_block_partition(block_jloc, block_kloc, block_lloc,
+                                              &nblock_j, &nblock_k, &nblock_l,
+                                              shls_slice, NULL, ao_loc);
+        size_t nblock_i = CVHFshls_block_partition(block_iloc, shls_slice+0, ao_loc, block_size);
         size_t nblock_kl = nblock_k * nblock_l;
         size_t nblock_jkl = nblock_j * nblock_kl;
         int nblock_max = MAX(nblock_i, nblock_j);
@@ -421,8 +471,9 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         size_t r, blk_id;
         JKArray *v_priv[n_dm];
         for (i = 0; i < n_dm; i++) {
-                v_priv[i] = CVHFallocate_JKArray(jkop[i], shls_slice, ao_loc,
-                                                 ncomp, nblock_max, size_limit);
+                v_priv[i] = CVHFallocate_JKArray_bs(jkop[i], shls_slice, ao_loc,
+                                                    ncomp, nblock_max, size_limit,
+                                                    block_size);
         }
         double *buf = malloc(sizeof(double) * (di*di*di*di*ncomp + di*di*2 + cache_size));
         double *cache = buf + di*di*di*di*ncomp;
@@ -549,10 +600,11 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         int *block_jloc = block_iloc + nish + 1;
         int *block_kloc = block_jloc + njsh + 1;
         int *block_lloc = block_kloc + nksh + 1;
-        size_t nblock_i = _shls_block_partition_lim(block_iloc, shls_slice+0, shls_excludes+0, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_j = _shls_block_partition_lim(block_jloc, shls_slice+2, shls_excludes+2, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_k = _shls_block_partition_lim(block_kloc, shls_slice+4, shls_excludes+4, ao_loc, AO_BLOCK_SIZE);
-        size_t nblock_l = _shls_block_partition_lim(block_lloc, shls_slice+6, shls_excludes+6, ao_loc, AO_BLOCK_SIZE);
+        size_t nblock_j, nblock_k, nblock_l;
+        int block_size = _jkl_block_partition(block_jloc, block_kloc, block_lloc,
+                                              &nblock_j, &nblock_k, &nblock_l,
+                                              shls_slice, shls_excludes, ao_loc);
+        size_t nblock_i = _shls_block_partition_lim(block_iloc, shls_slice+0, shls_excludes+0, ao_loc, block_size);
         size_t nblock_kl = nblock_k * nblock_l;
         size_t nblock_jkl = nblock_j * nblock_kl;
         int nblock_max = MAX(nblock_i, nblock_j);
@@ -575,8 +627,9 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         size_t r, blk_id;
         JKArray *v_priv[n_dm];
         for (i = 0; i < n_dm; i++) {
-                v_priv[i] = CVHFallocate_JKArray(jkop[i], shls_slice, ao_loc,
-                                                 ncomp, nblock_max, size_limit);
+                v_priv[i] = CVHFallocate_JKArray_bs(jkop[i], shls_slice, ao_loc,
+                                                    ncomp, nblock_max, size_limit,
+                                                    block_size);
         }
         double *buf = malloc(sizeof(double) * (di*di*di*di*ncomp + di*di*2 + cache_size));
         double *cache = buf + di*di*di*di*ncomp;

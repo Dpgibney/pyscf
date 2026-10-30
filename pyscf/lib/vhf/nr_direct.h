@@ -20,6 +20,10 @@
 #include "optimizer.h"
 
 #define AO_BLOCK_SIZE   64
+// CVHFnr_direct_drv halves its blocks down to this size when a call has
+// fewer than TASKS_PER_THREAD tasks per thread
+#define AO_BLOCK_SIZE_MIN       16
+#define TASKS_PER_THREAD        16
 
 #define NOVALUE 0x7fffffff
 
@@ -79,6 +83,8 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
 
 JKArray *CVHFallocate_JKArray(JKOperator *op, int *shls_slice, int *ao_loc,
                               int ncomp, int nblock, int size_limit);
+JKArray *CVHFallocate_JKArray_bs(JKOperator *op, int *shls_slice, int *ao_loc,
+                                 int ncomp, int nblock, int size_limit, int block_size);
 void CVHFdeallocate_JKArray(JKArray *jkarray);
 double *CVHFallocate_and_reorder_dm(JKOperator *op, double *dm,
                                     int *shls_slice, int *ao_loc);
