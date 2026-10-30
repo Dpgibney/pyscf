@@ -18,6 +18,10 @@ add_library(dft SHARED
   multigrid.c grid_common.c grid_collocate.c grid_integrate.c
 )
 add_dependencies(dft cgto cvhf np_helper pbc)
+if(NUMINT_KERNEL_FLAGS)
+  set_source_files_properties(nr_numint.c nr_numint_sparse.c nr_numint_fused.c
+    PROPERTIES COMPILE_OPTIONS "${NUMINT_KERNEL_FLAGS}")
+endif()
 
 set_target_properties(dft PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})

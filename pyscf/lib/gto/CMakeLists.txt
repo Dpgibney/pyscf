@@ -18,6 +18,10 @@ add_library(cgto SHARED
   grid_ao_drv.c deriv1.c deriv2.c nr_ecp.c nr_ecp_deriv.c
   autocode/auto_eval1.c auto_ftao/ft_ao_ppnl_auto.c)
 add_dependencies(cgto np_helper)
+if(NUMINT_KERNEL_FLAGS)
+  set_source_files_properties(grid_ao_drv.c deriv1.c deriv2.c
+    PROPERTIES COMPILE_OPTIONS "${NUMINT_KERNEL_FLAGS}")
+endif()
 
 set_target_properties(cgto PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
