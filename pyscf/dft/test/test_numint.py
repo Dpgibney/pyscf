@@ -335,7 +335,9 @@ class KnownValues(unittest.TestCase):
 
     def test_fused_xc(self):
         # The kernels that compute the AO values in place (numint._FusedXC) give
-        # the results of the block_loop path bit for bit
+        # the results of the block_loop path bit for bit, except for dms that carry
+        # orbitals: their density path is chosen by flop count, and the GGA gradient
+        # from the orbitals sums in another order, so those agree to rounding
         numpy.random.seed(4)
         nao = mol.nao_nr()
         grids = mf.grids
@@ -355,25 +357,29 @@ class KnownValues(unittest.TestCase):
             return [numpy.asarray(x)]
         def xc_results():
             ni = numint.NumInt()
-            out = []
+            exact = []
+            with_mo = []
             for xc in ('lda,vwn', 'pbe', 'r2scan'):
-                out.append(ni.nr_rks(mol, grids, xc, dm_mo))
-                out.append(ni.nr_rks(mol, grids, xc, dm1, hermi=0))
-                out.append(ni.nr_uks(mol, grids, xc, dmu))
-                out.append(ni.nr_rks_fxc(mol, grids, xc, dm, dm1, hermi=0))
-                out.append(ni.nr_uks_fxc(mol, grids, xc, (dm, dm*.5), (dm1, dm1*.5)))
-                out.append(ni.cache_xc_kernel(mol, grids, xc, mo, occ))
-                out.append(ni.cache_xc_kernel(mol, grids, xc, (mo, mo), (occ*.5, occ*.25), spin=1))
-            return flatten(out)
+                with_mo.append(ni.nr_rks(mol, grids, xc, dm_mo))
+                exact.append(ni.nr_rks(mol, grids, xc, dm1, hermi=0))
+                with_mo.append(ni.nr_uks(mol, grids, xc, dmu))
+                exact.append(ni.nr_rks_fxc(mol, grids, xc, dm, dm1, hermi=0))
+                exact.append(ni.nr_uks_fxc(mol, grids, xc, (dm, dm*.5), (dm1, dm1*.5)))
+                with_mo.append(ni.cache_xc_kernel(mol, grids, xc, mo, occ))
+                with_mo.append(ni.cache_xc_kernel(mol, grids, xc, (mo, mo), (occ*.5, occ*.25),
+                                                  spin=1))
+            return flatten(exact), flatten(with_mo)
         with lib.temporary_env(numint, FUSED_XC=False):
-            ref = xc_results()
+            ref, ref_mo = xc_results()
         for env in ({}, {'RADIAL_CACHE_FRACTION': 0}):
             grids._fused_ao_data = None
             with lib.temporary_env(numint, **env):
-                out = xc_results()
+                out, out_mo = xc_results()
             self.assertEqual(grids._fused_ao_data.radial is None, bool(env))
             for a, b in zip(ref, out):
                 self.assertTrue(numpy.array_equal(a, b))
+            for a, b in zip(ref_mo, out_mo):
+                self.assertAlmostEqual(abs(a - b).max() / max(abs(a).max(), 1), 0, 13)
 
     def test_dot_sets_aow_ao(self):
         numpy.random.seed(5)

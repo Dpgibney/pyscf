@@ -386,7 +386,9 @@ static void _contract_mo(double *rho, double *a, double *b, int nocc, int ng)
  * in cmo: rho[i,0], for nderiv >= 1 also rho[i,1:4] and for nderiv == 2 also
  * rho[i,4] (tau) of rho[nset,nrho,ngrids]. The products of the AO values with
  * the orbitals are those of VXCdot_ao_mo_sparse_gemm, and the sums those of
- * _contract_rho (VXC_dcontract_rho) in eval_rho2.
+ * _contract_rho (VXC_dcontract_rho) in eval_rho2, except for the GGA gradient:
+ * 2 sum_n ao[c,n] Z[n] with Z = cmo (ao[0] cmo)^T, one GEMM for the three
+ * components instead of three. It equals eval_rho2's to rounding.
  */
 void VXCfused_eval_rho_mo(double *rho, double *cmo, int *nocc, int nset, int nderiv,
                           int nao, int ngrids, double *coords, int ldc,
@@ -416,8 +418,10 @@ void VXCfused_eval_rho_mo(double *rho, double *cmo, int *nocc, int nset, int nde
         const double D1 = 1;
         GemmGroup g;
         _gemm_group_init(&g, nbas);
+        // v1: Z[ns,ng] for GGA, ao[c]*cbuf for meta-GGA
+        const int nv1 = nderiv == 1 ? max_nao : max_nocc;
         double *aobuf = malloc(sizeof(double) * (max_nao * (GEMM_NGRIDS*ncomp + (size_t)max_nocc)
-                                                 + max_nocc * GEMM_NGRIDS * 2));
+                                                 + (max_nocc + (size_t)nv1) * GEMM_NGRIDS));
         double *cbuf = aobuf + max_nao * GEMM_NGRIDS * ncomp;
         double *v0 = cbuf + max_nao * (size_t)max_nocc;
         double *v1 = v0 + max_nocc * GEMM_NGRIDS;
@@ -464,11 +468,26 @@ void VXCfused_eval_rho_mo(double *rho, double *cmo, int *nocc, int nset, int nde
                         if (nderiv == 0) {
                                 continue;
                         }
-                        ptau = rhoi + 4 * Ngrids + ig0;
-                        if (nderiv == 2) {
-                                for (k = 0; k < ng; k++) {
-                                        ptau[k] = 0;
+                        if (nderiv == 1) {
+                                // sum_o v0[o,k] (ao[c] cbuf)[o,k] = sum_n aobuf[c,n,k] Z[n,k]
+                                // with Z[n,k] = sum_o cbuf[n,o] v0[o,k]: one GEMM for the
+                                // three gradient components (the AO values are zero on the
+                                // screened blocks _contract_group skips)
+                                dgemm_(&TRANS_N, &TRANS_N, &ng, &ns, &nc, &D1, v0, &ng,
+                                       cbuf, &nc, &D0, v1, &ng);
+                                for (c = 1; c < 4; c++) {
+                                        _contract_group(rho1, aobuf + c * (size_t)ns * ng, v1,
+                                                        &g, ao_loc, ng);
+                                        prho = rhoi + c * Ngrids + ig0;
+                                        for (k = 0; k < ng; k++) {
+                                                prho[k] = rho1[k] * 2;
+                                        }
                                 }
+                                continue;
+                        }
+                        ptau = rhoi + 4 * Ngrids + ig0;
+                        for (k = 0; k < ng; k++) {
+                                ptau[k] = 0;
                         }
                         for (c = 1; c < 4; c++) {
                                 dgemm_(&TRANS_N, &TRANS_T, &ng, &nc, &ns, &D1,
@@ -479,17 +498,13 @@ void VXCfused_eval_rho_mo(double *rho, double *cmo, int *nocc, int nset, int nde
                                 for (k = 0; k < ng; k++) {
                                         prho[k] = rho1[k] * 2;
                                 }
-                                if (nderiv == 2) {
-                                        _contract_mo(rho1, v1, v1, nc, ng);
-                                        for (k = 0; k < ng; k++) {
-                                                ptau[k] += rho1[k];
-                                        }
+                                _contract_mo(rho1, v1, v1, nc, ng);
+                                for (k = 0; k < ng; k++) {
+                                        ptau[k] += rho1[k];
                                 }
                         }
-                        if (nderiv == 2) {
-                                for (k = 0; k < ng; k++) {
-                                        ptau[k] *= .5;
-                                }
+                        for (k = 0; k < ng; k++) {
+                                ptau[k] *= .5;
                         }
                 }
         }

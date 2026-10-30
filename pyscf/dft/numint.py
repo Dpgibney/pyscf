@@ -1032,7 +1032,11 @@ class _FusedXC:
     matrices or potentials of a block at once. They are the sparse kernels
     _eval_rho_sparse, eval_rho2's _dot_ao_dm, _dot_ao_ao_sparse,
     _dot_ao_aow_sparse and _tau_dot_sparse without the AO arrays, and the
-    results equal those of the block_loop path on the same blocks bit for bit.
+    results equal those of the block_loop path on the same blocks bit for bit,
+    except the densities of dms that carry orbitals. Those take the cheaper of the
+    two density paths by flop count (mo_path_cheaper, which can differ from
+    _rho1_preferred), and the GGA gradient from the orbitals takes one GEMM fewer
+    than eval_rho2; both agree with the block_loop path to rounding.
     The fxc contractions take blocks of their own (_fused_fxc_blksize), and
     rks_fxc_mo the factors of CPHF-type dms instead of the dms.
     '''
@@ -1061,6 +1065,24 @@ class _FusedXC:
                 mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
                 mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
                 mol._env.ctypes.data_as(ctypes.c_void_p), radial, offsets)
+
+    def mo_path_cheaper(self, xctype, nocc):
+        '''Whether the densities of sets of nocc[i] occupied orbitals take fewer flops
+        from the orbitals (VXCfused_eval_rho_mo) than from their density matrices
+        (VXCfused_eval_rho), summed over the AO groups of the grid. Per grid point of a
+        group of ns AOs and per set, the orbital path multiplies the AO values by the
+        nocc orbitals (LDA once, meta-GGA four times; GGA once plus Z, then three
+        contractions over the AOs), the dm path by the ns x ns density matrix block.'''
+        ns = self.data.group_naos(self.mol)
+        nset = len(nocc)
+        nocc = int(numpy.sum(nocc))
+        if xctype == 'GGA':
+            mo = (4 * nocc + 3 * nset) * ns.sum()
+            dm = nset * (2 * ns**2 + 4 * ns).sum()
+        else:
+            mo = 2 * nocc * ns.sum()
+            dm = 2 * nset * (ns**2).sum()
+        return mo < dm
 
     @staticmethod
     def _occupied(mo_coeff, mo_occ):
@@ -1110,18 +1132,19 @@ class _FusedXC:
     def rho_evaluator(self, ni, dms_list, hermi, xctype):
         '''make_rho(ip0, ip1) -> [rho of dms for dms in dms_list] on the block,
         rho[nset,nrho,ngrids] (LDA: [nset,ngrids]), the densities that make_rho of
-        ni._gen_rho_evaluator(dms) gives. The dms of all lists that take the same
-        density path go through one kernel call.'''
+        ni._gen_rho_evaluator(dms) gives (to rounding for dms that carry orbitals,
+        see the class doc). The dms of all lists that take the same density path go
+        through one kernel call.'''
         mo_paths = []  # (index in dms_list, cpos, nocc) taking eval_rho2's path
         dm_paths = []  # (index in dms_list, dms) taking eval_rho1's
         for k, dms in enumerate(dms_list):
             dms, hermi1, mo_coeff, mo_occ, pair_mask, rho1_rho2_ratio = \
                     _rho_setup(ni, self.mol, dms, hermi, self.grids)
-            if mo_coeff is not None and not _rho1_preferred(rho1_rho2_ratio, xctype):
+            if mo_coeff is not None:
                 occupied = self._occupied(mo_coeff, mo_occ)
                 # Otherwise from the dms: eval_rho2's sums with negative occupations
-                # are not implemented, the results differ by the rounding
-                if occupied is not None:
+                # are not implemented
+                if occupied is not None and self.mo_path_cheaper(xctype, occupied[1]):
                     mo_paths.append((k,) + occupied)
                     continue
             # eval_rho1 on screened blocks: _eval_rho_sparse for real dms (hermi=1)
