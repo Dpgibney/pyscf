@@ -2271,17 +2271,15 @@ def _fxc_wv(rho1, fxc, weights, ip0, ip1):
         ctypes.c_int(nset), ctypes.c_int(nvar), ctypes.c_int(ng), ctypes.c_int(fxc.shape[2]))
     return wv
 
-def _fused_fxc_blksize(xctype, nset, nao, ngrids, max_memory):
-    '''The grid block size of _FusedXC.rks_fxc and uks_fxc for nset dms:
-    block_loop's, with fewer points where rho1 and wv of the dms would take
-    more than a quarter of max_memory. (The kernels hold no AO arrays. The
-    blocks of _rks_fxc_batch, which shrink with nset for its AO arrays, would
-    multiply the private XC matrices that the kernels sum per block.)'''
-    ao_deriv = 0 if xctype == 'LDA' else 1
-    comp = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
-    blksize = min(max_memory*1e6/((comp+1)*nao*8*BLKSIZE),
-                  max_memory*.25e6/(16*nset*_FUSED_NRHO[xctype]*BLKSIZE))
-    return max(4, min(int(blksize), ngrids//BLKSIZE+1, 1200)) * BLKSIZE
+def _fused_fxc_blksize(xctype, nset, ngrids, max_memory):
+    '''The grid block size of _FusedXC.rks_fxc and uks_fxc for nset dms: all
+    points, or as many as fit with rho1 and wv of the dms in a quarter of
+    max_memory. (The kernels hold no AO arrays, and each block allocates and
+    sums nthreads*nset private XC matrices, so the fewer blocks the better. The
+    blocks of block_loop and _rks_fxc_batch, sized for AO arrays, would multiply
+    those sums.)'''
+    blksize = max_memory*.25e6/(16*nset*_FUSED_NRHO[xctype]*BLKSIZE)
+    return max(4, min(int(blksize), ngrids//BLKSIZE+1)) * BLKSIZE
 
 def _rks_fxc_batch(ni, mol, grids, xctype, fxc, dms, hermi, make_rho1, nbins,
                    pair_mask, ao_loc, max_memory):
@@ -2435,7 +2433,7 @@ def nr_rks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     if xctype in _FUSED_XCTYPE and dtype == numpy.double:
         if grids.coords is None:
             grids.build(with_non0tab=True)
-        blksize = _fused_fxc_blksize(xctype, nset, nao, grids.weights.size, max_memory)
+        blksize = _fused_fxc_blksize(xctype, nset, grids.weights.size, max_memory)
         fused = _fused_xc(ni, mol, grids, nao, xctype, max_memory, (dms,), blksize)
     if fused is not None:
         vmat = fused.rks_fxc(ni, xctype, fxc, dms, hermi, vmat)
@@ -2724,7 +2722,7 @@ def nr_uks_fxc(ni, mol, grids, xc_code, dm0, dms, relativity=0, hermi=0,
     if xctype in _FUSED_XCTYPE:
         if grids.coords is None:
             grids.build(with_non0tab=True)
-        blksize = _fused_fxc_blksize(xctype, 2*nset, nao, grids.weights.size, max_memory)
+        blksize = _fused_fxc_blksize(xctype, 2*nset, grids.weights.size, max_memory)
         fused = _fused_xc(ni, mol, grids, nao, xctype, max_memory, (dma, dmb), blksize)
     if fused is not None:
         vmat = fused.uks_fxc(ni, xctype, fxc, dma, dmb, hermi, vmat)
