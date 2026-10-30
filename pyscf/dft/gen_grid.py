@@ -464,9 +464,12 @@ def arg_group_grids(mol, coords, box_size=GROUP_BOX_SIZE):
     box_ids[box_ids[:,0] > boxes[0], 0] = boxes[0]
     box_ids[box_ids[:,1] > boxes[1], 1] = boxes[1]
     box_ids[box_ids[:,2] > boxes[2], 2] = boxes[2]
-    rev_idx, counts = numpy.unique(box_ids, axis=0, return_inverse=True,
-                                   return_counts=True)[1:3]
-    return rev_idx.ravel().argsort(kind='stable')
+    # The ids lie in [-1, boxes], so this key increases with the lexicographic order of the
+    # (x, y, z) box ids. Its stable argsort is the stable argsort of the rank of the row in
+    # numpy.unique(box_ids, axis=0), without unique's sort of structured rows.
+    ny, nz = boxes[1:] + 2
+    key = ((box_ids[:,0] + 1).astype(numpy.int64) * ny + (box_ids[:,1] + 1)) * nz + (box_ids[:,2] + 1)
+    return key.argsort(kind='stable')
 
 def _load_conf(mod, name, default):
     var = getattr(__config__, name, None)

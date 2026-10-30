@@ -166,17 +166,23 @@ class KnownValues(unittest.TestCase):
             -numpy.inf, numpy.arange(boxes[1]+1) * box_size[1] + boundary[0][1]), numpy.inf)
         z_splits = numpy.append(numpy.append(
             -numpy.inf, numpy.arange(boxes[2]+1) * box_size[2] + boundary[0][2]), numpy.inf)
-        idx = []
-        for x0, x1 in zip(x_splits[:-1], x_splits[1:]):
-            for y0, y1 in zip(y_splits[:-1], y_splits[1:]):
-                for z0, z1 in zip(z_splits[:-1], z_splits[1:]):
-                    mask = ((x0 <= coords[:,0]) & (coords[:,0] < x1) &
-                            (y0 <= coords[:,1]) & (coords[:,1] < y1) &
-                            (z0 <= coords[:,2]) & (coords[:,2] < z1))
-                    idx.append(numpy.where(mask)[0])
-        ref = numpy.hstack(idx)
+        def ref_order(coords):
+            idx = []
+            for x0, x1 in zip(x_splits[:-1], x_splits[1:]):
+                for y0, y1 in zip(y_splits[:-1], y_splits[1:]):
+                    for z0, z1 in zip(z_splits[:-1], z_splits[1:]):
+                        mask = ((x0 <= coords[:,0]) & (coords[:,0] < x1) &
+                                (y0 <= coords[:,1]) & (coords[:,1] < y1) &
+                                (z0 <= coords[:,2]) & (coords[:,2] < z1))
+                        idx.append(numpy.where(mask)[0])
+            return numpy.hstack(idx)
         idx = gen_grid.arg_group_grids(mol, coords)
-        self.assertTrue(abs(ref - idx).max() == 0)
+        self.assertTrue(abs(ref_order(coords) - idx).max() == 0)
+
+        # Points beyond the boundary are grouped in the outermost boxes
+        coords = coords + numpy.random.default_rng(1).normal(scale=3., size=coords.shape)
+        idx = gen_grid.arg_group_grids(mol, coords)
+        self.assertTrue(abs(ref_order(coords) - idx).max() == 0)
 
 class TreutlerAhlrichsGrids(unittest.TestCase):
     @classmethod
