@@ -60,33 +60,52 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                                        None, atmlst, max_memory, log)
         t1 = log.timer_debug1('solving MO1', *t1)
 
-    nao, nmo = mo_coeff.shape
     mocc = mo_coeff[:,mo_occ>0]
-    s1a = -mol.intor('int1e_ipovlp', comp=3)
-
-    aoslices = mol.aoslice_by_atom()
-    for i0, ia in enumerate(atmlst):
-        shl0, shl1, p0, p1 = aoslices[ia]
-        s1ao = numpy.zeros((3,nao,nao))
-        s1ao[:,p0:p1] += s1a[:,p0:p1]
-        s1ao[:,:,p0:p1] += s1a[:,p0:p1].transpose(0,2,1)
-        s1oo = numpy.einsum('xpq,pi,qj->xij', s1ao, mocc, mocc)
-
-        for j0 in range(i0+1):
-            ja = atmlst[j0]
-            q0, q1 = aoslices[ja][2:]
-# *2 for double occupancy, *2 for +c.c.
-            dm1 = numpy.einsum('ypi,qi->ypq', mo1[ja], mocc)
-            de2[i0,j0] += numpy.einsum('xpq,ypq->xy', h1ao[ia], dm1) * 4
-            dm1 = numpy.einsum('ypi,qi,i->ypq', mo1[ja], mocc, mo_energy[mo_occ>0])
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1ao, dm1) * 4
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1oo, mo_e1[ja]) * 2
-
+    # *2 for double occupancy, *2 for +c.c.
+    de2_mo1 = _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc,
+                             mo_energy[mo_occ>0], max_memory=max_memory) * 4
+    for i0 in range(len(atmlst)):
+        de2[i0,:i0+1] += de2_mo1[i0,:i0+1]
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
     log.timer('RHF hessian', *time0)
     return de2
+
+def _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc, mo_eocc, s1a=None,
+                   max_memory=4000):
+    '''tr(h1ao[A] dm1[B]) - tr(s1ao[A] dme1[B]) - tr(s1oo[A] mo_e1[B])/2 for all pairs of atoms
+    A, B of atmlst, as [natm,natm,3,3]. Here dm1[B] = mo1[B] C^T and dme1[B] = mo1[B] e C^T, where
+    C holds the occupied orbitals and e their energies; s1ao[A] is the overlap derivative for
+    atom A and s1oo[A] = C^T s1ao[A] C. The factors of A and of B are formed once per atom, and
+    the pair sums are GEMMs.
+    '''
+    if s1a is None:
+        s1a = -mol.intor('int1e_ipovlp', comp=3)
+    nao, nocc = mocc.shape
+    natm = len(atmlst)
+    aoslices = mol.aoslice_by_atom()
+    mocc_e = mocc * mo_eocc
+    mo1 = numpy.asarray([mo1[ja] for ja in atmlst]).reshape(natm*3, nao*nocc)
+    mo_e1 = numpy.asarray([mo_e1[ja] for ja in atmlst]).reshape(natm*3, nocc*nocc)
+    out = numpy.empty((natm*3, natm*3))
+    blksize = max(1, int(max_memory*.2e6/8 / (3*nao*nocc + 3*nocc**2)))
+    for a0, a1 in lib.prange(0, natm, blksize):
+        # h1ao[A] C - s1ao[A] C e and s1oo[A], where s1ao[A] is s1a[:,p0:p1] in the rows of A
+        # plus its transpose
+        h1mo = numpy.empty((a1-a0, 3, nao, nocc))
+        s1oo = numpy.empty((a1-a0, 3, nocc, nocc))
+        for k, ia in enumerate(atmlst[a0:a1]):
+            p0, p1 = aoslices[ia][2:]
+            s1c = lib.einsum('xpq,qi->xpi', s1a[:,p0:p1], mocc)
+            s1oo_k = lib.einsum('pi,xpj->xij', mocc[p0:p1], s1c)
+            s1oo[k] = s1oo_k + s1oo_k.transpose(0,2,1)
+            h1mo[k] = lib.einsum('xpq,qi->xpi', h1ao[ia], mocc)
+            h1mo[k,:,p0:p1] -= lib.einsum('xpq,qi->xpi', s1a[:,p0:p1], mocc_e)
+            h1mo[k] -= lib.einsum('xqp,qi->xpi', s1a[:,p0:p1], mocc_e[p0:p1])
+        out[a0*3:a1*3] = lib.dot(h1mo.reshape(-1,nao*nocc), mo1.T)
+        out[a0*3:a1*3] -= lib.dot(s1oo.reshape(-1,nocc*nocc), mo_e1.T, .5)
+    return out.reshape(natm,3,natm,3).transpose(0,2,1,3)
 
 def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                       atmlst=None, max_memory=4000, verbose=None):

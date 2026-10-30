@@ -64,35 +64,19 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     mo1a, mo1b = mo1
     mo_e1a, mo_e1b = mo_e1
 
-    nao, nmo = mo_coeff[0].shape
     mocca = mo_coeff[0][:,mo_occ[0]>0]
     moccb = mo_coeff[1][:,mo_occ[1]>0]
     mo_ea = mo_energy[0][mo_occ[0]>0]
     mo_eb = mo_energy[1][mo_occ[1]>0]
     s1a = -mol.intor('int1e_ipovlp', comp=3)
 
-    aoslices = mol.aoslice_by_atom()
-    for i0, ia in enumerate(atmlst):
-        shl0, shl1, p0, p1 = aoslices[ia]
-        s1ao = numpy.zeros((3,nao,nao))
-        s1ao[:,p0:p1] += s1a[:,p0:p1]
-        s1ao[:,:,p0:p1] += s1a[:,p0:p1].transpose(0,2,1)
-        s1ooa = numpy.einsum('xpq,pi,qj->xij', s1ao, mocca, mocca)
-        s1oob = numpy.einsum('xpq,pi,qj->xij', s1ao, moccb, moccb)
-
-        for j0, ja in enumerate(atmlst[:i0+1]):
-            q0, q1 = aoslices[ja][2:]
-            dm1a = numpy.einsum('ypi,qi->ypq', mo1a[ja], mocca)
-            dm1b = numpy.einsum('ypi,qi->ypq', mo1b[ja], moccb)
-            de2[i0,j0] += numpy.einsum('xpq,ypq->xy', h1aoa[ia], dm1a) * 2
-            de2[i0,j0] += numpy.einsum('xpq,ypq->xy', h1aob[ia], dm1b) * 2
-            dm1a = numpy.einsum('ypi,qi,i->ypq', mo1a[ja], mocca, mo_ea)
-            dm1b = numpy.einsum('ypi,qi,i->ypq', mo1b[ja], moccb, mo_eb)
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1ao, dm1a) * 2
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1ao, dm1b) * 2
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1ooa, mo_e1a[ja])
-            de2[i0,j0] -= numpy.einsum('xpq,ypq->xy', s1oob, mo_e1b[ja])
-
+    de2_mo1 = rhf_hess._hess_elec_mo1(mol, atmlst, h1aoa, mo1a, mo_e1a, mocca, mo_ea, s1a,
+                                      max_memory)
+    de2_mo1 += rhf_hess._hess_elec_mo1(mol, atmlst, h1aob, mo1b, mo_e1b, moccb, mo_eb, s1a,
+                                       max_memory)
+    de2_mo1 *= 2
+    for i0 in range(len(atmlst)):
+        de2[i0,:i0+1] += de2_mo1[i0,:i0+1]
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
