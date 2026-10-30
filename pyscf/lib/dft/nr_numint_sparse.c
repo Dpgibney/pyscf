@@ -1310,8 +1310,11 @@ static void _dot_ao_ao_gemm(double *out, double *bra, double *wbra,
         const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
         const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
         const int nbuf = symmetric ? ncomp : 2;
-        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+        const int nstream = _slot_nstreams(ngroup);
         if (max_nao > 0) {
+        SlotStreams st;
+        _slot_streams_init(&st, ngroup, nstream);
+        double **vparts = _slot_parts_alloc(nstream, nn);
 #pragma omp parallel
 {
         const char TRANS_N = 'N';
@@ -1322,22 +1325,22 @@ static void _dot_ao_ao_gemm(double *out, double *bra, double *wbra,
         const double DM1 = -1;
         GemmGroup g;
         _gemm_group_init(&g, nbas);
-        double *vpriv = calloc(nn, sizeof(double));
-        // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
-        // visible to the other threads.
-        vprivs[omp_get_thread_num()] = vpriv;
+        char *skip = malloc(sizeof(char) * nstream);
         double *brabuf = malloc(sizeof(double) * max_nao * (GEMM_NGRIDS*nbuf + max_nao));
         double *ketbuf = brabuf + max_nao * GEMM_NGRIDS;
         double *cbuf = brabuf + max_nao * GEMM_NGRIDS * nbuf;
         double sqrtw[GEMM_NGRIDS];
         int pidx[GEMM_NGRIDS];
-        int igroup, blk0, blk1, ig0, ng, ns, np, nk, sign, i, j, k;
+        int igroup, blk0, blk1, ig0, ng, ns, np, nk, sign, i, k, slot, stream;
         double w, beta;
-// static: each thread sums a fixed set of groups, so out is reproducible for a
-// given number of threads. Round robin, because the cost of a group varies
-// along the grid.
-#pragma omp for schedule(static, 1)
-        for (igroup = 0; igroup < ngroup; igroup++) {
+        double *vpriv;
+// the deterministic dynamic schedule of _slot_take: out is reproducible for a
+// given number of threads
+        stream = -1;
+        while ((slot = _slot_take(&st, &stream, skip)) >= 0) {
+        vpriv = _slot_part(&st, vparts, stream, slot, nn);
+        for (igroup = slot * SLOT_GROUPS;
+             igroup < MIN((slot+1) * SLOT_GROUPS, ngroup); igroup++) {
                 blk0 = igroup * GEMM_NBLK;
                 blk1 = MIN(blk0 + GEMM_NBLK, nblk);
                 ig0 = blk0 * BLKSIZE;
@@ -1386,20 +1389,20 @@ static void _dot_ao_ao_gemm(double *out, double *bra, double *wbra,
                 }
                 _gemm_scatter_add(vpriv, cbuf, &g, Nao, hermi);
         }
-        NPomp_dsum_reduce_inplace(vprivs, nn);
-        double *vsum = vprivs[0];
+        _slot_release(&st, stream);
+        }
+#pragma omp barrier
 #pragma omp for schedule(static)
         for (i = 0; i < nao; i++) {
-                for (j = 0; j < (hermi ? i+1 : nao); j++) {
-                        out[i*Nao+j] += vsum[i*Nao+j];
-                }
+                _slot_streams_add(out + i*Nao, vparts, nstream, i*Nao, hermi ? i+1 : nao);
         }
         _gemm_group_free(&g);
-        free(vpriv);
+        free(skip);
         free(brabuf);
 }
+        _slot_parts_free(vparts, nstream);
+        _slot_streams_free(&st);
         }
-        free(vprivs);
         if (hermi != 0) {
                 NPdsymm_triu(nao, out, hermi);
         }

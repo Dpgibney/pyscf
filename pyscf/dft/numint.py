@@ -43,6 +43,9 @@ from pyscf import __config__
 libdft = lib.load_library('libdft')
 # Grid blocks per GEMM group of the sparse and fused kernels (GEMM_NBLK in nr_numint_gemm.h)
 GEMM_NBLK = libdft.VXCfused_gemm_nblk()
+# Partial matrices per thread of the kernels that sum the products of the groups
+# (STREAMS_PER_THREAD in nr_numint_gemm.h)
+STREAMS_PER_THREAD = libdft.VXCfused_streams_per_thread()
 OCCDROP = getattr(__config__, 'dft_numint_occdrop', 1e-12)
 # The system size above which to consider the sparsity of the density matrix.
 # If the number of AOs in the system is less than this value, all tensors are
@@ -1180,9 +1183,11 @@ class _FusedXC:
         assert vmat.flags.c_contiguous and vmat.dtype == numpy.double
         nset = wv.shape[0]
         nao = self.nao
-        # Each thread keeps one (meta-GGA: two) [nao,nao] matrices per set
+        # The kernel keeps STREAMS_PER_THREAD partial sums per thread, of one
+        # (meta-GGA: two) [nao,nao] matrices per set
         npriv = 2 if xctype == 'MGGA' else 1
-        blk = int(self.max_memory*.5e6 / (lib.num_threads()*npriv*nao**2*8))
+        nparts = STREAMS_PER_THREAD * lib.num_threads()
+        blk = int(self.max_memory*.5e6 / (nparts*npriv*nao**2*8))
         for i0, i1 in lib.prange(0, nset, max(1, blk)):
             libdft.VXCfused_dot_wv(
                 vmat[i0:i1].ctypes.data_as(ctypes.c_void_p),
@@ -1199,8 +1204,10 @@ class _FusedXC:
         assert out.flags.c_contiguous and out.dtype == numpy.double
         nset, nwv = wv.shape[:2]
         nout, nseg = bras.shape[:2]
-        # Each thread keeps nout [nao,nao] matrices per set
-        blk = int(self.max_memory*.5e6 / (lib.num_threads()*nout*self.nao**2*8))
+        # The kernel keeps STREAMS_PER_THREAD partial sums per thread, of nout
+        # [nao,nao] matrices per set
+        nparts = STREAMS_PER_THREAD * lib.num_threads()
+        blk = int(self.max_memory*.5e6 / (nparts*nout*self.nao**2*8))
         for i0, i1 in lib.prange(0, nset, max(1, blk)):
             libdft.VXCfused_dot_terms(
                 out[i0:i1].ctypes.data_as(ctypes.c_void_p),
@@ -1261,9 +1268,10 @@ class _FusedXC:
 
     def mo_chunk(self, nset, nq):
         '''The number of sets rks_fxc_mo takes per pass over the grids: their
-        matrices v[k] Q, one copy per thread in dot_ao_mo, fit in half of
-        max_memory'''
-        n = self.max_memory*.5e6 / (8 * (lib.num_threads()+1) * self.nao * nq)
+        matrices v[k] Q, with STREAMS_PER_THREAD partial sums per thread in the
+        kernels, fit in half of max_memory'''
+        nparts = STREAMS_PER_THREAD * lib.num_threads()
+        n = self.max_memory*.5e6 / (8 * (nparts+1) * self.nao * nq)
         return max(1, min(nset, int(n)))
 
     def lowrank_cheaper(self, xctype, r, nq, nset):
