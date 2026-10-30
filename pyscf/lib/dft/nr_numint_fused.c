@@ -50,6 +50,12 @@
 #include "vhf/fblas.h"
 #include "nr_numint_gemm.h"
 
+// GEMM_NBLK for the Python side (numint._GridAOData.group_naos)
+int VXCfused_gemm_nblk()
+{
+        return GEMM_NBLK;
+}
+
 // The work buffer of _eval_group for ncomp AO components
 #define EVAL_WORK(ncomp)        (BLKSIZE*(3 + NPRIMAX*2 + NCTR_CART*(ncomp)))
 #define FUSED_LDA       0

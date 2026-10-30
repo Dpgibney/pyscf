@@ -41,6 +41,8 @@ from pyscf.dft import xc_deriv
 from pyscf import __config__
 
 libdft = lib.load_library('libdft')
+# Grid blocks per GEMM group of the sparse and fused kernels (GEMM_NBLK in nr_numint_gemm.h)
+GEMM_NBLK = libdft.VXCfused_gemm_nblk()
 OCCDROP = getattr(__config__, 'dft_numint_occdrop', 1e-12)
 # The system size above which to consider the sparsity of the density matrix.
 # If the number of AOs in the system is less than this value, all tensors are
@@ -966,13 +968,13 @@ class _GridAOData:
 
     def group_naos(self, mol):
         '''The number of AOs of the shells unscreened on each group of GEMM_NBLK
-        (4) blocks, as the sparse kernels gather them'''
+        blocks, as the sparse kernels gather them'''
         if getattr(self, '_group_naos', None) is None:
             m = self.non0tab != 0
             nblk = m.shape[0]
-            ngroup = (nblk + 3) // 4
-            m = numpy.vstack([m, numpy.zeros((ngroup*4-nblk, m.shape[1]), dtype=bool)])
-            m = m.reshape(ngroup, 4, -1).any(axis=1)
+            ngroup = (nblk + GEMM_NBLK - 1) // GEMM_NBLK
+            m = numpy.vstack([m, numpy.zeros((ngroup*GEMM_NBLK-nblk, m.shape[1]), dtype=bool)])
+            m = m.reshape(ngroup, GEMM_NBLK, -1).any(axis=1)
             self._group_naos = (m * numpy.diff(mol.ao_loc_nr())).sum(axis=1).astype(float)
         return self._group_naos
 
@@ -1266,7 +1268,7 @@ class _FusedXC:
         nq = Q.shape[1]
         nrho = _FUSED_NRHO[xctype]
         ngrids = self.grids.weights.size
-        ngemm = BLKSIZE * 4  # the GEMM groups (GEMM_NGRIDS) of the kernels
+        ngemm = BLKSIZE * GEMM_NBLK  # the GEMM groups (GEMM_NGRIDS) of the kernels
         nchunk = self.mo_chunk(nset, nq)
         for k0, k1 in lib.prange(0, nset, nchunk):
             n = k1 - k0

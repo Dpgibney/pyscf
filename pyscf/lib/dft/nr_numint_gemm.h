@@ -26,7 +26,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define GEMM_NBLK       4
+// Blocks per group: the kernels gather the AOs unscreened on any block of a group and run one GEMM
+// over its GEMM_NGRIDS points. Two blocks (112 points) keep a thread's AO buffers within L2.
+#define GEMM_NBLK       2
 #define GEMM_NGRIDS     (GEMM_NBLK*BLKSIZE)
 
 typedef struct {
