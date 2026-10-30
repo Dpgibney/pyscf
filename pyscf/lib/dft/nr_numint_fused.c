@@ -1251,3 +1251,56 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
         }
         free(vprivs);
 }
+
+#define WV_POINTS       512
+/*
+ * The potentials of the fxc contractions for nset sets: for each point g,
+ *   wv[k,x,g] = sum_y rho1[k,y,g] fxc[x,y,g] weight[g]
+ * with each term taken as (rho1 * fxc) * weight and the terms added in the
+ * order of y, as numpy.einsum('yg,xyg,g->xg', rho1[k], fxc, weight) computes
+ * them; for nvar == 1, wv[k] = (weight * rho1[k]) * fxc, as numpy evaluates
+ * weight * rho1[k] * fxc[0]. rho1 and wv are [nset,nvar,ngrids], weight
+ * [ngrids], and fxc[x,y,g] is fxc[(x*nvar+y)*ldfxc+g]. The points go in blocks
+ * whose fxc stays in cache for all sets.
+ */
+void VXCfused_fxc_wv(double *wv, double *rho1, double *fxc, double *weight,
+                     int nset, int nvar, int ngrids, int ldfxc)
+{
+        const size_t Ngrids = ngrids;
+        const size_t Ldfxc = ldfxc;
+        const int nblk = (ngrids + WV_POINTS - 1) / WV_POINTS;
+#pragma omp parallel
+{
+        int ib, g0, g1, k, x, y, g;
+        double *r, *rk, *w, *wx, *f;
+#pragma omp for schedule(static)
+        for (ib = 0; ib < nblk; ib++) {
+                g0 = ib * WV_POINTS;
+                g1 = MIN(g0 + WV_POINTS, ngrids);
+                for (k = 0; k < nset; k++) {
+                        rk = rho1 + k * nvar * Ngrids;
+                        w = wv + k * nvar * Ngrids;
+                        if (nvar == 1) {
+                                for (g = g0; g < g1; g++) {
+                                        w[g] = weight[g] * rk[g] * fxc[g];
+                                }
+                                continue;
+                        }
+                        for (x = 0; x < nvar; x++) {
+                                wx = w + x * Ngrids;
+                                f = fxc + x * nvar * Ldfxc;
+                                for (g = g0; g < g1; g++) {
+                                        wx[g] = rk[g] * f[g] * weight[g];
+                                }
+                                for (y = 1; y < nvar; y++) {
+                                        r = rk + y * Ngrids;
+                                        f = fxc + (x * nvar + y) * Ldfxc;
+                                        for (g = g0; g < g1; g++) {
+                                                wx[g] += r[g] * f[g] * weight[g];
+                                        }
+                                }
+                        }
+                }
+        }
+}
+}

@@ -1294,6 +1294,7 @@ class _FusedXC:
         ngrids = self.grids.weights.size
         ngemm = BLKSIZE * GEMM_NBLK  # the GEMM groups (GEMM_NGRIDS) of the kernels
         nchunk = self.mo_chunk(nset, nq)
+        fxc = numpy.ascontiguousarray(fxc)
         for k0, k1 in lib.prange(0, nset, nchunk):
             n = k1 - k0
             # rho1 and wv of a block in a quarter of max_memory
@@ -1301,15 +1302,8 @@ class _FusedXC:
             blksize = max(1, min(blksize, 300)) * ngemm
             vq = numpy.zeros((n, self.nao, nq))
             for ip0, ip1 in lib.prange(0, ngrids, blksize):
-                weight = self.grids.weights[ip0:ip1]
-                _fxc = fxc[:,:,ip0:ip1]
                 rho1 = self.rho_lowrank(ip0, ip1, A[k0:k1], B, xctype)
-                wv = numpy.empty((n, nrho, ip1-ip0))
-                for i in range(n):
-                    if xctype == 'LDA':
-                        wv[i] = weight * rho1[i] * _fxc[0]
-                    else:
-                        wv[i] = numpy.einsum('yg,xyg,g->xg', rho1[i], _fxc, weight)
+                wv = _fxc_wv(rho1, fxc, self.grids.weights, ip0, ip1)
                 if xctype != 'LDA':
                     wv[:,0] *= .5
                 if xctype == 'MGGA':
@@ -1374,18 +1368,11 @@ class _FusedXC:
         of _fused_fxc_blksize) with the kernel fxc; adds to vmat[nset,nao,nao]
         and returns the XC response matrices as nr_rks_fxc does.'''
         make_rho1 = self.rho_evaluator(ni, [dms], hermi, xctype)
-        nset = vmat.shape[0]
         vtau = numpy.zeros_like(vmat) if xctype == 'MGGA' else None
+        fxc = numpy.ascontiguousarray(fxc)
         for ip0, ip1 in self.blocks:
-            weight = self.grids.weights[ip0:ip1]
-            _fxc = fxc[:,:,ip0:ip1]
             rho1 = make_rho1(ip0, ip1)[0]
-            wv = numpy.empty((nset, _FUSED_NRHO[xctype], ip1-ip0))
-            for i in range(nset):
-                if xctype == 'LDA':
-                    wv[i] = weight * rho1[i] * _fxc[0]
-                else:
-                    wv[i] = numpy.einsum('yg,xyg,g->xg', rho1[i], _fxc, weight)
+            wv = _fxc_wv(rho1, fxc, self.grids.weights, ip0, ip1)
             self._dot_wv(ip0, ip1, wv, xctype, hermi, vmat, vtau)
         return self._vmat(xctype, vmat, vtau)
 
@@ -2264,6 +2251,25 @@ def _rks_fxc_blksize(xctype, nset, nao, ngrids, max_memory):
     comp = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
     blksize = int(max_memory*1e6/((comp+1+2*nset)*nao*8*BLKSIZE))
     return max(4, min(blksize, ngrids//BLKSIZE+1, 1200)) * BLKSIZE
+
+def _fxc_wv(rho1, fxc, weights, ip0, ip1):
+    '''wv[k] = numpy.einsum('yg,xyg,g->xg', rho1[k], fxc[:,:,ip0:ip1],
+    weights[ip0:ip1]) for every set k of rho1[nset,nvar,ip1-ip0] (LDA: rho1[nset,
+    ip1-ip0] and wv[k,0] = weights[ip0:ip1] * rho1[k] * fxc[0,0,ip0:ip1]), bit for
+    bit, in one threaded kernel (VXCfused_fxc_wv). fxc[nvar,nvar,ngrids] must be
+    C-contiguous.'''
+    nvar = fxc.shape[0]
+    nset = len(rho1)
+    ng = ip1 - ip0
+    assert fxc.flags.c_contiguous and fxc.dtype == numpy.double
+    rho1 = numpy.asarray(rho1, dtype=numpy.double, order='C').reshape(nset, nvar, ng)
+    weights = numpy.asarray(weights[ip0:ip1], dtype=numpy.double, order='C')
+    wv = numpy.empty((nset, nvar, ng))
+    libdft.VXCfused_fxc_wv(
+        wv.ctypes.data_as(ctypes.c_void_p), rho1.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_void_p(fxc.ctypes.data + ip0 * 8), weights.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nset), ctypes.c_int(nvar), ctypes.c_int(ng), ctypes.c_int(fxc.shape[2]))
+    return wv
 
 def _fused_fxc_blksize(xctype, nset, nao, ngrids, max_memory):
     '''The grid block size of _FusedXC.rks_fxc and uks_fxc for nset dms:
