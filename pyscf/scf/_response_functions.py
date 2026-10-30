@@ -262,8 +262,8 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
             '''v1 += the Coulomb and exchange response of dm1'''
             if not hybrid:
                 if with_j:
-                    vj = mf.get_j(mol, dm1, hermi=hermi)
-                    v1 += vj[0] + vj[1]
+                    # J depends on the total density only
+                    v1 += mf.get_j(mol, dm1[0] + dm1[1], hermi=hermi)
             else:
                 if omega == 0:
                     vj, vk = mf.get_jk(mol, dm1, hermi, with_j=with_j)

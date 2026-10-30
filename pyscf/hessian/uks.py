@@ -105,6 +105,8 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     moccb = mo_coeff[1][:,mo_occ[1]>0]
     dm0a = numpy.dot(mocca, mocca.T)
     dm0b = numpy.dot(moccb, moccb.T)
+    # J depends on the total density only
+    dm0 = dm0a + dm0b
     hcore_deriv = hessobj.base.nuc_grad_method().hcore_generator(mol)
 
     mf = hessobj.base
@@ -121,15 +123,13 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         shl0, shl1, p0, p1 = aoslices[ia]
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
         if hybrid:
-            vj1a, vj1b, vj2a, vj2b, vk1a, vk1b, vk2a, vk2b = \
+            vj1, vj2, vk1a, vk1b, vk2a, vk2b = \
                     _get_jk(mol, 'int2e_ip1', 3, 's2kl',
-                            ['ji->s2kl', -dm0a[:,p0:p1], 'ji->s2kl', -dm0b[:,p0:p1],
-                             'lk->s1ij', -dm0a         , 'lk->s1ij', -dm0b         ,
+                            ['ji->s2kl', -dm0[:,p0:p1],
+                             'lk->s1ij', -dm0         ,
                              'li->s1kj', -dm0a[:,p0:p1], 'li->s1kj', -dm0b[:,p0:p1],
                              'jk->s1il', -dm0a         , 'jk->s1il', -dm0b         ],
                             shls_slice=shls_slice)
-            vj1 = vj1a + vj1b
-            vj2 = vj2a + vj2b
             veffa = vj1 - hyb * vk1a
             veffb = vj1 - hyb * vk1b
             veffa[:,p0:p1] += vj2 - hyb * vk2a
@@ -148,13 +148,9 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
                 veffa[:,p0:p1] -= (alpha-hyb) * vk2a
                 veffb[:,p0:p1] -= (alpha-hyb) * vk2b
         else:
-            vj1a, vj1b, vj2a, vj2b = \
-                    _get_jk(mol, 'int2e_ip1', 3, 's2kl',
-                            ['ji->s2kl', -dm0a[:,p0:p1], 'ji->s2kl', -dm0b[:,p0:p1],
-                             'lk->s1ij', -dm0a         , 'lk->s1ij', -dm0b         ],
-                            shls_slice=shls_slice)
-            vj1 = vj1a + vj1b
-            vj2 = vj2a + vj2b
+            vj1, vj2 = _get_jk(mol, 'int2e_ip1', 3, 's2kl',
+                               ['ji->s2kl', -dm0[:,p0:p1], 'lk->s1ij', -dm0],
+                               shls_slice=shls_slice)
             veffa = vj1
             veffb = vj1.copy()
             veffa[:,p0:p1] += vj2
