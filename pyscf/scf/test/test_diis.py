@@ -94,6 +94,57 @@ class KnownValues(unittest.TestCase):
         e = mf.kernel()
         self.assertAlmostEqual(e, eref, 9)
 
+    def test_adiis_cdiis(self):
+        mol = gto.M(atom='O 0 0 0; H 0 -1.757 1.587; H 0 1.757 1.587', basis='631g', verbose=0)
+        e_ref = scf.RHF(mol).kernel()
+        mf = scf.RHF(mol)
+        mf.DIIS = diis.ADIIS_CDIIS
+        self.assertAlmostEqual(mf.kernel(), e_ref, 9)
+        self.assertTrue(mf.converged)
+
+        mol1 = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='631g',
+                     charge=1, spin=1, verbose=0)
+        e_ref = scf.UHF(mol1).kernel()
+        mf = scf.UHF(mol1)
+        mf.DIIS = diis.ADIIS_CDIIS
+        self.assertAlmostEqual(mf.kernel(), e_ref, 9)
+        # ROHF has one Fock matrix for two densities: CDIIS alone
+        e_ref = scf.ROHF(mol1).kernel()
+        mf = scf.ROHF(mol1)
+        mf.DIIS = diis.ADIIS_CDIIS
+        self.assertAlmostEqual(mf.kernel(), e_ref, 9)
+
+    def test_adiis_cdiis_steps(self):
+        mol = gto.M(atom='O 0 0 0; H 0 -1.757 1.587; H 0 1.757 1.587', basis='631g', verbose=0)
+        mf = scf.RHF(mol)
+        s = mf.get_ovlp()
+        h = mf.get_hcore()
+        dm = mf.get_init_guess()
+        adiis = diis.ADIIS_CDIIS(mf)
+        adiis.space = 3
+        adiis.adiis_start = 0
+        for i in range(5):
+            f = h + mf.get_veff(mol, dm)
+            fnew = adiis.update(s, dm, f)
+            if i == 0:
+                # one Fock matrix: ADIIS and CDIIS both return it
+                self.assertAlmostEqual(abs(fnew - f).max(), 0, 12)
+            self.assertEqual(len(adiis._ds), min(i + 1, 3))
+            e, c = mf.eig(fnew, s)
+            dm = mf.make_rdm1(c, mf.get_occ(e, c))
+        # below adiis_end the step is CDIIS's
+        cdiis = diis.CDIIS(mf)
+        adiis = diis.ADIIS_CDIIS(mf)
+        adiis.adiis_end = 1e9
+        dm = mf.get_init_guess()
+        for i in range(3):
+            f = h + mf.get_veff(mol, dm)
+            f1 = cdiis.update(s, dm, f)
+            f2 = adiis.update(s, dm, f)
+            self.assertAlmostEqual(abs(f1 - f2).max(), 0, 12)
+            e, c = mf.eig(f1, s)
+            dm = mf.make_rdm1(c, mf.get_occ(e, c))
+
     # issue 1524
     def test_diis_for_symmetry_adapted_scf(self):
         mol = gto.M(atom='O', spin=2, basis='ccpvdz', symmetry=True)

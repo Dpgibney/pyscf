@@ -210,6 +210,72 @@ class ADIIS(lib.diis.DIIS):
         self._head += 1
         return fock
 
+class ADIIS_CDIIS(CDIIS):
+    '''ADIIS+DIIS: ADIIS far from convergence, CDIIS close to it.
+
+    The size of the CDIIS error vector (the orbital gradient FDS - SDF, in the
+    orthonormal basis when Corth is set), its largest element (err='max') or its
+    root mean square (err='rms', as Psi4), chooses the extrapolation: ADIIS
+    above adiis_start, CDIIS below adiis_end, and in between the blend
+    w F_ADIIS + (1-w) F_CDIIS, w = (err-end) / (start-end) (blend='linear', the
+    rule of EDIIS+DIIS) or w = log(err/end) / log(start/end) (blend='log'). Both
+    extrapolate over the same last `space` Fock matrices. Unlike ADIIS, the ADIIS
+    step uses only the iterations seen so far. ROHF, whose DIIS sees the total
+    density and the effective Fock matrix, gets CDIIS alone.
+
+    Ref: ADIIS, JCP 132, 054109 (2010); DOI:10.1063/1.3304922
+         EDIIS+DIIS, JCP 116, 8255 (2002); DOI:10.1063/1.1470195
+    '''
+    adiis_start = 1e-1
+    adiis_end = 1e-4
+    blend = 'linear'
+    err = 'max'
+
+    def __init__(self, mf=None, filename=None, Corth=None):
+        CDIIS.__init__(self, mf, filename, Corth)
+        self._ds = []
+        self._fs = []
+
+    def update(self, s, d, f, *args, **kwargs):
+        errvec = get_err_vec(s, d, f, self.Corth)
+        if self.err == 'rms':
+            err = numpy.linalg.norm(errvec) / numpy.sqrt(errvec.size)
+        else:
+            err = abs(errvec).max()
+        logger.debug1(self, 'diis-norm(errvec)=%g  err=%g',
+                      numpy.linalg.norm(errvec), err)
+        f_prev = kwargs.get('f_prev', None)
+        if abs(self.damp) < 1e-6 or f_prev is None:
+            f_cdiis = lib.diis.DIIS.update(self, f, xerr=errvec)
+        else:
+            f_cdiis = lib.diis.DIIS.update(self, f*(1-self.damp) + f_prev*self.damp,
+                                           xerr=errvec)
+        if self.rollback > 0 and len(self._bookkeep) == self.space:
+            self._bookkeep = self._bookkeep[-self.rollback:]
+
+        d = numpy.asarray(d)
+        if getattr(f, 'focka', None) is not None or d.shape != f.shape:
+            # ROHF: an effective Fock matrix, and the total density
+            return f_cdiis
+        self._ds.append(d)
+        self._fs.append(numpy.asarray(f))
+        if len(self._ds) > self.space:
+            self._ds.pop(0)
+            self._fs.pop(0)
+        if err <= self.adiis_end:
+            return f_cdiis
+        fs = numpy.asarray(self._fs)
+        fun, c = adiis_minimize(numpy.asarray(self._ds), fs, len(fs)-1)
+        f_adiis = numpy.einsum('i,i...pq->...pq', c, fs)
+        if err >= self.adiis_start:
+            w = 1.
+        elif self.blend == 'linear':
+            w = (err - self.adiis_end) / (self.adiis_start - self.adiis_end)
+        else:
+            w = numpy.log(err/self.adiis_end) / numpy.log(self.adiis_start/self.adiis_end)
+        logger.debug1(self, 'ADIIS weight %g  adiis-c %s', w, c)
+        return w * f_adiis + (1 - w) * f_cdiis
+
 def adiis_minimize(ds, fs, idnewest):
     nx = ds.shape[0]
     nao = ds.shape[-1]
