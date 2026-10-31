@@ -1670,14 +1670,20 @@ class SCF(lib.StreamObject):
             energy based on the initial guess. Default value is 50.
         init_guess : str
             initial guess method.  It can be one of 'minao', 'atom', 'huckel',
-            'mod_huckel', 'hcore', '1e', 'sap', 'chkfile'.
+            'mod_huckel', 'hcore', '1e', 'sap', 'pre_scf', 'chkfile'.
             Default is 'minao'
         sap_basis : str or dict
             basis for SAP initial guess, either filename or path as str or
             internal format dictionary.
+        pre_scf_conv_tol : float
+            init_guess='pre_scf' converges a cheaper SCF (density fitting, and
+            for DFT the grids of level pre_scf_grids_level) to this energy
+            threshold. Default is 1e-6
+        pre_scf_grids_level : int
+            Grid level of the pre-SCF of init_guess='pre_scf'. Default is 1
         DIIS : DIIS class
             The class to generate diis object.  It can be one of
-            diis.SCF_DIIS, diis.ADIIS, diis.EDIIS.
+            diis.SCF_DIIS, diis.ADIIS, diis.EDIIS, diis.ADIIS_CDIIS.
         diis : boolean or object of DIIS class defined in :mod:`scf.diis`.
             Default is the object associated to the attribute :attr:`self.DIIS`.
             Set it to None/False to turn off DIIS.
@@ -1747,6 +1753,8 @@ class SCF(lib.StreamObject):
     max_cycle = getattr(__config__, 'scf_hf_SCF_max_cycle', 50)
     init_guess = getattr(__config__, 'scf_hf_SCF_init_guess', 'minao')
     sap_basis = 'sapgrasplarge' # Basis for SAP initial guess
+    pre_scf_conv_tol = getattr(__config__, 'scf_hf_SCF_pre_scf_conv_tol', 1e-6)
+    pre_scf_grids_level = getattr(__config__, 'scf_hf_SCF_pre_scf_grids_level', 1)
     disp = None  # for DFT-D3 and DFT-D4
 
     # To avoid diis pollution from previous run, self.diis should not be
@@ -1771,7 +1779,8 @@ class SCF(lib.StreamObject):
 
     _keys = {
         'conv_tol', 'conv_tol_grad', 'conv_tol_cpscf', 'max_cycle', 'init_guess',
-        'sap_basis', 'DIIS', 'diis', 'diis_space', 'diis_damp', 'diis_start_cycle',
+        'sap_basis', 'pre_scf_conv_tol', 'pre_scf_grids_level',
+        'DIIS', 'diis', 'diis_space', 'diis_damp', 'diis_start_cycle',
         'diis_file', 'diis_space_rollback', 'damp', 'level_shift',
         'direct_scf', 'direct_scf_tol', 'semi_direct', 'conv_check', 'callback',
         'mol', 'chkfile', 'mo_energy', 'mo_coeff', 'mo_occ',
@@ -2014,6 +2023,43 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
             logger.error(self, 'sap_basis is of an unexpected datatype.')
         return init_guess_by_sap(mol, sap_basis=sapbas, **kwargs)
 
+    def init_guess_by_pre_scf(self, mol=None):
+        '''Density of a cheaper SCF of the same model, converged from the minao
+        guess to pre_scf_conv_tol: density fitting for the Coulomb and exchange
+        terms (unless the object fits already), and for DFT the grids of level
+        pre_scf_grids_level. Starting from it, the SCF needs a few of its own
+        Fock builds instead of a full sequence (the DF_SCF_GUESS of Psi4).
+        '''
+        import copy
+        if mol is None: mol = self.mol
+        logger.info(self, 'Initial guess from an SCF with density fitting%s, '
+                    'converged to %g', ', grids level %d' % self.pre_scf_grids_level
+                    if hasattr(self, 'grids') else '', self.pre_scf_conv_tol)
+        mf = self.copy()
+        mf.mol = mol
+        mf._eri = None
+        mf._opt = {None: None}
+        mf.diis = True
+        mf.diis_file = None
+        mf.chkfile = None
+        mf.callback = None
+        mf.scf_summary = {}
+        mf.conv_check = False
+        mf.init_guess = 'minao'
+        mf.conv_tol = self.pre_scf_conv_tol
+        mf.conv_tol_grad = None
+        for key in ('grids', 'nlcgrids'):
+            grids = getattr(self, key, None)
+            if grids is not None:
+                grids = copy.copy(grids).reset(mol)
+                grids.__dict__.pop('_fused_ao_data', None)
+                grids.level = min(grids.level, self.pre_scf_grids_level)
+                setattr(mf, key, grids)
+        if getattr(mf, 'with_df', None) is None:
+            mf = mf.density_fit()
+        mf.kernel()
+        return mf.make_rdm1()
+
     @lib.with_doc(init_guess_by_chkfile.__doc__)
     def init_guess_by_chkfile(self, chkfile=None, project=None):
         if chkfile is None: chkfile = self.chkfile
@@ -2045,6 +2091,8 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
             dm = self.init_guess_by_vsap(mol)
         elif key == 'sap':
             dm = self.init_guess_by_sap(mol, **kwargs)
+        elif key == 'pre_scf':
+            dm = self.init_guess_by_pre_scf(mol)
         elif key[:3] == 'chk':
             try:
                 dm = self.init_guess_by_chkfile()

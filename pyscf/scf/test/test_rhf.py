@@ -1001,6 +1001,29 @@ H     0    0.757    0.587'''
             self.assertTrue(eri[shls] < eri[i,i,l,l]**.5 * eri[j,j,k,k]**.5)
 
 
+    def test_init_guess_pre_scf(self):
+        from pyscf import dft
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*', verbose=0)
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*',
+                     charge=1, spin=1, verbose=0)
+        for make in (lambda: scf.RHF(mol), lambda: scf.UHF(mol1), lambda: scf.ROHF(mol1),
+                     lambda: dft.RKS(mol, xc='b3lyp'), lambda: dft.UKS(mol1, xc='pbe'),
+                     lambda: dft.RKS(mol, xc='pbe').density_fit()):
+            mf = make()
+            mf.conv_tol = 1e-10
+            e_ref = mf.kernel()
+            mf = make()
+            mf.conv_tol = 1e-10
+            mf.init_guess = 'pre_scf'
+            self.assertAlmostEqual(mf.kernel(), e_ref, 8)
+            self.assertTrue(mf.converged)
+            if hasattr(mf, 'grids'):
+                self.assertEqual(mf.grids.level, 3)
+                self.assertEqual(mf.grids.coords.shape, make().grids.build().coords.shape)
+            # the guess leaves the object's own two-electron method alone
+            self.assertEqual(mf.istype('_DFHF'), make().istype('_DFHF'))
+
+
 if __name__ == "__main__":
     print("Full Tests for rhf")
     unittest.main()
