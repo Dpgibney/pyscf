@@ -559,6 +559,13 @@ void VXC_dscale_ao_batch(double *aow, double *ao, double *wv,
 #define VV10_LANES      8
 #define VV10_BLK        128
 
+/* The VV10 kernels may fuse multiplies and adds (FMA where the target has it, e.g. -march=x86-64-v3): their
+ * rounding differs from the previous kernels' anyway, and the rest of this file keeps -ffp-contract=off */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=fast")
+#endif
+
 typedef struct {
         double *x, *y, *z, *w0, *k, *rw;
         int n;  // padded length
@@ -865,6 +872,10 @@ void VXC_vv10nlc_grad(double *Fvec, double *vvcoords, double *coords,
         }
         free(q.x);
 }
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 void VXC_vv10nlc_hessian_eval_UWABCE(double* __restrict__ U, double* __restrict__ W, double* __restrict__ A, double* __restrict__ B, double* __restrict__ C, double* __restrict__ E,
                                      const double* __restrict__ grid_coord, const double* __restrict__ grid_weight,
