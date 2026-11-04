@@ -1090,6 +1090,11 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
 
     batch_k = _gen_k_direct(mol, 's2', direct_scf_tol, sgx._pjs_data)
 
+    # With the whole grid in one block, the AO values are the same in every K build. They are kept in
+    # _pjs_data, which _build_pjs makes anew when the grids or the molecule change.
+    single_block = blksize >= ngrids
+    if not single_block:
+        sgxdat._ao_on_grids = None
     ao = None
     fg = None
     for i0, i1 in lib.prange(0, ngrids, blksize):
@@ -1097,7 +1102,12 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
         coords = grids.coords[i0:i1]
         weights = grids.weights[i0:i1]
         mask = screen_index[i0 // BLKSIZE :]
-        ao = mol.eval_gto('GTOval', coords, non0tab=mask, out=ao)
+        if single_block and getattr(sgxdat, '_ao_on_grids', None) is not None:
+            ao = sgxdat._ao_on_grids
+        else:
+            ao = mol.eval_gto('GTOval', coords, non0tab=mask, out=ao)
+            if single_block:
+                sgxdat._ao_on_grids = ao
         if full_dm_ij is None:
             full_fni_bi = None
             full_fsgx_bi = None
@@ -1198,12 +1208,22 @@ def get_jk_favorj(sgx, dm, hermi=1, with_j=True, with_k=True,
     shls_slice = (0, mol.nbas)
     ao_loc = mol.ao_loc_nr()
     fg = None
+    # With the whole grid in one block, the AO values are the same in every J/K build: kept for the grids
+    single_block = blksize >= ngrids
+    cached = getattr(sgx, '_ao_on_grids', None)
+    if cached is not None and (not single_block or cached[0] is not grids):
+        sgx._ao_on_grids = cached = None
     for i0, i1 in lib.prange(0, ngrids, blksize):
         assert i0 % BLKSIZE == 0
         coords = grids.coords[i0:i1]
         weights = grids.weights[i0:i1]
         mask = screen_index[i0 // BLKSIZE:]
-        ao = mol.eval_gto('GTOval', coords, non0tab=mask)
+        if cached is not None:
+            ao = cached[1]
+        else:
+            ao = mol.eval_gto('GTOval', coords, non0tab=mask)
+            if single_block:
+                sgx._ao_on_grids = (grids, ao)
         # wao = ao * weights[:, None]
         # fg = lib.einsum('xij,ig->xjg', proj_dm, wao.T)
         wao = _scale_ao(ao, weights, out=wao)
