@@ -244,27 +244,37 @@ def get_D_S(surface, with_S=True, with_D=False):
     '''
     generate D and S matrix in  J. Chem. Phys. 133, 244111 (2010)
     The diagonal entries of S is not filled
+
+    The matrices are made a block of rows at a time, so that the temporaries are
+    a few (rows, ngrids) arrays rather than a dozen (ngrids, ngrids) ones; every
+    element is computed as before.
     '''
     charge_exp  = surface['charge_exp']
     grid_coords = surface['grid_coords']
     switch_fun  = surface['switch_fun']
     norm_vec    = surface['norm_vec']
     R_vdw       = surface['R_vdw']
+    ngrids = grid_coords.shape[0]
 
-    xi_i, xi_j = numpy.meshgrid(charge_exp, charge_exp, indexing='ij')
-    xi_ij = xi_i * xi_j / (xi_i**2 + xi_j**2)**0.5
-    rij = scipy.spatial.distance.cdist(grid_coords, grid_coords)
-    xi_r_ij = xi_ij * rij
-    numpy.fill_diagonal(rij, 1)
-    S = erf(xi_r_ij) / rij
+    S = numpy.empty((ngrids, ngrids))
+    D = numpy.empty((ngrids, ngrids)) if with_D else None
+    # about 128 MB for each of the (rows, ngrids, 3) temporaries
+    rows = max(1, int(128e6 / 8 / (ngrids * 3)))
+    xi_j = charge_exp[None,:]
+    for i0, i1 in lib.prange(0, ngrids, rows):
+        xi_i = charge_exp[i0:i1,None]
+        xi_ij = xi_i * xi_j / (xi_i**2 + xi_j**2)**0.5
+        rij = scipy.spatial.distance.cdist(grid_coords[i0:i1], grid_coords)
+        xi_r_ij = xi_ij * rij
+        rij[numpy.arange(i1-i0), numpy.arange(i0,i1)] = 1
+        S[i0:i1] = erf(xi_r_ij) / rij
+        if with_D:
+            # The diagonal of S is not set yet here; that of D is overwritten below
+            drij = numpy.expand_dims(grid_coords[i0:i1], axis=1) - grid_coords
+            nrij = numpy.sum(drij * norm_vec, axis=-1)
+            D[i0:i1] = S[i0:i1]*nrij/rij**2 -2.0*xi_r_ij/PI**0.5*numpy.exp(-xi_r_ij**2)*nrij/rij**3
     numpy.fill_diagonal(S, charge_exp * (2.0 / PI)**0.5 / switch_fun)
-
-    D = None
     if with_D:
-        drij = numpy.expand_dims(grid_coords, axis=1) - grid_coords
-        nrij = numpy.sum(drij * norm_vec, axis=-1)
-
-        D = S*nrij/rij**2 -2.0*xi_r_ij/PI**0.5*numpy.exp(-xi_r_ij**2)*nrij/rij**3
         numpy.fill_diagonal(D, -charge_exp * (2.0 / PI)**0.5 / (2.0 * R_vdw))
 
     return D, S
