@@ -546,75 +546,324 @@ void VXC_dscale_ao_batch(double *aow, double *ao, double *wv,
 }
 }
 
+/*
+ * VV10 (Vydrov and Van Voorhis 2010): for each outer point i, sums over the inner points j of
+ *     T_ij = RpW_j / (g gp gt),   g = R2 W0_i + K_i,  gp = R2 W0p_j + Kp_j,  gt = g + gp,  R2 = |r_i - r_j|^2:
+ *     F_i = -1.5 sum_j T_ij,   U_i = sum_j T_ij (1/g + 1/gt),   W_i = sum_j T_ij (1/g + 1/gt) R2.
+ * One division per pair: with D = 1/(g gp gt), T_ij = RpW_j D and 1/g + 1/gt = (g + gt) gp D.
+ * The inner points are copied into padded arrays per coordinate, and each sum runs in VV10_LANES partial sums,
+ * which the compiler can vectorize (it does not reorder a single floating-point sum); the partial sums are
+ * added in a fixed order. Padding points have RpW = 0, W0 = 0 and K = 1, so they add exact zeros. The results
+ * differ from a division per term in rounding only.
+ */
+#define VV10_LANES      8
+#define VV10_BLK        128
+
+typedef struct {
+        double *x, *y, *z, *w0, *k, *rw;
+        int n;  // padded length
+} VV10Points;
+
+static VV10Points vv10_points(double *coords, double *W0, double *K, double *RpW, int n, int pad_to)
+{
+        VV10Points p;
+        int npad = (n + pad_to - 1) / pad_to * pad_to;
+        double *buf = malloc(sizeof(double) * npad * 6 + 1);
+        int i;
+        p.n = npad;
+        p.x = buf;
+        p.y = p.x + npad;
+        p.z = p.y + npad;
+        p.w0 = p.z + npad;
+        p.k = p.w0 + npad;
+        p.rw = p.k + npad;
+        for (i = 0; i < n; i++) {
+                p.x[i] = coords[i*3+0];
+                p.y[i] = coords[i*3+1];
+                p.z[i] = coords[i*3+2];
+                p.w0[i] = W0[i];
+                p.k[i] = K[i];
+                p.rw[i] = RpW == NULL ? 0 : RpW[i];
+        }
+        for (; i < npad; i++) {
+                p.x[i] = 0;
+                p.y[i] = 0;
+                p.z[i] = 0;
+                p.w0[i] = 0;
+                p.k[i] = 1;
+                p.rw[i] = 0;
+        }
+        return p;
+}
+
 void VXC_vv10nlc(double *Fvec, double *Uvec, double *Wvec,
                  double *vvcoords, double *coords,
                  double *W0p, double *W0, double *K, double *Kp, double *RpW,
                  int vvngrids, int ngrids)
 {
-#pragma omp parallel
-{
-        double DX, DY, DZ, R2;
-        double gp, g, gt, T, F, U, W;
-        int i, j;
-#pragma omp for schedule(static)
-        for (i = 0; i < ngrids; i++) {
-                F = 0;
-                U = 0;
-                W = 0;
-                for (j = 0; j < vvngrids; j++) {
-                        DX = vvcoords[j*3+0] - coords[i*3+0];
-                        DY = vvcoords[j*3+1] - coords[i*3+1];
-                        DZ = vvcoords[j*3+2] - coords[i*3+2];
-                        R2 = DX*DX + DY*DY + DZ*DZ;
-                        gp = R2*W0p[j] + Kp[j];
-                        g  = R2*W0[i] + K[i];
-                        gt = g + gp;
-                        T = RpW[j] / (g*gp*gt);
-                        F += T;
-                        T *= 1./g + 1./gt;
-                        U += T;
-                        W += T * R2;
+        VV10Points q = vv10_points(vvcoords, W0p, Kp, RpW, vvngrids, VV10_LANES);
+        double *restrict xj = q.x;
+        double *restrict yj = q.y;
+        double *restrict zj = q.z;
+        double *restrict w0j = q.w0;
+        double *restrict kj = q.k;
+        double *restrict rwj = q.rw;
+        const int nj = q.n;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < ngrids; i++) {
+                const double xi = coords[i*3+0];
+                const double yi = coords[i*3+1];
+                const double zi = coords[i*3+2];
+                const double w0i = W0[i];
+                const double ki = K[i];
+                double f[VV10_LANES] = {0};
+                double u[VV10_LANES] = {0};
+                double w[VV10_LANES] = {0};
+                for (int j0 = 0; j0 < nj; j0 += VV10_LANES) {
+#pragma GCC ivdep
+                        for (int l = 0; l < VV10_LANES; l++) {
+                                int j = j0 + l;
+                                double dx = xj[j] - xi;
+                                double dy = yj[j] - yi;
+                                double dz = zj[j] - zi;
+                                double r2 = dx*dx + dy*dy + dz*dz;
+                                double gp = r2 * w0j[j] + kj[j];
+                                double g = r2 * w0i + ki;
+                                double gt = g + gp;
+                                double d = 1. / (g * gp * gt);
+                                double t = rwj[j] * d;
+                                f[l] += t;
+                                t *= (g + gt) * gp * d;
+                                u[l] += t;
+                                w[l] += t * r2;
+                        }
+                }
+                double F = 0, U = 0, W = 0;
+                for (int l = 0; l < VV10_LANES; l++) {
+                        F += f[l];
+                        U += u[l];
+                        W += w[l];
                 }
                 Fvec[i] = F * -1.5;
                 Uvec[i] = U;
                 Wvec[i] = W;
         }
-}
+        free(q.x);
 }
 
+/* the pairs of blocks a and b (a != b) of one point set, each pair once: T_ij and T_ji share D, so block a
+ * gets the sums over j in b and block b those over i in a */
+static void vv10_tile(VV10Points *p, double *restrict f, double *restrict u, double *restrict w, int a, int b)
+{
+        const int ia = a * VV10_BLK;
+        const int jb = b * VV10_BLK;
+        double *restrict xb = p->x + jb;
+        double *restrict yb = p->y + jb;
+        double *restrict zb = p->z + jb;
+        double *restrict w0b = p->w0 + jb;
+        double *restrict kb = p->k + jb;
+        double *restrict rwb = p->rw + jb;
+        double *restrict fb = f + jb;
+        double *restrict ub = u + jb;
+        double *restrict wb = w + jb;
+        for (int i = ia; i < ia + VV10_BLK; i++) {
+                const double xi = p->x[i];
+                const double yi = p->y[i];
+                const double zi = p->z[i];
+                const double w0i = p->w0[i];
+                const double ki = p->k[i];
+                const double rwi = p->rw[i];
+                double fi[VV10_LANES] = {0};
+                double ui[VV10_LANES] = {0};
+                double wi[VV10_LANES] = {0};
+                for (int j0 = 0; j0 < VV10_BLK; j0 += VV10_LANES) {
+#pragma GCC ivdep
+                        for (int l = 0; l < VV10_LANES; l++) {
+                                int j = j0 + l;
+                                double dx = xb[j] - xi;
+                                double dy = yb[j] - yi;
+                                double dz = zb[j] - zi;
+                                double r2 = dx*dx + dy*dy + dz*dz;
+                                double gi = r2 * w0i + ki;
+                                double gj = r2 * w0b[j] + kb[j];
+                                double gt = gi + gj;
+                                double d = 1. / (gi * gj * gt);
+                                double ti = rwb[j] * d;
+                                double tj = rwi * d;
+                                fi[l] += ti;
+                                fb[j] += tj;
+                                ti *= (gi + gt) * gj * d;
+                                tj *= (gj + gt) * gi * d;
+                                ui[l] += ti;
+                                ub[j] += tj;
+                                wi[l] += ti * r2;
+                                wb[j] += tj * r2;
+                        }
+                }
+                double F = 0, U = 0, W = 0;
+                for (int l = 0; l < VV10_LANES; l++) {
+                        F += fi[l];
+                        U += ui[l];
+                        W += wi[l];
+                }
+                f[i] += F;
+                u[i] += U;
+                w[i] += W;
+        }
+}
+
+/* the pairs within block a, as ordered pairs (the point itself included) */
+static void vv10_diag(VV10Points *p, double *f, double *u, double *w, int a)
+{
+        const int i0 = a * VV10_BLK;
+        double *restrict xb = p->x + i0;
+        double *restrict yb = p->y + i0;
+        double *restrict zb = p->z + i0;
+        double *restrict w0b = p->w0 + i0;
+        double *restrict kb = p->k + i0;
+        double *restrict rwb = p->rw + i0;
+        for (int i = i0; i < i0 + VV10_BLK; i++) {
+                const double xi = p->x[i];
+                const double yi = p->y[i];
+                const double zi = p->z[i];
+                const double w0i = p->w0[i];
+                const double ki = p->k[i];
+                double fi[VV10_LANES] = {0};
+                double ui[VV10_LANES] = {0};
+                double wi[VV10_LANES] = {0};
+                for (int j0 = 0; j0 < VV10_BLK; j0 += VV10_LANES) {
+#pragma GCC ivdep
+                        for (int l = 0; l < VV10_LANES; l++) {
+                                int j = j0 + l;
+                                double dx = xb[j] - xi;
+                                double dy = yb[j] - yi;
+                                double dz = zb[j] - zi;
+                                double r2 = dx*dx + dy*dy + dz*dz;
+                                double gp = r2 * w0b[j] + kb[j];
+                                double g = r2 * w0i + ki;
+                                double gt = g + gp;
+                                double d = 1. / (g * gp * gt);
+                                double t = rwb[j] * d;
+                                fi[l] += t;
+                                t *= (g + gt) * gp * d;
+                                ui[l] += t;
+                                wi[l] += t * r2;
+                        }
+                }
+                double F = 0, U = 0, W = 0;
+                for (int l = 0; l < VV10_LANES; l++) {
+                        F += fi[l];
+                        U += ui[l];
+                        W += wi[l];
+                }
+                f[i] += F;
+                u[i] += U;
+                w[i] += W;
+        }
+}
+
+/*
+ * VXC_vv10nlc for inner points that are the outer points (the SCF's and the gradient's NLC grid): each pair
+ * of points once. The points are cut into blocks of VV10_BLK; the pairs of blocks are visited in the rounds of
+ * a round-robin tournament, in which every block appears in one pair, so the threads of a round update
+ * disjoint blocks, and every block's sums are added in the same order for any number of threads.
+ */
+void VXC_vv10nlc_sym(double *Fvec, double *Uvec, double *Wvec, double *coords,
+                     double *W0, double *K, double *RpW, int ngrids)
+{
+        VV10Points p = vv10_points(coords, W0, K, RpW, ngrids, VV10_BLK);
+        const int nb = p.n / VV10_BLK;
+        const int m = nb + (nb & 1);  // with a dummy block for odd nb
+        double *f = calloc(p.n * 3 + 1, sizeof(double));
+        double *u = f + p.n;
+        double *w = u + p.n;
+#pragma omp parallel
+{
+#pragma omp for schedule(static)
+        for (int a = 0; a < nb; a++) {
+                vv10_diag(&p, f, u, w, a);
+        }
+        for (int r = 0; r < m - 1; r++) {
+#pragma omp for schedule(static)
+                for (int k = 0; k < m / 2; k++) {
+                        int a, b;
+                        if (k == 0) {
+                                a = m - 1;
+                                b = r;
+                        } else {
+                                a = (r + k) % (m - 1);
+                                b = (r - k + m - 1) % (m - 1);
+                        }
+                        if (a < nb && b < nb) {
+                                vv10_tile(&p, f, u, w, a, b);
+                        }
+                }
+        }
+}
+        for (int i = 0; i < ngrids; i++) {
+                Fvec[i] = f[i] * -1.5;
+                Uvec[i] = u[i];
+                Wvec[i] = w[i];
+        }
+        free(f);
+        free(p.x);
+}
+
+/*
+ * The VV10 gradient term (Vydrov and Van Voorhis 2010, eq. 25-26), with one division per pair as in
+ * VXC_vv10nlc: Q = T (W0_i/g + W0p_j/gp + (W0_i + W0p_j)/gt) = RpW_j D^2 (W0_i gp gt + W0p_j g gt + (W0_i + W0p_j) g gp).
+ */
 void VXC_vv10nlc_grad(double *Fvec, double *vvcoords, double *coords,
                       double *W0p, double *W0, double *K, double *Kp, double *RpW,
                       int vvngrids, int ngrids)
 {
-#pragma omp parallel
-{
-        double DX, DY, DZ, R2;
-        double gp, g, gt, T, Q, FX, FY, FZ;
-        int i, j;
-#pragma omp for schedule(static)
-        for (i = 0; i < ngrids; i++) {
-                FX = 0;
-                FY = 0;
-                FZ = 0;
-                for (j = 0; j < vvngrids; j++) {
-                        DX = vvcoords[j*3+0] - coords[i*3+0];
-                        DY = vvcoords[j*3+1] - coords[i*3+1];
-                        DZ = vvcoords[j*3+2] - coords[i*3+2];
-                        R2 = DX*DX + DY*DY + DZ*DZ;
-                        gp = R2*W0p[j] + Kp[j];
-                        g  = R2*W0[i] + K[i];
-                        gt = g + gp;
-                        T = RpW[j] / (g*gp*gt);
-                        Q = T * (W0[i]/g + W0p[j]/gp + (W0[i]+W0p[j])/gt);
-                        FX += Q * DX;
-                        FY += Q * DY;
-                        FZ += Q * DZ;
+        VV10Points q = vv10_points(vvcoords, W0p, Kp, RpW, vvngrids, VV10_LANES);
+        double *restrict xj = q.x;
+        double *restrict yj = q.y;
+        double *restrict zj = q.z;
+        double *restrict w0j = q.w0;
+        double *restrict kj = q.k;
+        double *restrict rwj = q.rw;
+        const int nj = q.n;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < ngrids; i++) {
+                const double xi = coords[i*3+0];
+                const double yi = coords[i*3+1];
+                const double zi = coords[i*3+2];
+                const double w0i = W0[i];
+                const double ki = K[i];
+                double fx[VV10_LANES] = {0};
+                double fy[VV10_LANES] = {0};
+                double fz[VV10_LANES] = {0};
+                for (int j0 = 0; j0 < nj; j0 += VV10_LANES) {
+#pragma GCC ivdep
+                        for (int l = 0; l < VV10_LANES; l++) {
+                                int j = j0 + l;
+                                double dx = xj[j] - xi;
+                                double dy = yj[j] - yi;
+                                double dz = zj[j] - zi;
+                                double r2 = dx*dx + dy*dy + dz*dz;
+                                double gp = r2 * w0j[j] + kj[j];
+                                double g = r2 * w0i + ki;
+                                double gt = g + gp;
+                                double d = 1. / (g * gp * gt);
+                                double q = rwj[j] * d * d * (w0i * gp * gt + w0j[j] * g * gt + (w0i + w0j[j]) * g * gp);
+                                fx[l] += q * dx;
+                                fy[l] += q * dy;
+                                fz[l] += q * dz;
+                        }
+                }
+                double FX = 0, FY = 0, FZ = 0;
+                for (int l = 0; l < VV10_LANES; l++) {
+                        FX += fx[l];
+                        FY += fy[l];
+                        FZ += fz[l];
                 }
                 Fvec[i*3+0] = FX * -3;
                 Fvec[i*3+1] = FY * -3;
                 Fvec[i*3+2] = FZ * -3;
         }
-}
+        free(q.x);
 }
 
 void VXC_vv10nlc_hessian_eval_UWABCE(double* __restrict__ U, double* __restrict__ W, double* __restrict__ A, double* __restrict__ B, double* __restrict__ C, double* __restrict__ E,

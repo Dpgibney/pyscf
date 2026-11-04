@@ -504,6 +504,8 @@ def eval_rho2(mol, ao, mo_coeff, mo_occ, non0tab=None, xctype='LDA',
 
 def _vv10nlc(rho, coords, vvrho, vvweight, vvcoords, nlc_pars):
     thresh=1e-8
+    # the outer grid is the inner one (the SCF's and the gradient's NLC grid): each pair of points once
+    same_grid = vvrho is rho and vvcoords is coords
 
     #output
     exc=numpy.zeros(rho[0,:].size)
@@ -570,18 +572,29 @@ def _vv10nlc(rho, coords, vvrho, vvweight, vvcoords, nlc_pars):
     #    U=numpy.sum(T)
     #    W=numpy.sum(T*R2)
     #    F*=-1.5
-    libdft.VXC_vv10nlc(F.ctypes.data_as(ctypes.c_void_p),
-                       U.ctypes.data_as(ctypes.c_void_p),
-                       W.ctypes.data_as(ctypes.c_void_p),
-                       vvcoords.ctypes.data_as(ctypes.c_void_p),
-                       coords.ctypes.data_as(ctypes.c_void_p),
-                       W0p.ctypes.data_as(ctypes.c_void_p),
-                       W0.ctypes.data_as(ctypes.c_void_p),
-                       K.ctypes.data_as(ctypes.c_void_p),
-                       Kp.ctypes.data_as(ctypes.c_void_p),
-                       RpW.ctypes.data_as(ctypes.c_void_p),
-                       ctypes.c_int(vvcoords.shape[0]),
-                       ctypes.c_int(coords.shape[0]))
+    if same_grid:
+        # the same points pass the same threshold, so W0p, Kp equal W0, K
+        libdft.VXC_vv10nlc_sym(F.ctypes.data_as(ctypes.c_void_p),
+                               U.ctypes.data_as(ctypes.c_void_p),
+                               W.ctypes.data_as(ctypes.c_void_p),
+                               coords.ctypes.data_as(ctypes.c_void_p),
+                               W0.ctypes.data_as(ctypes.c_void_p),
+                               K.ctypes.data_as(ctypes.c_void_p),
+                               RpW.ctypes.data_as(ctypes.c_void_p),
+                               ctypes.c_int(coords.shape[0]))
+    else:
+        libdft.VXC_vv10nlc(F.ctypes.data_as(ctypes.c_void_p),
+                           U.ctypes.data_as(ctypes.c_void_p),
+                           W.ctypes.data_as(ctypes.c_void_p),
+                           vvcoords.ctypes.data_as(ctypes.c_void_p),
+                           coords.ctypes.data_as(ctypes.c_void_p),
+                           W0p.ctypes.data_as(ctypes.c_void_p),
+                           W0.ctypes.data_as(ctypes.c_void_p),
+                           K.ctypes.data_as(ctypes.c_void_p),
+                           Kp.ctypes.data_as(ctypes.c_void_p),
+                           RpW.ctypes.data_as(ctypes.c_void_p),
+                           ctypes.c_int(vvcoords.shape[0]),
+                           ctypes.c_int(coords.shape[0]))
     #exc is multiplied by Rho later
     exc[threshind] = Beta+0.5*F
     vxc[0,threshind] = Beta+F+1.5*(U*dKdR+W*dW0dR)
