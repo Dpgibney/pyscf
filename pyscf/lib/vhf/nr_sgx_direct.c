@@ -37,6 +37,32 @@
 #define BOXSIZE         96
 #define SGX_BLKSIZE     224
 
+#ifdef SGX_PROFILE
+/* profiling counters of the K drivers (experiment builds only): thread-seconds of
+ * 0 grid screening, 1 shell screening, 2 integrals, 3 contraction, 4 set0 and send;
+ * 5 shell pairs, 6 integrals (di*dj*dg), 7 batches; 8 driver wall seconds; 9 calls */
+#include <omp.h>
+static double sgx_prof[10];
+void SGXprofile_get(double *out)
+{
+        for (int i = 0; i < 10; i++) {
+                out[i] = sgx_prof[i];
+                sgx_prof[i] = 0;
+        }
+}
+#define PROF_DECL double _pt; double prof[8] = {0}
+#define PROF_START _pt = omp_get_wtime()
+#define PROF_STOP(k) prof[k] += omp_get_wtime() - _pt
+#define PROF_COUNT(k, n) prof[k] += (n)
+#define PROF_FLUSH { _Pragma("omp critical") for (int _k = 0; _k < 8; _k++) sgx_prof[_k] += prof[_k]; }
+#else
+#define PROF_DECL
+#define PROF_START
+#define PROF_STOP(k)
+#define PROF_COUNT(k, n)
+#define PROF_FLUSH
+#endif
+
 typedef struct {
         int ncomp;
         int v_dims[3];
@@ -1347,8 +1373,12 @@ void SGXnr_direct_k_drv(int (*intor)(), SGXJKOperator **jkop,
         }
         const int tot_ngrids = (int) env[NGRIDS];
         const int nbatch = (tot_ngrids + SGX_BLKSIZE - 1) / SGX_BLKSIZE;
+#ifdef SGX_PROFILE
+        double _wall0 = omp_get_wtime();
+#endif
 #pragma omp parallel
 {
+        PROF_DECL;
         int ig0, ig1, dg;
         int ish, jsh, jmax;
         int i0, i1, j0, j1, idm;
@@ -1370,11 +1400,16 @@ void SGXnr_direct_k_drv(int (*intor)(), SGXJKOperator **jkop,
                 ig0 = ibatch * SGX_BLKSIZE;
                 ig1 = MIN(ig0 + SGX_BLKSIZE, tot_ngrids);
                 dg = ig1 - ig0;
+                PROF_COUNT(7, 1);
+                PROF_START;
                 sgxopt->fscreen_grid(sgxopt, dms[0] + ig0, ibatch,
                                      n_dm, nish, shl_info, screen_buf);
+                PROF_STOP(0);
+                PROF_START;
                 for (idm = 0; idm < n_dm; idm++) {
                         jkop[idm]->set0(v_priv[idm], dg);
                 }
+                PROF_STOP(4);
                 nij = 0;
                 for (ish = 0; ish < nbas; ish++) {
                         if (aosym == 2) {
@@ -1382,9 +1417,12 @@ void SGXnr_direct_k_drv(int (*intor)(), SGXJKOperator **jkop,
                         } else {
                                 jmax = nish;
                         }
+                        PROF_START;
                         num_sj_shells = sgxopt->fscreen_shl(
                                 sgxopt, jmax, ish, nish, ish0, jsh0,
                                 shl_info, screen_buf, sj_shells);
+                        PROF_STOP(1);
+                        PROF_COUNT(5, num_sj_shells);
                         for (sj_index = 0; sj_index < num_sj_shells; sj_index++) {
                                 jsh = sj_shells[sj_index];
                                 shls[0] = ish + ish0;
@@ -1397,18 +1435,25 @@ void SGXnr_direct_k_drv(int (*intor)(), SGXJKOperator **jkop,
                                                 ao_loc[jsh+1]-ao_loc[jsh], dg};
                                 shls[2] = ig0;
                                 shls[3] = ig1;
+                                PROF_COUNT(6, (double)dims[0] * dims[1] * dg);
+                                PROF_START;
                                 (*intor)(buf, dims, shls, atm, natm, bas, nbas,
                                          env, cintopt, cache);
+                                PROF_STOP(2);
+                                PROF_START;
                                 for (idm = 0; idm < n_dm; idm++) {
                                         jkop[idm]->contract(buf, dms[idm], v_priv[idm],
                                                             i0, i1, j0, j1, ig0, dg);
                                 }
+                                PROF_STOP(3);
                         }
                         nij += num_sj_shells;
                 }
+                PROF_START;
                 for (idm = 0; idm < n_dm; idm++) {
                         jkop[idm]->send(v_priv[idm], ig0, dg, vjk[idm]);
                 }
+                PROF_STOP(4);
         }
 #pragma omp critical
 {
@@ -1416,12 +1461,17 @@ void SGXnr_direct_k_drv(int (*intor)(), SGXJKOperator **jkop,
                 jkop[idm]->finalize(v_priv[idm], vjk[idm]);
         }
 }
+        PROF_FLUSH;
         free(buf);
         free(cache);
         free(sj_shells);
         free(screen_buf);
         free(shl_info);
 }
+#ifdef SGX_PROFILE
+        sgx_prof[8] += omp_get_wtime() - _wall0;
+        sgx_prof[9] += 1;
+#endif
 }
 
 void SGXnr_q_cond(int (*intor)(), CINTOpt *cintopt, double *q_cond,
