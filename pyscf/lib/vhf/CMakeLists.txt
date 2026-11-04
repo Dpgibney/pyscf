@@ -19,6 +19,10 @@ add_library(cvhf SHARED
   r_direct_dot.c rah_direct_dot.c rha_direct_dot.c
   hessian_screen.c nr_sgx_direct.c nr_sr_vhf.c grad_jk_energy.c)
 add_dependencies(cvhf cgto np_helper)
+if(NUMINT_KERNEL_FLAGS)
+  set_source_files_properties(nr_sgx_direct.c
+    PROPERTIES COMPILE_OPTIONS "${NUMINT_KERNEL_FLAGS}")
+endif()
 
 set_target_properties(cvhf PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
