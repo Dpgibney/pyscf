@@ -20,6 +20,7 @@
 PCM family solvent models
 '''
 
+import ctypes
 import numpy
 import scipy
 import scipy.linalg
@@ -292,33 +293,61 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     sum_g q_g (ij|g) for each set of charges.
 
     int1e_grids takes the Gaussian charge model (PTR_RINV_ZETA) with one
-    exponent per call. The charge exponents take one value per Lebedev weight
-    and atomic radius, so the points go in groups of equal exponents. The SGX
-    driver evaluates the integrals of each shell pair (i >= j) over a block of
-    points and contracts them at once; no (nao, nao, ngrids) tensor is kept.
+    exponent at a time, and the charge exponents take one value per Lebedev
+    weight and atomic radius. So the points are sorted by exponent and cut into
+    batches that keep to one exponent, and the SGX driver runs all the batches,
+    each with its exponent, over the threads in one call. It evaluates the
+    integrals of each shell pair (i >= j) over a batch and contracts them at
+    once; no (nao, nao, ngrids) tensor is kept.
     '''
-    from pyscf.sgx.sgx_jk import _gen_jk_direct
-    grid_coords = surface['grid_coords']
+    from pyscf.sgx import sgx
+    from pyscf.scf import _vhf
     xi, group = numpy.unique(surface['charge_exp'], return_inverse=True)
-    jk = _gen_jk_direct(mol, 's2', True, False, INT1E_GRIDS_CUTOFF)
+    order = numpy.argsort(group, kind='stable')
+    ngrids = order.size
+    blksize = _vhf.libcvhf.SGXreturn_blksize()
+    group_loc = numpy.append(0, numpy.cumsum(numpy.bincount(group)))
+    batch_loc = numpy.append(
+        numpy.hstack([numpy.arange(p0, p1, blksize)
+                      for p0, p1 in zip(group_loc[:-1], group_loc[1:])]),
+        ngrids).astype(numpy.int32)
+    batch_zeta = numpy.ascontiguousarray(xi[group[order[batch_loc[:-1]]]]**2)
+    coords = numpy.asarray(surface['grid_coords'][order], order='C')
+    env = numpy.append(mol._env, coords.ravel())
+    env[gto.NGRIDS] = ngrids
+    env[gto.PTR_GRIDS] = mol._env.size
+    sgxopt = sgx._make_opt(mol, False, INT1E_GRIDS_CUTOFF)
+    ao_loc = gto.moleintor.make_loc(mol._bas, sgxopt._intor)
     if dms is not None:
         # (ij|g) is symmetric in ij, so only the symmetric part of D contributes
-        dms = [numpy.ascontiguousarray(dm + dm.T) * .5 for dm in dms]
-        out = numpy.empty((len(dms), grid_coords.shape[0]))
+        ins = [numpy.ascontiguousarray(dm + dm.T) * .5 for dm in dms]
+        out = numpy.zeros((len(ins), ngrids))
+        fjk = 'SGXnrs2_ijg_ji_g'
     else:
-        out = numpy.zeros((len(charges), mol.nao, mol.nao))
-    for k in range(xi.size):
-        idx = numpy.where(group == k)[0]
-        with mol.with_rinv_zeta(xi[k]**2):
-            if dms is not None:
-                out[:,idx] = jk(mol, grid_coords[idx], dms, None, None)[0]
-            else:
-                q = [numpy.ascontiguousarray(c[idx]) for c in charges]
-                out += jk(mol, grid_coords[idx], q, None, None)[0]
-    if dms is None:
-        for v in out:
-            # the driver fills the lower triangle
-            lib.hermi_triu(v, inplace=True)
+        ins = [numpy.ascontiguousarray(c[order]) for c in charges]
+        out = numpy.zeros((len(ins), mol.nao, mol.nao))
+        fjk = 'SGXnrs2_ijg_g_ij'
+    n = len(ins)
+    def ptrs(arrays):
+        return (ctypes.c_void_p*n)(*[a.ctypes.data_as(ctypes.c_void_p) for a in arrays])
+    _vhf.libcvhf.SGXnr_direct_drv_batches(
+        _vhf._fpointer(sgxopt._intor), (ctypes.c_void_p*n)(*[_vhf._fpointer(fjk)]*n),
+        ptrs(ins), ptrs(out), ctypes.c_int(n), ctypes.c_int(1),
+        (ctypes.c_int*4)(0, mol.nbas, 0, mol.nbas),
+        ao_loc.ctypes.data_as(ctypes.c_void_p),
+        sgxopt._cintopt, ctypes.byref(sgxopt._this),
+        mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
+        mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
+        env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(2),
+        ctypes.c_int(batch_loc.size - 1), batch_loc.ctypes.data_as(ctypes.c_void_p),
+        batch_zeta.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size))
+    if dms is not None:
+        v = numpy.empty_like(out)
+        v[:,order] = out
+        return v
+    for v in out:
+        # the driver fills the lower triangle
+        lib.hermi_triu(v, inplace=True)
     return out
 
 def _R_dot(pcmobj, x, trans=False):

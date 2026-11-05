@@ -881,12 +881,22 @@ void SGXdiagonal_ints(int (*intor)(), double *m_bi, int *ao_loc, CINTOpt *cintop
 }
 }
 
-void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
-                      double **dms, double **vjk, int n_dm, int ncomp,
-                      int *shls_slice, int *ao_loc,
-                      CINTOpt *cintopt, CVHFOpt *vhfopt,
-                      int *atm, int natm, int *bas, int nbas, double *env,
-                      int aosym)
+/*
+ * SGXnr_direct_drv over given batches of the grid: batch b holds the points
+ * [batch_loc[b], batch_loc[b+1]), at most SGX_BLKSIZE of them (batches of
+ * SGX_BLKSIZE points if batch_loc is NULL). With batch_zeta, batch b also takes
+ * its own exponent of the Gaussian charge model, batch_zeta[b] in
+ * env[PTR_RINV_ZETA], set in each thread's copy of the nenv doubles of env.
+ * PCM's surface charges have a few exponents: one call spreads the batches of
+ * all of them over the threads.
+ */
+void SGXnr_direct_drv_batches(int (*intor)(), SGXJKOperator **jkop,
+                              double **dms, double **vjk, int n_dm, int ncomp,
+                              int *shls_slice, int *ao_loc,
+                              CINTOpt *cintopt, CVHFOpt *vhfopt,
+                              int *atm, int natm, int *bas, int nbas, double *env,
+                              int aosym, int nbatch, int *batch_loc,
+                              double *batch_zeta, int nenv)
 {
         const int ish0 = shls_slice[0];
         const int ish1 = shls_slice[1];
@@ -907,7 +917,6 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
                 fprescreen = CVHFnoscreen;
         }
         const int tot_ngrids = (int) env[NGRIDS];
-        const int nbatch = (tot_ngrids + SGX_BLKSIZE - 1) / SGX_BLKSIZE;
 #pragma omp parallel
 {
         int ig0, ig1, dg;
@@ -923,10 +932,23 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
         int *sj_shells = malloc(sizeof(int) * nish);
         int num_sj_shells;
         int sj_index;
+        double *env_b = env;
+        if (batch_zeta != NULL) {
+                env_b = malloc(sizeof(double) * nenv);
+                memcpy(env_b, env, sizeof(double) * nenv);
+        }
 #pragma omp for nowait schedule(dynamic, 1)
         for (int ibatch = 0; ibatch < nbatch; ibatch++) {
-                ig0 = ibatch * SGX_BLKSIZE;
-                ig1 = MIN(ig0 + SGX_BLKSIZE, tot_ngrids);
+                if (batch_loc != NULL) {
+                        ig0 = batch_loc[ibatch];
+                        ig1 = batch_loc[ibatch+1];
+                } else {
+                        ig0 = ibatch * SGX_BLKSIZE;
+                        ig1 = MIN(ig0 + SGX_BLKSIZE, tot_ngrids);
+                }
+                if (batch_zeta != NULL) {
+                        env_b[PTR_RINV_ZETA] = batch_zeta[ibatch];
+                }
                 dg = ig1 - ig0;
                 for (idm = 0; idm < n_dm; idm++) {
                         jkop[idm]->set0(v_priv[idm], dg);
@@ -941,7 +963,7 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
                         for (jsh = 0; jsh < jmax; jsh++) {
                                 shls[0] = ish + ish0;
                                 shls[1] = jsh + jsh0;
-                                if ((*fprescreen)(shls, vhfopt, atm, bas, env)) {
+                                if ((*fprescreen)(shls, vhfopt, atm, bas, env_b)) {
                                         sj_shells[num_sj_shells] = jsh;
                                         num_sj_shells++;
                                 }
@@ -959,7 +981,7 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
                                 shls[2] = ig0;
                                 shls[3] = ig1;
                                 (*intor)(buf, dims, shls, atm, natm, bas, nbas,
-                                         env, cintopt, cache);
+                                         env_b, cintopt, cache);
                                 for (idm = 0; idm < n_dm; idm++) {
                                         jkop[idm]->contract(buf, dms[idm], v_priv[idm],
                                                             i0, i1, j0, j1, ig0, dg);
@@ -976,10 +998,27 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
                 jkop[idm]->finalize(v_priv[idm], vjk[idm]);
         }
 }
+        if (batch_zeta != NULL) {
+                free(env_b);
+        }
         free(buf);
         free(cache);
         free(sj_shells);
 }
+}
+
+void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
+                      double **dms, double **vjk, int n_dm, int ncomp,
+                      int *shls_slice, int *ao_loc,
+                      CINTOpt *cintopt, CVHFOpt *vhfopt,
+                      int *atm, int natm, int *bas, int nbas, double *env,
+                      int aosym)
+{
+        const int tot_ngrids = (int) env[NGRIDS];
+        const int nbatch = (tot_ngrids + SGX_BLKSIZE - 1) / SGX_BLKSIZE;
+        SGXnr_direct_drv_batches(intor, jkop, dms, vjk, n_dm, ncomp, shls_slice, ao_loc,
+                                 cintopt, vhfopt, atm, natm, bas, nbas, env, aosym,
+                                 nbatch, NULL, NULL, 0);
 }
 
 static inline void _bottom_up_merge(double *a, int *aind, int il, int ir,
