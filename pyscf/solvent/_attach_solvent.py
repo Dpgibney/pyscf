@@ -79,14 +79,19 @@ class SCFWithSolvent(_Solvation):
     # SCF.get_hcore may lead error.
 
     def get_veff(self, mol=None, dm=None, *args, **kwargs):
-        # FIXME: super() here and after might be problematic and need to be
-        # fixed in the future. Consider the combination of solvent and QM/MM.
-        # Strictly, vhf = self.undo_solvent().get_veff()
-        vhf = super().get_veff(mol, dm, *args, **kwargs)
+        if dm is None:
+            dm = self.make_rdm1()
+        # The solvent part goes first: its first call builds the solvent model,
+        # whose matrices then count in the memory left to the J/K and XC
+        # caches, which are sized at their own first calls.
         with_solvent = self.with_solvent
         if not with_solvent.frozen:
             with_solvent.e, with_solvent.v = with_solvent.kernel(dm)
         e_solvent, v_solvent = with_solvent.e, with_solvent.v
+        # FIXME: super() here and after might be problematic and need to be
+        # fixed in the future. Consider the combination of solvent and QM/MM.
+        # Strictly, vhf = self.undo_solvent().get_veff()
+        vhf = super().get_veff(mol, dm, *args, **kwargs)
 
         # NOTE: v_solvent should not be added to vhf in this place. This is
         # because vhf is used as the reference for direct_scf in the next
