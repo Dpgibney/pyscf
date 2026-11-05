@@ -26,11 +26,11 @@
 #include "cint.h"
 #include "nr_direct.h"
 #include "gto/gto.h"
+#include "np_helper/np_helper.h"
 #include "fblas.h"
 #include "nr_sgx_direct.h"
 
-#define MAX(I,J)        ((I) > (J) ? (I) : (J))
-#define MIN(I,J)        ((I) < (J) ? (I) : (J))
+// MAX and MIN come from np_helper.h
 #define ALIGNMENT       8
 #define NI_BLKSIZE      56
 #define UNROLL_SIZE     NI_BLKSIZE
@@ -1019,6 +1019,130 @@ void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
         SGXnr_direct_drv_batches(intor, jkop, dms, vjk, n_dm, ncomp, shls_slice, ao_loc,
                                  cintopt, vhfopt, atm, natm, bas, nbas, env, aosym,
                                  nbatch, NULL, NULL, 0);
+}
+
+/*
+ * PCM's surface integrals contracted inside the integral library as they are
+ * made (fcontract: qcint's int1e_grids_dm_contract_cart or
+ * int1e_grids_charge_contract_cart), for the shell pairs i >= j that pass
+ * vhfopt's prescreen, on Cartesian functions (ao_loc, nao of them):
+ *   mode 0: out[k*ngrids+g] += sum_ij in[k*nao*nao+i*nao+j] (ij|g) for
+ *           symmetric density matrices;
+ *   mode 1: the lower triangle of out[k*nao*nao+i*nao+j] = sum_g in[k*ngrids+g] (ij|g).
+ * The grids are env[PTR_GRIDS] (env has nenv doubles) in nbatch batches of one
+ * exponent each (batch_loc, batch_zeta), as in SGXnr_direct_drv_batches.
+ */
+void SGXnr_grids_contract_drv(int (*fcontract)(), int mode, double *in, double *out,
+                              int n_dm, int nao, int ngrids, int *ao_loc,
+                              CINTOpt *cintopt, CVHFOpt *vhfopt,
+                              int *atm, int natm, int *bas, int nbas, double *env, int nenv,
+                              int nbatch, int *batch_loc, double *batch_zeta)
+{
+        int (*fprescreen)();
+        if (vhfopt != NULL) {
+                fprescreen = vhfopt->fprescreen;
+        } else {
+                fprescreen = CVHFnoscreen;
+        }
+        int *pairs = malloc(sizeof(int) * nbas * (nbas + 1));
+        int npair = 0;
+        int dimax = 0;
+        size_t cache_size = 0;
+        int ish, jsh;
+        int shls[4] = {0, 0, 0, ngrids};
+        for (ish = 0; ish < nbas; ish++) {
+                dimax = MAX(dimax, ao_loc[ish+1] - ao_loc[ish]);
+                for (jsh = 0; jsh <= ish; jsh++) {
+                        shls[0] = ish;
+                        shls[1] = jsh;
+                        if ((*fprescreen)(shls, vhfopt, atm, bas, env)) {
+                                pairs[npair*2  ] = ish;
+                                pairs[npair*2+1] = jsh;
+                                npair++;
+                                cache_size = MAX(cache_size, (size_t)(*fcontract)(
+                                        NULL, NULL, n_dm, ngrids, shls, atm, natm, bas, nbas,
+                                        env, cintopt, NULL, nbatch, batch_loc, batch_zeta));
+                        }
+                }
+        }
+        const size_t nn = (size_t)nao * nao;
+        const size_t vsize = (size_t)n_dm * ngrids;
+        double **vprivs = malloc(sizeof(double *) * omp_get_max_threads());
+#pragma omp parallel
+{
+        // the exponents of the batches go to each thread's copy of env
+        double *env_t = malloc(sizeof(double) * nenv);
+        memcpy(env_t, env, sizeof(double) * nenv);
+        double *cache = malloc(sizeof(double) * cache_size);
+        double *blk = malloc(sizeof(double) * n_dm * dimax * dimax);
+        double *vpriv = NULL;
+        if (mode == 0) {
+                vpriv = calloc(vsize, sizeof(double));
+                // Published here so the barrier in NPomp_dsum_reduce_inplace makes it
+                // visible to the other threads.
+                vprivs[omp_get_thread_num()] = vpriv;
+        }
+        int shls_t[4] = {0, 0, 0, ngrids};
+        int ip, i, j, k, i0, j0, di, dj;
+        double *b, *v;
+// static: each thread takes a fixed set of pairs, so the sums are
+// reproducible for a given number of threads
+#pragma omp for schedule(static, 1)
+        for (ip = 0; ip < npair; ip++) {
+                shls_t[0] = pairs[ip*2  ];
+                shls_t[1] = pairs[ip*2+1];
+                i0 = ao_loc[shls_t[0]];
+                j0 = ao_loc[shls_t[1]];
+                di = ao_loc[shls_t[0]+1] - i0;
+                dj = ao_loc[shls_t[1]+1] - j0;
+                if (mode == 0) {
+                        // the pair's block of D + D^T (of D on the diagonal), column-major
+                        for (k = 0; k < n_dm; k++) {
+                                v = in + k * nn;
+                                b = blk + k * di * dj;
+                                for (j = 0; j < dj; j++) {
+                                for (i = 0; i < di; i++) {
+                                        b[i+di*j] = v[(i0+i)*nao+j0+j];
+                                } }
+                                if (shls_t[0] != shls_t[1]) {
+                                        for (j = 0; j < dj; j++) {
+                                        for (i = 0; i < di; i++) {
+                                                b[i+di*j] += v[(j0+j)*nao+i0+i];
+                                        } }
+                                }
+                        }
+                        (*fcontract)(vpriv, blk, n_dm, ngrids, shls_t, atm, natm, bas, nbas,
+                                     env_t, cintopt, cache, nbatch, batch_loc, batch_zeta);
+                } else {
+                        memset(blk, 0, sizeof(double) * n_dm * di * dj);
+                        if ((*fcontract)(blk, in, n_dm, ngrids, shls_t, atm, natm, bas, nbas,
+                                         env_t, cintopt, cache, nbatch, batch_loc, batch_zeta)) {
+                                for (k = 0; k < n_dm; k++) {
+                                        v = out + k * nn;
+                                        b = blk + k * di * dj;
+                                        for (j = 0; j < dj; j++) {
+                                        for (i = 0; i < di; i++) {
+                                                v[(i0+i)*nao+j0+j] = b[i+di*j];
+                                        } }
+                                }
+                        }
+                }
+        }
+        if (mode == 0) {
+                NPomp_dsum_reduce_inplace(vprivs, vsize);
+                size_t n;
+#pragma omp for schedule(static)
+                for (n = 0; n < vsize; n++) {
+                        out[n] += vprivs[0][n];
+                }
+                free(vpriv);
+        }
+        free(blk);
+        free(cache);
+        free(env_t);
+}
+        free(vprivs);
+        free(pairs);
 }
 
 static inline void _bottom_up_merge(double *a, int *aind, int il, int ir,

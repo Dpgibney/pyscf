@@ -284,6 +284,10 @@ def get_D_S(surface, with_S=True, with_D=False):
 # Shell pairs whose overlap (the largest |S_ij| of the pair) is below this are
 # left out of the surface integrals; that changes no result beyond rounding.
 INT1E_GRIDS_CUTOFF = 1e-15
+# Contract the surface integrals inside the integral library, if it has the
+# kernels for it (qcint's int1e_grids_dm_contract_cart and
+# int1e_grids_charge_contract_cart)
+INT1E_GRIDS_CONTRACT = True
 
 def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     r'''
@@ -295,10 +299,11 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     int1e_grids takes the Gaussian charge model (PTR_RINV_ZETA) with one
     exponent at a time, and the charge exponents take one value per Lebedev
     weight and atomic radius. So the points are sorted by exponent and cut into
-    batches that keep to one exponent, and the SGX driver runs all the batches,
-    each with its exponent, over the threads in one call. It evaluates the
-    integrals of each shell pair (i >= j) over a batch and contracts them at
-    once; no (nao, nao, ngrids) tensor is kept.
+    batches that keep to one exponent, and one call runs all the batches, each
+    with its exponent, over the threads; no (nao, nao, ngrids) tensor is kept.
+    With the library's kernels (see _int1e_grids_contract) the contractions
+    are made inside them; otherwise the SGX driver evaluates the integrals of
+    each shell pair (i >= j) over a batch and contracts them at once.
     '''
     from pyscf.sgx import sgx
     from pyscf.scf import _vhf
@@ -317,10 +322,16 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     env[gto.NGRIDS] = ngrids
     env[gto.PTR_GRIDS] = mol._env.size
     sgxopt = sgx._make_opt(mol, False, INT1E_GRIDS_CUTOFF)
-    ao_loc = gto.moleintor.make_loc(mol._bas, sgxopt._intor)
     if dms is not None:
         # (ij|g) is symmetric in ij, so only the symmetric part of D contributes
-        ins = [numpy.ascontiguousarray(dm + dm.T) * .5 for dm in dms]
+        dms = [(dm + dm.T) * .5 for dm in dms]
+    if INT1E_GRIDS_CONTRACT and hasattr(_vhf.libcvhf, 'int1e_grids_dm_contract_cart'):
+        return _int1e_grids_contract(mol, sgxopt, env, order, batch_loc, batch_zeta,
+                                     dms, charges)
+
+    ao_loc = gto.moleintor.make_loc(mol._bas, sgxopt._intor)
+    if dms is not None:
+        ins = [numpy.ascontiguousarray(dm) for dm in dms]
         out = numpy.zeros((len(ins), ngrids))
         fjk = 'SGXnrs2_ijg_ji_g'
     else:
@@ -348,6 +359,54 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     for v in out:
         # the driver fills the lower triangle
         lib.hermi_triu(v, inplace=True)
+    return out
+
+def _int1e_grids_contract(mol, sgxopt, env, order, batch_loc, batch_zeta,
+                          dms=None, charges=None):
+    '''
+    The contractions of _int1e_grids_dot inside the integral library's kernels,
+    on Cartesian functions, as GPU4PySCF's PCM does: the density of a shell
+    pair is moved to the monomials of the center of its larger shell by the
+    horizontal recursion, so each point takes only the vertical recursion and
+    one dot product; for charges, the sums over the points are taken on those
+    monomials and the horizontal recursion is applied to them once. Each
+    thread takes a fixed set of shell pairs.
+    '''
+    from pyscf.scf import _vhf
+    c2s = None if mol.cart else mol.cart2sph_coeff()
+    ao_loc = mol.ao_loc_nr(cart=True)
+    nao = ao_loc[-1]
+    ngrids = order.size
+    if dms is not None:
+        if c2s is not None:
+            dms = [c2s.dot(dm).dot(c2s.T) for dm in dms]
+        ins = numpy.asarray(dms, order='C')
+        out = numpy.zeros((len(dms), ngrids))
+        mode, fcontract = 0, 'int1e_grids_dm_contract_cart'
+    else:
+        ins = numpy.asarray([c[order] for c in charges], order='C')
+        out = numpy.zeros((len(charges), nao, nao))
+        mode, fcontract = 1, 'int1e_grids_charge_contract_cart'
+    _vhf.libcvhf.SGXnr_grids_contract_drv(
+        _vhf._fpointer(fcontract), ctypes.c_int(mode),
+        ins.ctypes.data_as(ctypes.c_void_p), out.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(len(ins)), ctypes.c_int(nao), ctypes.c_int(ngrids),
+        ao_loc.ctypes.data_as(ctypes.c_void_p),
+        sgxopt._cintopt, ctypes.byref(sgxopt._this),
+        mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
+        mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
+        env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size),
+        ctypes.c_int(batch_loc.size - 1), batch_loc.ctypes.data_as(ctypes.c_void_p),
+        batch_zeta.ctypes.data_as(ctypes.c_void_p))
+    if dms is not None:
+        v = numpy.empty_like(out)
+        v[:,order] = out
+        return v
+    for v in out:
+        # the driver fills the lower triangle
+        lib.hermi_triu(v, inplace=True)
+    if c2s is not None:
+        out = numpy.asarray([c2s.T.dot(v).dot(c2s) for v in out])
     return out
 
 def _R_dot(pcmobj, x, trans=False):
