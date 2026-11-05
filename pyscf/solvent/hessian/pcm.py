@@ -22,7 +22,7 @@ import numpy
 from scipy.special import erf
 from pyscf import lib, gto
 from pyscf import scf, df
-from pyscf.solvent.pcm import PI, switch_h
+from pyscf.solvent.pcm import PI, switch_h, _R_dot, _K_solve
 from pyscf.solvent.grad.pcm import grad_qv, grad_nuc, get_dD_dS, get_dF_dA, grad_switch_h
 from pyscf.lib import logger
 
@@ -505,7 +505,7 @@ def analytical_hess_solver(pcmobj, dm, verbose=None):
 
     ngrids = q.shape[0]
 
-    vK_1 = numpy.linalg.solve(K.T, v_grids)
+    vK_1 = _K_solve(pcmobj, v_grids, trans=True)
 
     if pcmobj.method.upper() in ['C-PCM', 'CPCM', 'COSMO']:
         dF, _ = get_dF_dA(pcmobj.surface, surface_discretization_method = pcmobj.surface_discretization_method)
@@ -532,7 +532,7 @@ def analytical_hess_solver(pcmobj, dm, verbose=None):
         d2Sii = None
 
         dK_1Rv = -S_1_dSdx_dot_q
-        dvK_1R = -einsum_Adi_ij_Adj_inverseK(VS_1_dot_dSdx, K) @ R
+        dvK_1R = -_R_dot(pcmobj, einsum_Adi_ij_Adj_inverseK(VS_1_dot_dSdx, K), trans=True)
 
     elif pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM', 'SMD']:
         dF, dA = get_dF_dA(pcmobj.surface, surface_discretization_method = pcmobj.surface_discretization_method)
@@ -829,7 +829,7 @@ def get_dqsym_dx_fix_vgrids(pcmobj, atmlst):
         dRdx_dot_V = f_eps_over_2pi * (dDdx_dot_AV + numpy.einsum('ij,Adj->Adi', D, dAdx_dot_V))
         dqdx_fix_Vq += einsum_ij_Adj_Adi_inverseK(K, dRdx_dot_V)
 
-        invKT_V = numpy.linalg.solve(K.T, v_grids)
+        invKT_V = _K_solve(pcmobj, v_grids, trans=True)
         dDdxT_dot_invKT_V = get_dDT_dot_q(dD, invKT_V, atmlst, gridslice, ngrids)
 
         DT_invKT_V = D.T @ invKT_V
@@ -893,7 +893,7 @@ def get_dqsym_dx_fix_vgrids(pcmobj, atmlst):
         dRdx_dot_V = f_eps_over_2pi * (dDdx_dot_AV + numpy.einsum('ij,Adj->Adi', D, dAdx_dot_V))
         dqdx_fix_Vq += einsum_ij_Adj_Adi_inverseK(K, dRdx_dot_V)
 
-        invKT_V = numpy.linalg.solve(K.T, v_grids)
+        invKT_V = _K_solve(pcmobj, v_grids, trans=True)
         dDdxT_dot_invKT_V = get_dDT_dot_q(dD, invKT_V, atmlst, gridslice, ngrids)
 
         DT_invKT_V = D.T @ invKT_V
@@ -976,11 +976,10 @@ def get_dvgrids(pcmobj, dm, atmlst):
 def get_dqsym_dx_fix_K_R(pcmobj, dm, atmlst):
     dV_on_charge_dx = get_dvgrids(pcmobj, dm, atmlst)
     K = pcmobj._intermediates['K']
-    R = pcmobj._intermediates['R']
-    R_dVdx = numpy.einsum('ij,Adj->Adi', R, dV_on_charge_dx)
+    R_dVdx = _R_dot(pcmobj, dV_on_charge_dx)
     K_1_R_dVdx = einsum_ij_Adj_Adi_inverseK(K, R_dVdx)
     K_1T_dVdx = einsum_ij_Adj_Adi_inverseK(K.T, dV_on_charge_dx)
-    RT_K_1T_dVdx = numpy.einsum('ij,Adj->Adi', R.T, K_1T_dVdx)
+    RT_K_1T_dVdx = _R_dot(pcmobj, K_1T_dVdx, trans=True)
     dqdx_fix_K_R = 0.5 * (K_1_R_dVdx + RT_K_1T_dVdx)
 
     return dqdx_fix_K_R

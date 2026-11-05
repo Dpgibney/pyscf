@@ -25,7 +25,7 @@ from scipy.special import erf
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import gto, df
-from pyscf.solvent.pcm import PI, switch_h, PCM
+from pyscf.solvent.pcm import PI, switch_h, PCM, _K_solve
 from pyscf.grad import rhf as rhf_grad
 
 def grad_switch_h(x):
@@ -263,10 +263,9 @@ def grad_solver(pcmobj, dm):
     A            = pcmobj._intermediates['A']
     D            = pcmobj._intermediates['D']
     S            = pcmobj._intermediates['S']
-    K            = pcmobj._intermediates['K']
     q            = pcmobj._intermediates['q']
 
-    vK_1 = numpy.linalg.solve(K.T, v_grids)
+    vK_1 = _K_solve(pcmobj, v_grids, trans=True)
 
     dF, dA = get_dF_dA(pcmobj.surface, pcmobj.surface_discretization_method)
 

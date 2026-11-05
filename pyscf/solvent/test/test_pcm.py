@@ -153,11 +153,11 @@ class KnownValues(unittest.TestCase):
         assert numpy.abs(mc.e_tot - -74.97040819700919) < 1e-8
 
     def test_memory_blocking(self):
-        # gh-3266: in the block loops of PCM, the intermediate 3c-integral
-        # buffer v_nj must be released before the next block is computed,
-        # and the block size must respect the remaining memory budget even
-        # when it is tiny (no 400-grids hard floor).
-        import weakref
+        # gh-3266: PCM's surface integrals must fit any memory budget. They are
+        # contracted as they are made (int1e_grids through the SGX driver),
+        # with no (nao, nao, ngrids) buffer, so the results do not depend on
+        # max_memory; and they are the 3c-integrals of fakemol's Gaussian
+        # charges.
         from pyscf import df
         mol1 = gto.M(atom='''
 O  0.  0.  0.
@@ -168,32 +168,22 @@ H  0. 0.757  0.587''', basis='sto3g')
         cm.eps = epsilon
         cm.verbose = 0
         cm.max_memory = 0
-
-        refs = []
-        n_alive = []
-        blk_grids = []
-        orig_aux_e2 = df.incore.aux_e2
-        def counting_aux_e2(mol_, fakemol_, **kwargs):
-            n_alive.append(sum(r() is not None for r in refs))
-            blk_grids.append(fakemol_._bas.shape[0])
-            out = orig_aux_e2(mol_, fakemol_, **kwargs)
-            refs.append(weakref.ref(out))
-            return out
-
-        df.incore.aux_e2 = counting_aux_e2
-        try:
-            epcm_blk, vmat_blk = cm._get_vind(dm[None])
-        finally:
-            df.incore.aux_e2 = orig_aux_e2
-
-        self.assertGreater(len(blk_grids), 1, 'single block, test ineffective')
-        self.assertEqual(max(n_alive), 0, 'v_nj of previous block still alive')
-        self.assertLessEqual(max(blk_grids), 8, 'block size exceeds budget')
+        epcm_blk, vmat_blk = cm._get_vind(dm[None])
 
         cm.max_memory = 2000
         epcm_ref, vmat_ref = cm._get_vind(dm[None])
         self.assertAlmostEqual(epcm_blk, epcm_ref, 12)
         self.assertAlmostEqual(abs(vmat_blk - vmat_ref).max(), 0, 12)
+
+        surface = cm.surface
+        fakemol = gto.fakemol_for_charges(surface['grid_coords'],
+                                          expnt=surface['charge_exp']**2)
+        v_nj = df.incore.aux_e2(mol1, fakemol, intor='int3c2e', aosym='s1')
+        v_ref = numpy.einsum('ijL,ij->L', v_nj, dm)
+        self.assertAlmostEqual(abs(cm._get_v(dm[None])[0] - v_ref).max(), 0, 11)
+        q = cm._intermediates['q_sym']
+        vmat_ref = -numpy.einsum('ijL,L->ij', v_nj, q)
+        self.assertAlmostEqual(abs(cm._get_vmat(q)[0] - vmat_ref).max(), 0, 12)
 
     def test_casscf(self):
         mf = scf.RHF(mol0).run()

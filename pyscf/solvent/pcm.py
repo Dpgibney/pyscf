@@ -22,9 +22,10 @@ PCM family solvent models
 
 import numpy
 import scipy
+import scipy.linalg
 from pyscf import lib
 from pyscf.lib import logger
-from pyscf import gto, df
+from pyscf import gto
 from pyscf.dft import gen_grid
 from pyscf.data import radii
 from pyscf.solvent import ddcosmo
@@ -279,6 +280,69 @@ def get_D_S(surface, with_S=True, with_D=False):
 
     return D, S
 
+# Shell pairs whose overlap (the largest |S_ij| of the pair) is below this are
+# left out of the surface integrals; that changes no result beyond rounding.
+INT1E_GRIDS_CUTOFF = 1e-15
+
+def _int1e_grids_dot(mol, surface, dms=None, charges=None):
+    r'''
+    The integrals of the AO pairs with the Gaussian charges of the surface,
+    (ij|g) = \int \phi_i \phi_j erf(\xi_g |r-R_g|) / |r-R_g| dr, contracted as
+    they are made: sum_ij D_ij (ij|g) for each density matrix of dms, or
+    sum_g q_g (ij|g) for each set of charges.
+
+    int1e_grids takes the Gaussian charge model (PTR_RINV_ZETA) with one
+    exponent per call. The charge exponents take one value per Lebedev weight
+    and atomic radius, so the points go in groups of equal exponents. The SGX
+    driver evaluates the integrals of each shell pair (i >= j) over a block of
+    points and contracts them at once; no (nao, nao, ngrids) tensor is kept.
+    '''
+    from pyscf.sgx.sgx_jk import _gen_jk_direct
+    grid_coords = surface['grid_coords']
+    xi, group = numpy.unique(surface['charge_exp'], return_inverse=True)
+    jk = _gen_jk_direct(mol, 's2', True, False, INT1E_GRIDS_CUTOFF)
+    if dms is not None:
+        # (ij|g) is symmetric in ij, so only the symmetric part of D contributes
+        dms = [numpy.ascontiguousarray(dm + dm.T) * .5 for dm in dms]
+        out = numpy.empty((len(dms), grid_coords.shape[0]))
+    else:
+        out = numpy.zeros((len(charges), mol.nao, mol.nao))
+    for k in range(xi.size):
+        idx = numpy.where(group == k)[0]
+        with mol.with_rinv_zeta(xi[k]**2):
+            if dms is not None:
+                out[:,idx] = jk(mol, grid_coords[idx], dms, None, None)[0]
+            else:
+                q = [numpy.ascontiguousarray(c[idx]) for c in charges]
+                out += jk(mol, grid_coords[idx], q, None, None)[0]
+    if dms is None:
+        for v in out:
+            # the driver fills the lower triangle
+            lib.hermi_triu(v, inplace=True)
+    return out
+
+def _R_dot(pcmobj, x, trans=False):
+    '''R x (R^T x with trans) over the last axis of x, the surface points.
+    C-PCM and COSMO keep no R: it is -f_epsilon times the identity there.'''
+    R = pcmobj._intermediates['R']
+    if R is None:
+        return -pcmobj._intermediates['f_epsilon'] * x
+    return numpy.dot(x, R) if trans else numpy.dot(x, R.T)
+
+def _K_solve(pcmobj, b, trans=False):
+    '''K^-1 b (K^-T b with trans) over the last axis of b, the surface points,
+    with a factorization of K made at the first call and kept in
+    _intermediates: Cholesky for C-PCM and COSMO, whose K = S is symmetric
+    positive definite, LU otherwise.'''
+    intermediates = pcmobj._intermediates
+    if pcmobj.method.upper() in ['C-PCM', 'CPCM', 'COSMO']:
+        if 'K_cho' not in intermediates:
+            intermediates['K_cho'] = scipy.linalg.cho_factor(intermediates['K'])
+        return scipy.linalg.cho_solve(intermediates['K_cho'], b.T).T
+    if 'K_lu' not in intermediates:
+        intermediates['K_lu'] = scipy.linalg.lu_factor(intermediates['K'])
+    return scipy.linalg.lu_solve(intermediates['K_lu'], b.T, trans=int(trans)).T
+
 
 class PCM(lib.StreamObject):
     '''
@@ -490,17 +554,21 @@ class PCM(lib.StreamObject):
                                    surface_discretization_method = self.surface_discretization_method)
         self._intermediates = {}
         F, A = get_F_A(self.surface)
-        D, S = get_D_S(self.surface, with_S=True, with_D=True)
+        # C-PCM and COSMO need no D
+        with_D = self.method.upper() not in ['C-PCM', 'CPCM', 'COSMO']
+        D, S = get_D_S(self.surface, with_S=True, with_D=with_D)
 
         epsilon = self.eps
+        # R is None for C-PCM and COSMO, where it is -f_epsilon times the
+        # identity (see _R_dot)
         if self.method.upper() in ['C-PCM', 'CPCM']:
             f_epsilon = (epsilon-1.)/epsilon if epsilon != float('inf') else 1.0
             K = S
-            R = -f_epsilon * numpy.eye(K.shape[0])
+            R = None
         elif self.method.upper() == 'COSMO':
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0/2.0) if epsilon != float('inf') else 1.0
             K = S
-            R = -f_epsilon * numpy.eye(K.shape[0])
+            R = None
         elif self.method.upper() in ['IEF-PCM', 'IEFPCM']:
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0) if epsilon != float('inf') else 1.0
             DA = D*A
@@ -546,17 +614,10 @@ class PCM(lib.StreamObject):
         if dms.shape[0] == 2:
             dms = (dms[0] + dms[1]).reshape(-1,nao,nao)
 
-        K = self._intermediates['K']
-        R = self._intermediates['R']
         v_grids_e = self._get_v(dms)
         v_grids = self.v_grids_n - v_grids_e
 
-        b = numpy.dot(R, v_grids.T)
-        q = numpy.linalg.solve(K, b).T
-
-        vK_1 = numpy.linalg.solve(K.T, v_grids.T)
-        qt = numpy.dot(R.T, vK_1).T
-        q_sym = (q + qt)/2.0
+        q, q_sym = self._get_q(v_grids)
 
         vmat = self._get_vmat(q_sym)
         epcm = 0.5 * numpy.dot(q_sym[0], v_grids[0])
@@ -567,59 +628,28 @@ class PCM(lib.StreamObject):
         self._intermediates['dm'] = dms
         return epcm, vmat[0]
 
+    def _get_q(self, v_grids):
+        '''The surface charges q = K^-1 R v of the potentials v_grids (one set
+        a row), and their symmetrized form (q + R^T K^-T v) / 2'''
+        q = _K_solve(self, _R_dot(self, v_grids))
+        if self._intermediates['R'] is None:
+            # C-PCM and COSMO: K is symmetric and R = -f_epsilon I
+            return q, q
+        qt = _R_dot(self, _K_solve(self, v_grids, trans=True), trans=True)
+        return q, (q + qt)/2.0
+
     def _get_v(self, dms):
         '''
         return electrostatic potential on surface
         '''
-        mol = self.mol
         nao = dms.shape[-1]
-        grid_coords = self.surface['grid_coords']
-        exponents   = self.surface['charge_exp']
-        ngrids = grid_coords.shape[0]
-        nset = dms.shape[0]
-        v_grids_e = numpy.empty([nset, ngrids])
-        max_memory = self.max_memory - lib.current_memory()[0]
-        # The floor of 8 grids per block bounds the Python overhead of the
-        # block loop. It must not exceed what the remaining memory allows,
-        # otherwise a single v_nj buffer (nao**2 * blksize * 8 bytes) can
-        # exceed the memory budget for large systems.
-        blksize = int(max(max_memory*.9e6/8/nao**2, 8))
-        int3c2e = mol._add_suffix('int3c2e')
-        cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas, mol._env, int3c2e)
-        for p0, p1 in lib.prange(0, ngrids, blksize):
-            fakemol = gto.fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-            fakemol.cart = mol.cart
-            v_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e, aosym='s1', cintopt=cintopt)
-            for i in range(nset):
-                v_grids_e[i,p0:p1] = numpy.einsum('ijL,ij->L',v_nj, dms[i])
-            # Free up v_nj to stay within mem limits
-            del v_nj
-
-        return v_grids_e
+        dms = dms.reshape(-1,nao,nao)
+        return _int1e_grids_dot(self.mol, self.surface, dms=dms)
 
     def _get_vmat(self, q):
-        mol = self.mol
-        nao = mol.nao
-        grid_coords = self.surface['grid_coords']
-        exponents   = self.surface['charge_exp']
-        ngrids = grid_coords.shape[0]
+        ngrids = self.surface['grid_coords'].shape[0]
         q = q.reshape([-1,ngrids])
-        nset = q.shape[0]
-        vmat = numpy.zeros([nset,nao,nao])
-        max_memory = self.max_memory - lib.current_memory()[0]
-        blksize = int(max(max_memory*.9e6/8/nao**2, 8))
-
-        int3c2e = mol._add_suffix('int3c2e')
-        cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas, mol._env, int3c2e)
-        for p0, p1 in lib.prange(0, ngrids, blksize):
-            fakemol = gto.fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-            fakemol.cart = mol.cart
-            v_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e, aosym='s1', cintopt=cintopt)
-            for i in range(nset):
-                vmat[i] += -numpy.einsum('ijL,L->ij', v_nj, q[i,p0:p1])
-            # Free up v_nj to stay within mem limits
-            del v_nj
-        return vmat
+        return -_int1e_grids_dot(self.mol, self.surface, charges=q)
 
     def nuc_grad_method(self, grad_method):
         raise DeprecationWarning('Use the make_grad_object function from '
@@ -660,16 +690,8 @@ class PCM(lib.StreamObject):
         nao = dms.shape[-1]
         dms = dms.reshape(-1,nao,nao)
 
-        K = self._intermediates['K']
-        R = self._intermediates['R']
         v_grids = -self._get_v(dms)
-
-        b = numpy.dot(R, v_grids.T)
-        q = numpy.linalg.solve(K, b).T
-
-        vK_1 = numpy.linalg.solve(K.T, v_grids.T)
-        qt = numpy.dot(R.T, vK_1).T
-        q_sym = (q + qt)/2.0
+        q_sym = self._get_q(v_grids)[1]
 
         vmat = self._get_vmat(q_sym)
         return vmat.reshape(out_shape)
