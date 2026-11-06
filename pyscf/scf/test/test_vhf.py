@@ -152,6 +152,25 @@ class KnownValues(unittest.TestCase):
             self.assertAlmostEqual(abs(vj1 - vj2).max(), 0, 12)
             self.assertAlmostEqual(abs(vk1 - vk2).max(), 0, 12)
 
+    def test_direct_int2e_batch(self):
+        # qcint's int2e_sph_batch (several quartets of one class in the SIMD lanes) against int2e_sph
+        # quartet by quartet, full and long range, with d and f shells; with libcint, which has no
+        # int2e_sph_batch, both calls take the same path
+        mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587', basis='def2-tzvp', verbose=0)
+        nao1 = mol1.nao
+        numpy.random.seed(4)
+        a = numpy.random.random((3,nao1,nao1)) - .5
+        vhfopt = scf.RHF(mol1).init_direct_scf()
+        for omega in (0, .3):
+            for hermi, dms in ((1, a + a.transpose(0,2,1)), (0, a), (1, a[0] + a[0].T)):
+                with mol1.with_range_coulomb(omega):
+                    with lib.temporary_env(_vhf, INT2E_BATCH=False):
+                        vj0, vk0 = scf.hf.get_jk(mol1, dms, hermi, vhfopt)
+                    with lib.temporary_env(_vhf, INT2E_BATCH=True):
+                        vj1, vk1 = scf.hf.get_jk(mol1, dms, hermi, vhfopt)
+                self.assertAlmostEqual(abs(vj1 - vj0).max(), 0, 12)
+                self.assertAlmostEqual(abs(vk1 - vk0).max(), 0, 12)
+
     def test_semi_direct(self):
         numpy.random.seed(3)
         a = numpy.random.random((3,nao,nao)) - .5

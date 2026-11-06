@@ -19,6 +19,7 @@ import weakref
 import numpy
 from pyscf import lib
 from pyscf import gto
+from pyscf import __config__
 from pyscf.gto.moleintor import make_cintopt, make_loc, ascint3
 
 libcvhf = lib.load_library('libcvhf')
@@ -584,6 +585,11 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
 # for a single dm.
 DIRECT_BATCH_MIN = 1
 
+# int2e_sph of several shell quartets of one class at once (the quartets in the
+# SIMD lanes, qcint's int2e_sph_batch) in the direct J/K; no effect with
+# libcint, which has no such function
+INT2E_BATCH = getattr(__config__, 'scf_vhf_int2e_batch', True)
+
 def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
                      cvhfopt=None, cintopt=None, sd_eri=None):
     '''J and K of all dms from s8 ERIs computed on the fly, or kept in sd_eri
@@ -632,6 +638,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
             null if dm_sum is None else dm_sum.ctypes.data_as(ctypes.c_void_p),
             ctypes.c_int(npad), ctypes.c_int(1 if sym_k else 0),
             ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt, c_sd,
+            ctypes.c_int(1 if INT2E_BATCH else 0),
             c_atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_atm.shape[0]),
             c_bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_bas.shape[0]),
             c_env.ctypes.data_as(ctypes.c_void_p))

@@ -224,6 +224,30 @@ typedef struct {
         double *eri;
 } CVHFsdCache;
 
+/*
+ * Several quartets of one class in the SIMD lanes: qcint's int2e_sph_batch (cint2e_batch.c) for the
+ * quartets int2e_sph_batch_ok takes. Each row queues them by the types of their ket shells (l and
+ * number of primitives; the bra pair is the row's), and evaluates a queue when it holds
+ * int2e_sph_batch_lanes() quartets, and at the end of the row. A batch costs as much as a full one,
+ * so a queue of fewer than half the lanes goes quartet by quartet. Weak: libcint and older qcint
+ * have none of these functions, and then every quartet goes alone.
+ */
+int int2e_sph();
+int int2e_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                    double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+int int2e_sph_batch_lanes(void) __attribute__((weak));
+size_t int2e_sph_batch_cache_size(void) __attribute__((weak));
+
+#define BATCH_MAX_LANES 8
+#define BATCH_MAX_NF    2401    // (ff|ff)
+
+typedef struct {
+        int n;
+        int listed;
+        int shls[4 * BATCH_MAX_LANES];
+} QuartetQueue;
+
 // for each ksh, max over lsh <= ksh of q_cond[ksh,lsh]
 static double *_qmax_k(double *q_cond, int nbas)
 {
@@ -446,6 +470,45 @@ DEF_BATCH_WRAPPERS(_v_avx2, _v, AVX2_FMA)
 DEF_BATCH_WRAPPERS(_s_avx2, _s, AVX2_FMA)
 #endif
 
+// evaluates and contracts the quartets of Q, then empties it
+static void _flush_queue(QuartetQueue *Q, int lanes, int (*intor)(), FBatchJ fj, FBatchK fk,
+                         JKBatch *b, int *ao_loc, int hermi, double *bout, double *bcache,
+                         double *buf, double *cache, CINTOpt *cintopt,
+                         int *atm, int natm, int *bas, int nbas, double *env)
+{
+        int *s = Q->shls;
+        int q;
+        if (2 * Q->n >= lanes) {
+                const size_t nf = (size_t)(ao_loc[s[0]+1] - ao_loc[s[0]]) *
+                                          (ao_loc[s[1]+1] - ao_loc[s[1]]) *
+                                          (ao_loc[s[2]+1] - ao_loc[s[2]]) *
+                                          (ao_loc[s[3]+1] - ao_loc[s[3]]);
+                int2e_sph_batch(bout, Q->n, s, atm, natm, bas, nbas, env, NULL, bcache);
+                for (q = 0; q < Q->n; q++, s += 4) {
+                        double *e = bout + nf * q;
+                        if (b->vj != NULL) {
+                                (*fj)(e, b, ao_loc, s[0], s[1], s[2], s[3]);
+                        }
+                        if (b->vk != NULL) {
+                                (*fk)(e, b, ao_loc, hermi, s[0], s[1], s[2], s[3]);
+                        }
+                }
+        } else {
+                for (q = 0; q < Q->n; q++, s += 4) {
+                        if (!(*intor)(buf, NULL, s, atm, natm, bas, nbas, env, cintopt, cache)) {
+                                continue;
+                        }
+                        if (b->vj != NULL) {
+                                (*fj)(buf, b, ao_loc, s[0], s[1], s[2], s[3]);
+                        }
+                        if (b->vk != NULL) {
+                                (*fk)(buf, b, ao_loc, hermi, s[0], s[1], s[2], s[3]);
+                        }
+                }
+        }
+        Q->n = 0;
+}
+
 /*
  * vj, vk: [nao,nao,npad] (either can be NULL), VJ and VK as described at the
  * top: the caller forms vj = VJ + VJ^T and, for hermi=1, vk = VK + VK^T.
@@ -454,12 +517,13 @@ DEF_BATCH_WRAPPERS(_s_avx2, _s, AVX2_FMA)
  * vhfopt (or NULL) gives the screening of CVHFnr_direct_drv: the same
  * fprescreen is applied to every quartet. sd (or NULL) is a semi-direct cache
  * for the same intor, molecule and q_cond; it is used with the CVHFnrs8_*
- * prescreen functions only.
+ * prescreen functions only. int2e_batch: int2e_sph evaluates several quartets
+ * of one class at once where qcint offers that (see QuartetQueue).
  */
 void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                             double *dm, double *dms, int npad, int hermi,
                             int *ao_loc, CINTOpt *cintopt, CVHFOpt *vhfopt,
-                            CVHFsdCache *sd,
+                            CVHFsdCache *sd, int int2e_batch,
                             int *atm, int natm, int *bas, int nbas, double *env)
 {
         const size_t nao = ao_loc[nbas];
@@ -503,6 +567,32 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         if (q_cond == NULL) {
                 sd = NULL;
         }
+        // the queues of quartets for int2e_sph_batch, by shell type (l, nprim)
+        int lanes = 0;
+        int nt = 0;
+        int *stype = NULL;
+        if (int2e_batch && int2e_sph_batch != NULL && intor == int2e_sph &&
+            env[PTR_RANGE_OMEGA] >= 0) {
+                lanes = MIN(int2e_sph_batch_lanes(), BATCH_MAX_LANES);
+                stype = malloc(sizeof(int) * nbas * 3);
+                int *tl = stype + nbas;
+                int *tp = tl + nbas;
+                int s, t;
+                for (s = 0; s < nbas; s++) {
+                        for (t = 0; t < nt; t++) {
+                                if (tl[t] == bas[ANG_OF+s*BAS_SLOTS] &&
+                                    tp[t] == bas[NPRIM_OF+s*BAS_SLOTS]) {
+                                        break;
+                                }
+                        }
+                        if (t == nt) {
+                                tl[t] = bas[ANG_OF+s*BAS_SLOTS];
+                                tp[t] = bas[NPRIM_OF+s*BAS_SLOTS];
+                                nt++;
+                        }
+                        stype[s] = t;
+                }
+        }
         double **vjprivs = malloc(sizeof(double *) * omp_get_max_threads() * 2);
         double **vkprivs = vjprivs + omp_get_max_threads();
 #pragma omp parallel
@@ -519,6 +609,19 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         }
         double *buf = malloc(sizeof(double) * ((size_t)di*di*di*di + cache_size));
         double *cache = buf + (size_t)di*di*di*di;
+        QuartetQueue *queues = NULL;
+        QuartetQueue *Q;
+        int *qlist = NULL;
+        int nlisted = 0;
+        int x;
+        double *bout = NULL;
+        double *bcache = NULL;
+        if (lanes) {
+                queues = calloc((size_t)nt * nt, sizeof(QuartetQueue));
+                qlist = malloc(sizeof(int) * nt * nt);
+                bout = malloc(sizeof(double) * BATCH_MAX_NF * lanes);
+                bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
+        }
         double *e;
         int shls[4];
         int ish, jsh, ksh, lsh, lsh1;
@@ -613,6 +716,20 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                                     !(*fprescreen)(shls, vhfopt, atm, bas, env)) {
                                         continue;
                                 }
+                                if (lanes && int2e_sph_batch_ok(shls, bas, env)) {
+                                        Q = queues + stype[ksh] * nt + stype[lsh];
+                                        if (!Q->listed) {
+                                                Q->listed = 1;
+                                                qlist[nlisted++] = Q - queues;
+                                        }
+                                        memcpy(Q->shls + 4 * Q->n, shls, sizeof(int) * 4);
+                                        if (++Q->n == lanes) {
+                                                _flush_queue(Q, lanes, intor, fj, fk, &b, ao_loc,
+                                                             hermi, bout, bcache, buf, cache,
+                                                             cintopt, atm, natm, bas, nbas, env);
+                                        }
+                                        continue;
+                                }
                                 if (!(*intor)(buf, NULL, shls, atm, natm, bas, nbas,
                                               env, cintopt, cache)) {
                                         continue;
@@ -625,6 +742,16 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                                 }
                         }
                 }
+                // the rest of the row's queues
+                for (x = 0; x < nlisted; x++) {
+                        Q = queues + qlist[x];
+                        if (Q->n > 0) {
+                                _flush_queue(Q, lanes, intor, fj, fk, &b, ao_loc, hermi, bout,
+                                             bcache, buf, cache, cintopt, atm, natm, bas, nbas, env);
+                        }
+                        Q->listed = 0;
+                }
+                nlisted = 0;
         }
         if (vj != NULL) {
                 NPomp_dsum_reduce_inplace(vjprivs, vsize);
@@ -643,8 +770,17 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                 free(b.vk);
         }
         free(buf);
+        if (lanes) {
+                free(queues);
+                free(qlist);
+                free(bout);
+                free(bcache);
+        }
 }
         free(vjprivs);
+        if (stype != NULL) {
+                free(stype);
+        }
         if (qmax_k != NULL) {
                 free(qmax_k);
         }
