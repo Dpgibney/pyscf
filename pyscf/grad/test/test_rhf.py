@@ -326,6 +326,25 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dm, 0, 1, omega=-.4) - ref).max(),
                                0, 12)
 
+    def test_jk_energy_per_atom_int2e_batch(self):
+        # qcint's int2e_ip1_sph_batch (several orbits in the SIMD lanes) against int2e_ip1_sph orbit by
+        # orbit, with d and f shells; with libcint, which has none, both calls take the same path
+        from pyscf.scf import _vhf
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='def2-tzvp', verbose=0)
+        nao = mol.nao
+        numpy.random.seed(3)
+        a = numpy.random.rand(nao, nao) - .5
+        dm = a.dot(a.T) * .2
+        b = numpy.random.rand(nao, nao) - .5
+        dms = numpy.asarray([dm, b.dot(b.T) * .1])
+        for d, jf, kf, omega in ((dm, .7, .3, None), (dm, 1, 0, None), (dms, 1, 1, None),
+                                 (dms, 0, .6, .4)):
+            with lib.temporary_env(_vhf, INT2E_BATCH=False):
+                ref = grad.rhf.jk_energy_per_atom(mol, d, jf, kf, omega=omega)
+            with lib.temporary_env(_vhf, INT2E_BATCH=True):
+                de = grad.rhf.jk_energy_per_atom(mol, d, jf, kf, omega=omega)
+            self.assertAlmostEqual(abs(de - ref).max(), 0, 12)
+
     def test_grad_elec_jk_energy(self):
         from pyscf import dft
         mol = gto.M(atom='''O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47''',
