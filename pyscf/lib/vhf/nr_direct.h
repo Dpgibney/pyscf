@@ -72,6 +72,7 @@ typedef struct {
         int *tao;     /* time reversal mappings, index start from 1 */
         CINTOpt *cintopt;
         int ncomp;
+        void *batch;  /* a thread's queues of CVHFnr_direct_drv_mode (nr_direct.c), or NULL */
 } IntorEnvs;
 #endif
 
@@ -80,6 +81,12 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                        int *shls_slice, int *ao_loc,
                        CINTOpt *cintopt, CVHFOpt *vhfopt,
                        int *atm, int natm, int *bas, int nbas, double *env);
+// int2e_batch: several quartets of one class at once where qcint offers that (nr_direct.c)
+void CVHFnr_direct_drv_mode(int (*intor)(), void (*fdot)(), JKOperator **jkop,
+                            double **dms, double **vjk, int n_dm, int ncomp,
+                            int *shls_slice, int *ao_loc,
+                            CINTOpt *cintopt, CVHFOpt *vhfopt, int int2e_batch,
+                            int *atm, int natm, int *bas, int nbas, double *env);
 
 JKArray *CVHFallocate_JKArray(JKOperator *op, int *shls_slice, int *ao_loc,
                               int ncomp, int nblock, int size_limit);

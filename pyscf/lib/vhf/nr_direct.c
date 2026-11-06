@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <assert.h>
 #include <math.h>
 #ifdef _OPENMP
@@ -30,6 +31,336 @@
 #include "nr_direct.h"
 #include "np_helper/np_helper.h"
 #include "gto/gto.h"
+
+/*
+ * Several quartets of one class at once: qcint's batched integrals (cint2e_batch.c) evaluate up to
+ * int2e_sph_batch_lanes() shell quartets whose shells have the same l and number of primitives,
+ * one quartet per SIMD lane. CVHFnr_direct_drv_mode queues the quartets they take by the types of
+ * their 4 shells, in a hash table per thread, and evaluates a queue when it holds a SIMD width of
+ * quartets. A batch costs as much as a full one, so fewer than half the lanes go quartet by quartet.
+ *
+ * The contractions write to the JKArray of the quartet's block (ao_off, shape, block_quartets), so
+ * each queued quartet keeps its block, and the JKArrays are pointed at it for the contraction. The
+ * queues outlive the blocks (and are flushed at the thread's end) when every output fits in its
+ * JKArray's stack, which then holds each block pair at most once and cannot overflow; otherwise
+ * they are flushed at the end of each block. With 16-AO blocks (few tasks for many threads) a block
+ * holds a few quartets of each class, which would mostly go one at a time.
+ *
+ * Weak: libcint and older qcint have none of these functions, and then every quartet goes alone.
+ */
+int int2e_sph();
+int int2e_ip1_sph();
+int int2e_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                    double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+int int2e_ip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                        double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_ip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+int int2e_sph_batch_lanes(void) __attribute__((weak));
+size_t int2e_sph_batch_cache_size(void) __attribute__((weak));
+// the integrals of nuclear Hessians, 9 components
+int int2e_ipip1_sph();
+int int2e_ipvip1_sph();
+int int2e_ip1ip2_sph();
+int int2e_ipip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                          double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_ipvip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                           double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_ip1ip2_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
+                           double *env, CINTOpt *opt, double *cache) __attribute__((weak));
+int int2e_ipip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+int int2e_ipvip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+int int2e_ip1ip2_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
+size_t int2e_hess_sph_batch_cache_size(void) __attribute__((weak));
+
+#define DB_MAX_LANES    8
+#define DB_MAX_NF       2401    // (ff|ff)
+#define DB_CAP          8192    // slots of the hash table of queues per thread, at most half used
+
+typedef struct {
+        int (*fbatch)();
+        int (*fok)(int *shls, int *bas, double *env);
+        size_t cache_size;
+        int ncomp;
+} DirectBatchIntor;
+
+typedef struct {
+        int n;
+        int shls[4 * DB_MAX_LANES];
+        int blk[4 * DB_MAX_LANES];      // the blocks (i, j, k, l) of the quartets
+} DirectQueue;
+
+typedef struct {
+        DirectBatchIntor bi;
+        int lanes;
+        int nt;
+        int *stype;             // the type (l, number of primitives) of each shell
+        int persist;            // whether the queues outlive the blocks
+        int cur[4];             // the block of the driver's fdot call
+        int *block_loc[4];      // the driver's block partitions of i, j, k, l
+        int nused;              // queues in use, q[0..nused-1], in hash slots slot[...]
+        int *keys;              // [DB_CAP]: the types of the 4 shells of a slot's queue, or -1
+        int *qid;               // [DB_CAP]: the queue of a slot
+        int *slot;              // [DB_CAP/2]
+        DirectQueue *q;         // [DB_CAP/2]
+        double *bout;
+        double *bcache;
+} DirectBatch;
+
+// the batched version of intor, if qcint has one; 0 if not
+static int _direct_batch_intor(int (*intor)(), DirectBatchIntor *bi)
+{
+        if (int2e_sph_batch_lanes == NULL || int2e_sph_batch_cache_size == NULL) {
+                return 0;
+        }
+        if (intor == int2e_sph && int2e_sph_batch != NULL && int2e_sph_batch_ok != NULL) {
+                *bi = (DirectBatchIntor){int2e_sph_batch, int2e_sph_batch_ok,
+                                         int2e_sph_batch_cache_size(), 1};
+                return 1;
+        }
+        if (intor == int2e_ip1_sph && int2e_ip1_sph_batch != NULL && int2e_ip1_sph_batch_ok != NULL) {
+                *bi = (DirectBatchIntor){int2e_ip1_sph_batch, int2e_ip1_sph_batch_ok,
+                                         int2e_sph_batch_cache_size(), 3};
+                return 1;
+        }
+        if (int2e_hess_sph_batch_cache_size == NULL) {
+                return 0;
+        }
+        if (intor == int2e_ipip1_sph && int2e_ipip1_sph_batch != NULL &&
+            int2e_ipip1_sph_batch_ok != NULL) {
+                *bi = (DirectBatchIntor){int2e_ipip1_sph_batch, int2e_ipip1_sph_batch_ok,
+                                         int2e_hess_sph_batch_cache_size(), 9};
+                return 1;
+        }
+        if (intor == int2e_ipvip1_sph && int2e_ipvip1_sph_batch != NULL &&
+            int2e_ipvip1_sph_batch_ok != NULL) {
+                *bi = (DirectBatchIntor){int2e_ipvip1_sph_batch, int2e_ipvip1_sph_batch_ok,
+                                         int2e_hess_sph_batch_cache_size(), 9};
+                return 1;
+        }
+        if (intor == int2e_ip1ip2_sph && int2e_ip1ip2_sph_batch != NULL &&
+            int2e_ip1ip2_sph_batch_ok != NULL) {
+                *bi = (DirectBatchIntor){int2e_ip1ip2_sph_batch, int2e_ip1ip2_sph_batch_ok,
+                                         int2e_hess_sph_batch_cache_size(), 9};
+                return 1;
+        }
+        return 0;
+}
+
+// the types of the shells for the queues of CVHFnr_direct_drv_mode; NULL if intor is not batched
+static int *_direct_batch_types(int (*intor)(), int int2e_batch, DirectBatchIntor *bi, int *nt_out,
+                                int *bas, int nbas, double *env)
+{
+        if (!int2e_batch || env[PTR_RANGE_OMEGA] < 0 || !_direct_batch_intor(intor, bi)) {
+                return NULL;
+        }
+        int *stype = malloc(sizeof(int) * nbas * 3);
+        int *tl = stype + nbas;
+        int *tp = tl + nbas;
+        int s, t;
+        int nt = 0;
+        for (s = 0; s < nbas; s++) {
+                for (t = 0; t < nt; t++) {
+                        if (tl[t] == bas[ANG_OF+s*BAS_SLOTS] && tp[t] == bas[NPRIM_OF+s*BAS_SLOTS]) {
+                                break;
+                        }
+                }
+                if (t == nt) {
+                        tl[t] = bas[ANG_OF+s*BAS_SLOTS];
+                        tp[t] = bas[NPRIM_OF+s*BAS_SLOTS];
+                        nt++;
+                }
+                stype[s] = t;
+        }
+        // the keys, nt^4, are ints
+        if (nt > 200) {
+                free(stype);
+                return NULL;
+        }
+        *nt_out = nt;
+        return stype;
+}
+
+// dmax: the largest shell dimension of the call; persist, block_loc: see DirectBatch
+static DirectBatch *_direct_batch_new(DirectBatchIntor *bi, int nt, int *stype, size_t dmax,
+                                      int persist, int **block_loc)
+{
+        DirectBatch *bt = malloc(sizeof(DirectBatch));
+        int i;
+        bt->bi = *bi;
+        bt->lanes = MIN(int2e_sph_batch_lanes(), DB_MAX_LANES);
+        bt->nt = nt;
+        bt->stype = stype;
+        bt->persist = persist;
+        for (i = 0; i < 4; i++) {
+                bt->cur[i] = 0;
+                bt->block_loc[i] = block_loc[i];
+        }
+        bt->nused = 0;
+        bt->keys = malloc(sizeof(int) * (DB_CAP * 2 + DB_CAP / 2));
+        bt->qid = bt->keys + DB_CAP;
+        bt->slot = bt->qid + DB_CAP;
+        for (i = 0; i < DB_CAP; i++) {
+                bt->keys[i] = -1;
+        }
+        bt->q = malloc(sizeof(DirectQueue) * DB_CAP / 2);
+        // and the contractions' scratch after the last quartet (_direct_batch_flush)
+        bt->bout = malloc(sizeof(double) * (DB_MAX_NF * bi->ncomp * bt->lanes + 2 * dmax * dmax));
+        bt->bcache = malloc(sizeof(double) * bi->cache_size);
+        return bt;
+}
+
+static void _direct_batch_del(DirectBatch *bt)
+{
+        free(bt->keys);
+        free(bt->q);
+        free(bt->bout);
+        free(bt->bcache);
+        free(bt);
+}
+
+// points the JKArrays at block blk (i, j, k, l), as the driver does for its fdot calls
+static void _direct_batch_block(DirectBatch *bt, const int *blk, JKArray **vjk, int n_dm,
+                                IntorEnvs *envs)
+{
+        const int *ao_loc = envs->ao_loc;
+        const int *shls_slice = envs->shls_slice;
+        int t, n;
+        for (t = 0; t < 4; t++) {
+                const int *loc = bt->block_loc[t];
+                const int a0 = ao_loc[loc[blk[t]]];
+                const int a1 = ao_loc[loc[blk[t]+1]];
+                const int off = ao_loc[shls_slice[2*t]];
+                for (n = 0; n < n_dm; n++) {
+                        vjk[n]->ao_off[t] = a0 - off;
+                        vjk[n]->shape[t] = a1 - a0;
+                        vjk[n]->block_quartets[t] = blk[t];
+                }
+        }
+}
+
+// as INTOR_AND_CONTRACT for the integrals eri of the quartet shls of block blk; set: the block the
+// JKArrays point at
+static void _contract_quartet(double *eri, int *shls, int *blk, int *set, DirectBatch *bt,
+                              JKOperator **jkop, JKArray **vjk, double **dms, int n_dm,
+                              IntorEnvs *envs)
+{
+        const int *ao_loc = envs->ao_loc;
+        const int *shls_slice = envs->shls_slice;
+        const int ioff = ao_loc[shls_slice[0]];
+        const int joff = ao_loc[shls_slice[2]];
+        const int koff = ao_loc[shls_slice[4]];
+        const int loff = ao_loc[shls_slice[6]];
+        const int i0 = ao_loc[shls[0]] - ioff;
+        const int j0 = ao_loc[shls[1]] - joff;
+        const int k0 = ao_loc[shls[2]] - koff;
+        const int l0 = ao_loc[shls[3]] - loff;
+        const int i1 = ao_loc[shls[0]+1] - ioff;
+        const int j1 = ao_loc[shls[1]+1] - joff;
+        const int k1 = ao_loc[shls[2]+1] - koff;
+        const int l1 = ao_loc[shls[3]+1] - loff;
+        int idm;
+        if (blk[0] != set[0] || blk[1] != set[1] || blk[2] != set[2] || blk[3] != set[3]) {
+                _direct_batch_block(bt, blk, vjk, n_dm, envs);
+                memcpy(set, blk, sizeof(int) * 4);
+        }
+        for (idm = 0; idm < n_dm; idm++) {
+                (*jkop[idm]->contract)(eri, dms[idm], vjk[idm], shls,
+                                       i0, i1, j0, j1, k0, k1, l0, l1);
+        }
+}
+
+// evaluates and contracts the quartets of Q, then empties it; the JKArrays point at the driver's
+// block again after
+static void _direct_batch_flush(DirectQueue *Q, DirectBatch *bt, int (*intor)(),
+                                JKOperator **jkop, JKArray **vjk, double **dms,
+                                double *buf, double *cache, int n_dm, IntorEnvs *envs)
+{
+        int *s = Q->shls;
+        int set[4];
+        int q;
+        memcpy(set, bt->cur, sizeof(int) * 4);
+        if (2 * Q->n >= bt->lanes) {
+                const int *ao_loc = envs->ao_loc;
+                const size_t nf = (size_t)(ao_loc[s[0]+1] - ao_loc[s[0]]) *
+                                          (ao_loc[s[1]+1] - ao_loc[s[1]]) *
+                                          (ao_loc[s[2]+1] - ao_loc[s[2]]) *
+                                          (ao_loc[s[3]+1] - ao_loc[s[3]]) * bt->bi.ncomp;
+                (*bt->bi.fbatch)(bt->bout, Q->n, s, envs->atm, envs->natm, envs->bas,
+                                 envs->nbas, envs->env, NULL, bt->bcache);
+                // The kernels of nr_direct_dot.c write up to 2*di*dj doubles of scratch after a
+                // quartet's integrals: the last quartet first, each over those contracted already.
+                for (q = Q->n - 1; q >= 0; q--) {
+                        _contract_quartet(bt->bout + nf * q, s + 4 * q, Q->blk + 4 * q, set, bt,
+                                          jkop, vjk, dms, n_dm, envs);
+                }
+        } else {
+                for (q = 0; q < Q->n; q++) {
+                        if ((*intor)(buf, NULL, s + 4 * q, envs->atm, envs->natm, envs->bas,
+                                     envs->nbas, envs->env, envs->cintopt, cache)) {
+                                _contract_quartet(buf, s + 4 * q, Q->blk + 4 * q, set, bt,
+                                                  jkop, vjk, dms, n_dm, envs);
+                        }
+                }
+        }
+        if (set[0] != bt->cur[0] || set[1] != bt->cur[1] || set[2] != bt->cur[2] ||
+            set[3] != bt->cur[3]) {
+                _direct_batch_block(bt, bt->cur, vjk, n_dm, envs);
+        }
+        Q->n = 0;
+}
+
+static void _direct_batch_flush_all(DirectBatch *bt, int (*intor)(), JKOperator **jkop,
+                                    JKArray **vjk, double **dms, double *buf, double *cache,
+                                    int n_dm, IntorEnvs *envs)
+{
+        int x;
+        for (x = 0; x < bt->nused; x++) {
+                DirectQueue *Q = bt->q + x;
+                if (Q->n > 0) {
+                        _direct_batch_flush(Q, bt, intor, jkop, vjk, dms, buf, cache, n_dm, envs);
+                }
+                bt->keys[bt->slot[x]] = -1;
+        }
+        bt->nused = 0;
+}
+
+// queues the quartet shls if the batched intor takes it (1), else 0
+static int _direct_batch_push(DirectBatch *bt, int *shls, int (*intor)(), JKOperator **jkop,
+                              JKArray **vjk, double **dms, double *buf, double *cache,
+                              int n_dm, IntorEnvs *envs)
+{
+        if (!(*bt->bi.fok)(shls, envs->bas, envs->env)) {
+                return 0;
+        }
+        const int nt = bt->nt;
+        const int *st = bt->stype;
+        const int key = ((st[shls[0]] * nt + st[shls[1]]) * nt + st[shls[2]]) * nt + st[shls[3]];
+        int slot = key % DB_CAP;
+        while (bt->keys[slot] != key) {
+                if (bt->keys[slot] < 0) {
+                        if (bt->nused == DB_CAP / 2) {
+                                _direct_batch_flush_all(bt, intor, jkop, vjk, dms, buf, cache,
+                                                        n_dm, envs);
+                                slot = key % DB_CAP;
+                        }
+                        bt->keys[slot] = key;
+                        bt->qid[slot] = bt->nused;
+                        bt->slot[bt->nused] = slot;
+                        bt->q[bt->nused].n = 0;
+                        bt->nused++;
+                        break;
+                }
+                slot = (slot + 1) % DB_CAP;
+        }
+        DirectQueue *Q = bt->q + bt->qid[slot];
+        memcpy(Q->shls + 4 * Q->n, shls, sizeof(int) * 4);
+        memcpy(Q->blk + 4 * Q->n, bt->cur, sizeof(int) * 4);
+        if (++Q->n == bt->lanes) {
+                _direct_batch_flush(Q, bt, intor, jkop, vjk, dms, buf, cache, n_dm, envs);
+        }
+        return 1;
+}
 
 #define DECLARE_ALL \
         const int *atm = envs->atm; \
@@ -65,15 +396,18 @@
         } \
         int ish, jsh, ksh, lsh, i0, j0, k0, l0, i1, j1, k1, l1, idm;
 
+// envs->batch: queued for the batched intor (_direct_batch_push), contracted when evaluated
 #define INTOR_AND_CONTRACT \
         shls[0] = ish; \
         shls[1] = jsh; \
         shls[2] = ksh; \
         shls[3] = lsh; \
-        if (vhfopt != NULL) { \
-                notempty = (*fprescreen)(shls, vhfopt, atm, bas, env) && \
-                        (*intor)(buf, NULL, shls, atm, natm, bas, nbas, env, \
-                                 cintopt, cache); \
+        if (vhfopt != NULL && !(*fprescreen)(shls, vhfopt, atm, bas, env)) { \
+                notempty = 0; \
+        } else if (envs->batch != NULL && \
+                   _direct_batch_push(envs->batch, shls, intor, jkop, vjk, dms, \
+                                      buf, cache, n_dm, envs)) { \
+                notempty = 0; \
         } else { \
                 notempty = (*intor)(buf, NULL, shls, atm, natm, bas, nbas, env, \
                                     cintopt, cache); \
@@ -407,14 +741,18 @@ static int _jkl_block_partition(int *block_jloc, int *block_kloc, int *block_llo
  *
  * Return [(ptr[ncomp,nao,nao] in C-contiguous) for ptr in vjk]
  */
-void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
-                       double **dms, double **vjk, int n_dm, int ncomp,
-                       int *shls_slice, int *ao_loc,
-                       CINTOpt *cintopt, CVHFOpt *vhfopt,
-                       int *atm, int natm, int *bas, int nbas, double *env)
+void CVHFnr_direct_drv_mode(int (*intor)(), void (*fdot)(), JKOperator **jkop,
+                            double **dms, double **vjk, int n_dm, int ncomp,
+                            int *shls_slice, int *ao_loc,
+                            CINTOpt *cintopt, CVHFOpt *vhfopt, int int2e_batch,
+                            int *atm, int natm, int *bas, int nbas, double *env)
 {
         IntorEnvs envs = {natm, nbas, atm, bas, env, shls_slice, ao_loc, NULL,
                 cintopt, ncomp};
+        // the queues of quartets for qcint's batched intor, by shell type (l, nprim)
+        DirectBatchIntor bi;
+        int nt = 0;
+        int *stype = _direct_batch_types(intor, int2e_batch, &bi, &nt, bas, nbas, env);
         int idm;
         double *tile_dms[n_dm];
         for (idm = 0; idm < n_dm; idm++) {
@@ -460,6 +798,19 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                 fprintf(stderr, "Insufficient memory for caching CVHFnr_direct_drv intermediates\n");
                 exit(1);
         }
+        // the queues outlive the blocks if every output fits in its stack, and its block pairs in
+        // its keys_cache (CVHFallocate_JKArray_bs), until the end (DirectBatch)
+        int persist = 1;
+        size_t nblocks[4] = {nblock_i, nblock_j, nblock_k, nblock_l};
+        int64_t keys_max = size_limit / (block_size * block_size * ncomp);
+        for (idm = 0; idm < n_dm; idm++) {
+                JKOperator *op = jkop[idm];
+                if ((int64_t)(*op->data_size)(shls_slice, ao_loc) * ncomp >= size_limit ||
+                    (int64_t)(nblocks[op->obra_shl0/2] * nblocks[op->oket_shl0/2]) > keys_max) {
+                        persist = 0;
+                }
+        }
+        int *block_loc[4] = {block_iloc, block_jloc, block_kloc, block_lloc};
 
 #pragma omp parallel
 {
@@ -477,6 +828,12 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         }
         double *buf = malloc(sizeof(double) * (di*di*di*di*ncomp + di*di*2 + cache_size));
         double *cache = buf + di*di*di*di*ncomp;
+        IntorEnvs tenvs = envs;
+        DirectBatch *bt = NULL;
+        if (stype != NULL) {
+                bt = _direct_batch_new(&bi, nt, stype, di, persist, block_loc);
+                tenvs.batch = bt;
+        }
 #pragma omp for nowait schedule(dynamic, 1)
         for (blk_id = 0; blk_id < nblock_jkl; blk_id++) {
                 // TODO: add schwarz ineq conditioner
@@ -511,9 +868,19 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                                 pv->shape[0] = i1 - i0;
                                 pv->block_quartets[0] = i;
                         }
+                        if (bt != NULL) {
+                                bt->cur[0] = i;
+                                bt->cur[1] = j;
+                                bt->cur[2] = k;
+                                bt->cur[3] = l;
+                        }
                         (*fdot)(intor, jkop, v_priv, tile_dms, buf, cache, n_dm,
                                 block_iloc+i, block_jloc+j, block_kloc+k, block_lloc+l,
-                                vhfopt, &envs);
+                                vhfopt, &tenvs);
+                        if (bt != NULL && !bt->persist) {
+                                _direct_batch_flush_all(bt, intor, jkop, v_priv, tile_dms,
+                                                        buf, cache, n_dm, &tenvs);
+                        }
                 }
                 for (n = 0; n < n_dm; n++) {
                         if (v_priv[n]->stack_size >= size_limit) {
@@ -522,6 +889,9 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                                block_iloc, block_jloc, block_kloc, block_lloc);
                         }
                 }
+        }
+        if (bt != NULL) {
+                _direct_batch_flush_all(bt, intor, jkop, v_priv, tile_dms, buf, cache, n_dm, &tenvs);
         }
         for (n = 0; n < n_dm; n++) {
                 if (v_priv[n]->stack_size > 0) {
@@ -532,11 +902,27 @@ void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                 CVHFdeallocate_JKArray(v_priv[n]);
         }
         free(buf);
+        if (bt != NULL) {
+                _direct_batch_del(bt);
+        }
 }
         for (idm = 0; idm < n_dm; idm++) {
                 free(tile_dms[idm]);
         }
         free(block_iloc);
+        if (stype != NULL) {
+                free(stype);
+        }
+}
+
+void CVHFnr_direct_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
+                       double **dms, double **vjk, int n_dm, int ncomp,
+                       int *shls_slice, int *ao_loc,
+                       CINTOpt *cintopt, CVHFOpt *vhfopt,
+                       int *atm, int natm, int *bas, int nbas, double *env)
+{
+        CVHFnr_direct_drv_mode(intor, fdot, jkop, dms, vjk, n_dm, ncomp, shls_slice, ao_loc,
+                               cintopt, vhfopt, 1, atm, natm, bas, nbas, env);
 }
 
 // Divide shells into subblocks with two cutting points specified in shls_lim.
@@ -564,14 +950,17 @@ static int _shls_block_partition_lim(int *block_loc, int *shls_slice,
  * excluding the eri block [ix0:ix1,jx0:jx1,kx0:kx1,lx0:lx1].
  * The boundary ix, jx, kx, lx are provided by shls_slice[8:16]
  */
-void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
-                          double **dms, double **vjk, int n_dm, int ncomp,
-                          int *shls_slice, int *ao_loc,
-                          CINTOpt *cintopt, CVHFOpt *vhfopt,
-                          int *atm, int natm, int *bas, int nbas, double *env)
+void CVHFnr_direct_ex_drv_mode(int (*intor)(), void (*fdot)(), JKOperator **jkop,
+                               double **dms, double **vjk, int n_dm, int ncomp,
+                               int *shls_slice, int *ao_loc,
+                               CINTOpt *cintopt, CVHFOpt *vhfopt, int int2e_batch,
+                               int *atm, int natm, int *bas, int nbas, double *env)
 {
         IntorEnvs envs = {natm, nbas, atm, bas, env, shls_slice, ao_loc, NULL,
                 cintopt, ncomp};
+        DirectBatchIntor bi;
+        int nt = 0;
+        int *stype = _direct_batch_types(intor, int2e_batch, &bi, &nt, bas, nbas, env);
         int idm;
         double *tile_dms[n_dm];
         for (idm = 0; idm < n_dm; idm++) {
@@ -616,6 +1005,19 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                 fprintf(stderr, "Insufficient memory for caching CVHFnr_direct_ex_drv intermediates\n");
                 exit(1);
         }
+        // the queues outlive the blocks if every output fits in its stack, and its block pairs in
+        // its keys_cache (CVHFallocate_JKArray_bs), until the end (DirectBatch)
+        int persist = 1;
+        size_t nblocks[4] = {nblock_i, nblock_j, nblock_k, nblock_l};
+        int64_t keys_max = size_limit / (block_size * block_size * ncomp);
+        for (idm = 0; idm < n_dm; idm++) {
+                JKOperator *op = jkop[idm];
+                if ((int64_t)(*op->data_size)(shls_slice, ao_loc) * ncomp >= size_limit ||
+                    (int64_t)(nblocks[op->obra_shl0/2] * nblocks[op->oket_shl0/2]) > keys_max) {
+                        persist = 0;
+                }
+        }
+        int *block_loc[4] = {block_iloc, block_jloc, block_kloc, block_lloc};
 
 #pragma omp parallel
 {
@@ -633,6 +1035,12 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
         }
         double *buf = malloc(sizeof(double) * (di*di*di*di*ncomp + di*di*2 + cache_size));
         double *cache = buf + di*di*di*di*ncomp;
+        IntorEnvs tenvs = envs;
+        DirectBatch *bt = NULL;
+        if (stype != NULL) {
+                bt = _direct_batch_new(&bi, nt, stype, di, persist, block_loc);
+                tenvs.batch = bt;
+        }
 #pragma omp for nowait schedule(dynamic, 1)
         for (blk_id = 0; blk_id < nblock_jkl; blk_id++) {
                 r = blk_id;
@@ -674,9 +1082,19 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                                 pv->shape[0] = i1 - i0;
                                 pv->block_quartets[0] = i;
                         }
+                        if (bt != NULL) {
+                                bt->cur[0] = i;
+                                bt->cur[1] = j;
+                                bt->cur[2] = k;
+                                bt->cur[3] = l;
+                        }
                         (*fdot)(intor, jkop, v_priv, tile_dms, buf, cache, n_dm,
                                 block_iloc+i, block_jloc+j, block_kloc+k, block_lloc+l,
-                                vhfopt, &envs);
+                                vhfopt, &tenvs);
+                        if (bt != NULL && !bt->persist) {
+                                _direct_batch_flush_all(bt, intor, jkop, v_priv, tile_dms,
+                                                        buf, cache, n_dm, &tenvs);
+                        }
                 }
                 for (n = 0; n < n_dm; n++) {
                         if (v_priv[n]->stack_size >= size_limit) {
@@ -685,6 +1103,9 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                                block_iloc, block_jloc, block_kloc, block_lloc);
                         }
                 }
+        }
+        if (bt != NULL) {
+                _direct_batch_flush_all(bt, intor, jkop, v_priv, tile_dms, buf, cache, n_dm, &tenvs);
         }
         for (n = 0; n < n_dm; n++) {
                 if (v_priv[n]->stack_size > 0) {
@@ -695,9 +1116,25 @@ void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
                 CVHFdeallocate_JKArray(v_priv[n]);
         }
         free(buf);
+        if (bt != NULL) {
+                _direct_batch_del(bt);
+        }
 }
         for (idm = 0; idm < n_dm; idm++) {
                 free(tile_dms[idm]);
         }
         free(block_iloc);
+        if (stype != NULL) {
+                free(stype);
+        }
+}
+
+void CVHFnr_direct_ex_drv(int (*intor)(), void (*fdot)(), JKOperator **jkop,
+                          double **dms, double **vjk, int n_dm, int ncomp,
+                          int *shls_slice, int *ao_loc,
+                          CINTOpt *cintopt, CVHFOpt *vhfopt,
+                          int *atm, int natm, int *bas, int nbas, double *env)
+{
+        CVHFnr_direct_ex_drv_mode(intor, fdot, jkop, dms, vjk, n_dm, ncomp, shls_slice, ao_loc,
+                                  cintopt, vhfopt, 1, atm, natm, bas, nbas, env);
 }

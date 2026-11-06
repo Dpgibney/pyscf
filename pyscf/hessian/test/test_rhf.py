@@ -247,6 +247,27 @@ class KnownValues(unittest.TestCase):
 #        e2 = mfs(mol.set_geom_('Cu 0 0 0; H 0 0 1.4999'))[1]
 #        self.assertAlmostEqual(abs(hess[1,:,2] - (e1-e2)/0.0002*lib.param.BOHR).max(), 0, 5)
 
+    def test_hess_2e_int2e_batch(self):
+        # qcint's batched Hessian integrals (int2e_ipip1, ipvip1, ip1ip2) and int2e_ip1 (make_h1)
+        # against them quartet by quartet, with d and f shells, every atom and a part of them; with
+        # libcint both take the same path
+        from pyscf.scf import _vhf
+        from pyscf.hessian import rhf as rhf_hess
+        mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587', basis='def2-tzvp', verbose=0)
+        mf1 = scf.RHF(mol1).run()
+        dm0 = mf1.make_rdm1()
+        res = []
+        for batch in (False, True):
+            with lib.temporary_env(_vhf, INT2E_BATCH=batch):
+                ej, ek = rhf_hess._partial_hess_2e(mol1, dm0, [dm0], 1, range(mol1.natm))
+                # not every atom: the diagonal blocks from int2e_ipip1
+                ej1, ek1 = rhf_hess._partial_hess_2e(mol1, dm0, [dm0], 1, [2, 0])
+                h1 = rhf_hess.make_h1(hessian.RHF(mf1), mf1.mo_coeff, mf1.mo_occ)
+            res.append((ej, ek, ej1, ek1, numpy.asarray(h1)))
+        for a, b in zip(*res):
+            self.assertTrue(abs(a).max() > 1e-2)
+            self.assertAlmostEqual(abs(a - b).max(), 0, 9)
+
 
 if __name__ == "__main__":
     print("Full Tests for RHF Hessian")

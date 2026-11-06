@@ -220,6 +220,45 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(hasattr(mf1._opt[None], 'semi_direct_eri'))
         self.assertAlmostEqual(mf1.e_tot, e1, 10)
 
+    def test_direct_bindm_int2e_batch(self):
+        # the generic driver (CVHFnr_direct_drv, CVHFnr_direct_ex_drv) with qcint's batched intors against
+        # them quartet by quartet: int2e, the gradients' int2e_ip1 and the Hessians' ipip1, ipvip1 and
+        # ip1ip2, with d and f shells, shell slices and an excluded block, full and long range; with
+        # libcint both calls take the same path
+        mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587', basis='def2-tzvp', verbose=0)
+        nbas1 = mol1.nbas
+        ao_loc = mol1.ao_loc_nr()
+        numpy.random.seed(6)
+        cases = (('int2e_sph', 1, 's8', ('ji->s2kl', 'jk->s1il'), None),
+                 ('int2e_sph', 1, 's1', ('ji->s1kl', 'li->s1kj'), (2, 6) + (0, nbas1) * 3),
+                 ('int2e_ip1_sph', 3, 's2kl', ('ji->s2kl', 'lk->s1ij', 'li->s1kj', 'jk->s1il'),
+                  (2, 6) + (0, nbas1) * 3),
+                 ('int2e_ipip1_sph', 9, 's2kl', ('lk->s1ij', 'jk->s1il'), None),
+                 ('int2e_ipvip1_sph', 9, 's2kl', ('lk->s1ij', 'li->s1kj'), (2, 6, 0, 7) + (0, nbas1) * 2),
+                 ('int2e_ip1ip2_sph', 9, 's1', ('ji->s1kl', 'li->s1kj', 'lj->s1ki'),
+                  (2, 6, 0, nbas1, 0, 7, 0, nbas1)))
+        for omega in (0, .3):
+            with mol1.with_range_coulomb(omega):
+                for intor, comp, aosym, scripts, shls_slice in cases:
+                    slc = shls_slice or (0, nbas1) * 4
+                    dms = [numpy.random.random(_vhf.get_dims(s.split('->')[0], slc, ao_loc)) - .5
+                           for s in scripts]
+                    for excludes in (None, (3, 5) + tuple(slc[2:])):
+                        if excludes is not None and aosym == 's8':
+                            continue
+                        vs = []
+                        for batch in (False, True):
+                            with lib.temporary_env(_vhf, INT2E_BATCH=batch):
+                                vs.append(_vhf.direct_bindm(intor, aosym, scripts, dms, comp,
+                                                            mol1._atm, mol1._bas, mol1._env,
+                                                            shls_slice=shls_slice,
+                                                            shls_excludes=excludes))
+                        for v0, v1 in zip(*vs):
+                            # the second derivatives of O's core functions reach ~1e4
+                            vmax = abs(v0).max()
+                            self.assertTrue(vmax > 1e-3)
+                            self.assertAlmostEqual(abs(v1 - v0).max() / vmax, 0, 13)
+
     def test_semi_direct_int2e_batch(self):
         # the first call evaluates the stored quartets with qcint's int2e_sph_batch where it can: the
         # stored integrals against int2e_sph's, all quartets and part of them, full and long range

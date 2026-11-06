@@ -892,10 +892,10 @@ def nr_direct_drv(intor, aosym, jkscript,
         drv = 'CVHFnr_sr_direct_drv'
         shls_slice = (ctypes.c_int*8)(*shls_slice)
     elif shls_excludes is None:
-        drv = 'CVHFnr_direct_drv'
+        drv = 'CVHFnr_direct_drv_mode'
         shls_slice = (ctypes.c_int*8)(*shls_slice)
     else:
-        drv = 'CVHFnr_direct_ex_drv'
+        drv = 'CVHFnr_direct_ex_drv_mode'
         shls_slice = (ctypes.c_int*16)(*shls_slice, *shls_excludes)
     fdrv = getattr(libcvhf, drv)
     dotsym = _INTSYMAP[aosym]
@@ -905,9 +905,11 @@ def nr_direct_drv(intor, aosym, jkscript,
         fdot = getattr(libcvhf, 'CVHFdot_nr'+dotsym)
     cintor = getattr(libcvhf, intor)
 
+    # the _mode drivers take INT2E_BATCH (qcint's batched intor, where it has one)
+    mode = (ctypes.c_int(1 if INT2E_BATCH else 0),) if drv.endswith('_mode') else ()
     fdrv(cintor, fdot, fjk, dmsptr, vjkptr,
          ctypes.c_int(n_dm), ctypes.c_int(ncomp), shls_slice,
-         ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt,
+         ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt, *mode,
          c_atm.ctypes.data_as(ctypes.c_void_p), natm,
          c_bas.ctypes.data_as(ctypes.c_void_p), nbas,
          c_env.ctypes.data_as(ctypes.c_void_p))
