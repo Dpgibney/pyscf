@@ -246,6 +246,9 @@ typedef struct {
         int n;
         int listed;
         int shls[4 * BATCH_MAX_LANES];
+        // the semi-direct cache's quartets on their first evaluation: their slots and indices
+        double *slot[BATCH_MAX_LANES];
+        int64_t idx[BATCH_MAX_LANES];
 } QuartetQueue;
 
 // for each ksh, max over lsh <= ksh of q_cond[ksh,lsh]
@@ -509,6 +512,45 @@ static void _flush_queue(QuartetQueue *Q, int lanes, int (*intor)(), FBatchJ fj,
         Q->n = 0;
 }
 
+// evaluates the queue of quartets of the semi-direct cache, stores them, and
+// contracts them; then empties it
+static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*intor)(),
+                          FBatchJ fj, FBatchK fk, JKBatch *b, int *ao_loc, int hermi,
+                          double *bout, double *bcache, double *cache, CINTOpt *cintopt,
+                          int *atm, int natm, int *bas, int nbas, double *env)
+{
+        int *s = Q->shls;
+        int q;
+        if (2 * Q->n >= lanes) {
+                const size_t nf = (size_t)(ao_loc[s[0]+1] - ao_loc[s[0]]) *
+                                          (ao_loc[s[1]+1] - ao_loc[s[1]]) *
+                                          (ao_loc[s[2]+1] - ao_loc[s[2]]) *
+                                          (ao_loc[s[3]+1] - ao_loc[s[3]]);
+                int2e_sph_batch(bout, Q->n, s, atm, natm, bas, nbas, env, NULL, bcache);
+                for (q = 0; q < Q->n; q++) {
+                        memcpy(Q->slot[q], bout + nf * q, sizeof(double) * nf);
+                        sd->state[Q->idx[q]] = 1;
+                }
+        } else {
+                for (q = 0; q < Q->n; q++) {
+                        sd->state[Q->idx[q]] = (*intor)(Q->slot[q], NULL, s + 4 * q, atm, natm,
+                                                        bas, nbas, env, cintopt, cache) ? 1 : 2;
+                }
+        }
+        for (q = 0; q < Q->n; q++, s += 4) {
+                if (sd->state[Q->idx[q]] == 2) {
+                        continue;
+                }
+                if (b->vj != NULL) {
+                        (*fj)(Q->slot[q], b, ao_loc, s[0], s[1], s[2], s[3]);
+                }
+                if (b->vk != NULL) {
+                        (*fk)(Q->slot[q], b, ao_loc, hermi, s[0], s[1], s[2], s[3]);
+                }
+        }
+        Q->n = 0;
+}
+
 /*
  * vj, vk: [nao,nao,npad] (either can be NULL), VJ and VK as described at the
  * top: the caller forms vj = VJ + VJ^T and, for hermi=1, vk = VK + VK^T.
@@ -610,15 +652,22 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
         double *buf = malloc(sizeof(double) * ((size_t)di*di*di*di + cache_size));
         double *cache = buf + (size_t)di*di*di*di;
         QuartetQueue *queues = NULL;
+        QuartetQueue *squeues = NULL;   // the semi-direct cache's quartets
         QuartetQueue *Q;
         int *qlist = NULL;
+        int *sqlist = NULL;
         int nlisted = 0;
+        int nslisted = 0;
         int x;
         double *bout = NULL;
         double *bcache = NULL;
         if (lanes) {
                 queues = calloc((size_t)nt * nt, sizeof(QuartetQueue));
                 qlist = malloc(sizeof(int) * nt * nt);
+                if (sd != NULL) {
+                        squeues = calloc((size_t)nt * nt, sizeof(QuartetQueue));
+                        sqlist = malloc(sizeof(int) * nt * nt);
+                }
                 bout = malloc(sizeof(double) * BATCH_MAX_NF * lanes);
                 bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
         }
@@ -669,6 +718,24 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                                 if (!(*fprescreen)(shls, vhfopt, atm, bas, env)) {
                                         continue;
                                 }
+                                if (sd->state[n] == 0 && lanes &&
+                                    int2e_sph_batch_ok(shls, bas, env)) {
+                                        // the first evaluation, batched (_flush_stored)
+                                        Q = squeues + stype[ksh] * nt + stype[lsh];
+                                        if (!Q->listed) {
+                                                Q->listed = 1;
+                                                sqlist[nslisted++] = Q - squeues;
+                                        }
+                                        memcpy(Q->shls + 4 * Q->n, shls, sizeof(int) * 4);
+                                        Q->slot[Q->n] = e;
+                                        Q->idx[Q->n] = n;
+                                        if (++Q->n == lanes) {
+                                                _flush_stored(Q, sd, lanes, intor, fj, fk, &b,
+                                                              ao_loc, hermi, bout, bcache, cache,
+                                                              cintopt, atm, natm, bas, nbas, env);
+                                        }
+                                        continue;
+                                }
                                 if (sd->state[n] == 0) {
                                         sd->state[n] = (*intor)(e, NULL, shls, atm, natm,
                                                                 bas, nbas, env, cintopt,
@@ -684,6 +751,18 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                                         (*fk)(e, &b, ao_loc, hermi, ish, jsh, ksh, lsh);
                                 }
                         }
+                        // the rest of the row's stored quartets (the queues are by
+                        // ket type: they must not outlive the row)
+                        for (x = 0; x < nslisted; x++) {
+                                Q = squeues + sqlist[x];
+                                if (Q->n > 0) {
+                                        _flush_stored(Q, sd, lanes, intor, fj, fk, &b, ao_loc,
+                                                      hermi, bout, bcache, cache, cintopt, atm,
+                                                      natm, bas, nbas, env);
+                                }
+                                Q->listed = 0;
+                        }
+                        nslisted = 0;
                         // fprescreen rejects the quartets with q_ij q_kl <= cutoff
                         if (sd->thr <= cutoff) {
                                 continue;
@@ -775,6 +854,10 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                 free(qlist);
                 free(bout);
                 free(bcache);
+                if (squeues != NULL) {
+                        free(squeues);
+                        free(sqlist);
+                }
         }
 }
         free(vjprivs);

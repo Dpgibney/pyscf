@@ -220,6 +220,33 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(hasattr(mf1._opt[None], 'semi_direct_eri'))
         self.assertAlmostEqual(mf1.e_tot, e1, 10)
 
+    def test_semi_direct_int2e_batch(self):
+        # the first call evaluates the stored quartets with qcint's int2e_sph_batch where it can: the
+        # stored integrals against int2e_sph's, all quartets and part of them, full and long range
+        mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587', basis='def2-tzvp', verbose=0)
+        nao1 = mol1.nao
+        numpy.random.seed(5)
+        a = numpy.random.random((nao1,nao1)) - .5
+        dm = a + a.T
+        for omega in (0, .3):
+            with mol1.with_range_coulomb(omega):
+                ref = scf.RHF(mol1).init_direct_scf()
+                full = _vhf._semi_direct_size(ref.q_cond, mol1.ao_loc_nr(), ref.direct_scf_tol)
+                for mem in (full, full * .4):
+                    stored = []
+                    for batch in (False, True):
+                        vhfopt = scf.RHF(mol1).init_direct_scf()
+                        sd = _vhf.semi_direct_eri(vhfopt, mol1._atm, mol1._bas, mol1._env, mem / 1e6)
+                        sd.eri[:] = 0
+                        vhfopt.semi_direct_eri = sd
+                        with lib.temporary_env(_vhf, INT2E_BATCH=batch):
+                            vj, vk = scf.hf.get_jk(mol1, dm, 1, vhfopt)
+                        stored.append((sd.state != 0, sd.eri, vj, vk))
+                    self.assertTrue((stored[0][0] == stored[1][0]).all())
+                    self.assertTrue(stored[1][0].any())
+                    for x in range(1, 4):
+                        self.assertAlmostEqual(abs(stored[1][x] - stored[0][x]).max(), 0, 12)
+
     def test_direct_mapdm(self):
         numpy.random.seed(1)
         dm = numpy.random.random((nao,nao))
