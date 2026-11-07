@@ -259,6 +259,40 @@ class KnownValues(unittest.TestCase):
                             self.assertTrue(vmax > 1e-3)
                             self.assertAlmostEqual(abs(v1 - v0).max() / vmax, 0, 13)
 
+    def test_direct_jk_gemm(self):
+        # 13 dms or more go through dense products of blocks of integrals with all dms
+        # (nr_direct_batch.c, _direct_jk_gemm); against one pass, with the semi-direct cache holding
+        # all, part and none of the quartets, its first and second calls, hermi 0 and 1, J and K alone
+        mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587; O 2.8 0 0; H 3.4 .76 0',
+                     basis='def2-tzvp', charge=-1, verbose=0)
+        nao1 = mol1.nao
+        numpy.random.seed(7)
+        a = numpy.random.random((20,nao1,nao1)) - .5
+        ref = scf.RHF(mol1).init_direct_scf()
+        full = _vhf._semi_direct_size(ref.q_cond, mol1.ao_loc_nr(), ref.direct_scf_tol)
+        with lib.with_omp_threads(4):
+            for mem in (full, full * .4, None):
+                for hermi, dms in ((1, a + a.transpose(0,2,1)), (0, a)):
+                    for with_j, with_k in ((True, True), (True, False), (False, True)):
+                        out = []
+                        for gemm in (False, True):
+                            vhfopt = scf.RHF(mol1).init_direct_scf()
+                            if mem is not None:
+                                vhfopt.semi_direct_eri = _vhf.semi_direct_eri(
+                                    vhfopt, mol1._atm, mol1._bas, mol1._env, mem / 1e6)
+                            with lib.temporary_env(_vhf, JK_GEMM=gemm):
+                                out.append([_vhf.direct(dms, mol1._atm, mol1._bas, mol1._env, vhfopt,
+                                                        hermi=hermi, with_j=with_j, with_k=with_k)
+                                            for call in range(2)])
+                        for call in range(2):
+                            for x in range(2):
+                                v0, v1 = out[0][call][x], out[1][call][x]
+                                if v0 is None:
+                                    continue
+                                vmax = abs(v0).max()
+                                self.assertTrue(vmax > 1e-2)
+                                self.assertAlmostEqual(abs(v1 - v0).max() / vmax, 0, 13)
+
     def test_semi_direct_int2e_batch(self):
         # the first call evaluates the stored quartets with qcint's int2e_sph_batch where it can: the
         # stored integrals against int2e_sph's, all quartets and part of them, full and long range

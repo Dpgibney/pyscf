@@ -48,6 +48,7 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -57,6 +58,10 @@
 #include "optimizer.h"
 #include "np_helper/np_helper.h"
 #include "gto/gto.h"
+#include "fblas.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define DM_CHUNK        4
 // aligned(8): the vectors are loaded from arbitrary dm offsets
@@ -512,12 +517,11 @@ static void _flush_queue(QuartetQueue *Q, int lanes, int (*intor)(), FBatchJ fj,
         Q->n = 0;
 }
 
-// evaluates the queue of quartets of the semi-direct cache, stores them, and
-// contracts them; then empties it
-static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*intor)(),
-                          FBatchJ fj, FBatchK fk, JKBatch *b, int *ao_loc, int hermi,
-                          double *bout, double *bcache, double *cache, CINTOpt *cintopt,
-                          int *atm, int natm, int *bas, int nbas, double *env)
+// evaluates the queue's quartets into their slots, with state[idx] 1 (or 2 if
+// intor returned 0)
+static void _store_queue(QuartetQueue *Q, int8_t *state, int lanes, int (*intor)(), int *ao_loc,
+                         double *bout, double *bcache, double *cache, CINTOpt *cintopt,
+                         int *atm, int natm, int *bas, int nbas, double *env)
 {
         int *s = Q->shls;
         int q;
@@ -529,14 +533,27 @@ static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*int
                 int2e_sph_batch(bout, Q->n, s, atm, natm, bas, nbas, env, NULL, bcache);
                 for (q = 0; q < Q->n; q++) {
                         memcpy(Q->slot[q], bout + nf * q, sizeof(double) * nf);
-                        sd->state[Q->idx[q]] = 1;
+                        state[Q->idx[q]] = 1;
                 }
         } else {
                 for (q = 0; q < Q->n; q++) {
-                        sd->state[Q->idx[q]] = (*intor)(Q->slot[q], NULL, s + 4 * q, atm, natm,
-                                                        bas, nbas, env, cintopt, cache) ? 1 : 2;
+                        state[Q->idx[q]] = (*intor)(Q->slot[q], NULL, s + 4 * q, atm, natm,
+                                                    bas, nbas, env, cintopt, cache) ? 1 : 2;
                 }
         }
+}
+
+// evaluates the queue of quartets of the semi-direct cache, stores them, and
+// contracts them; then empties it
+static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*intor)(),
+                          FBatchJ fj, FBatchK fk, JKBatch *b, int *ao_loc, int hermi,
+                          double *bout, double *bcache, double *cache, CINTOpt *cintopt,
+                          int *atm, int natm, int *bas, int nbas, double *env)
+{
+        int *s = Q->shls;
+        int q;
+        _store_queue(Q, sd->state, lanes, intor, ao_loc, bout, bcache, cache, cintopt,
+                     atm, natm, bas, nbas, env);
         for (q = 0; q < Q->n; q++, s += 4) {
                 if (sd->state[Q->idx[q]] == 2) {
                         continue;
@@ -552,6 +569,438 @@ static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*int
 }
 
 /*
+ * Many dms (the CPHF of Hessians: 3 natm of them; TDDFT with many roots) through dense matrix
+ * products (dm_mode 1, GEMM_MIN_CHUNKS * DM_CHUNK dms or more): the shells are cut into blocks of
+ * contiguous shells of about GEMM_BS AOs, and each s8-unique quartet of blocks (IJ|KL) is evaluated
+ * whole into a dense matrix E[(i,j),(k,l)]. Its shell quartets are those of the one-pass loop, each
+ * once and with the same screening; the copies that the symmetries of a block quartet with I == J,
+ * K == L or (IJ) == (KL) bring are filled in, the rest stays 0. J and K are then six products with
+ * all dms at once (n innermost):
+ *   VJ[I,J] += cJ E Ds[K,L]          VJ[K,L] += cJ E^T Ds[I,J]    (if (IJ) != (KL))
+ *   VK[I,L] += c X1 D[J,K]           VK[J,K] += c w4 X1^T D[I,L]
+ *   VK[I,K] += c w3 X2 D[J,L]        VK[J,L] += c w2 X2^T D[I,K]
+ * with X1[(i,l),(j,k)] = X2[(i,k),(j,l)] = E[(i,j),(k,l)], and the weights of the quartet kernels
+ * taken at the block level (a block pair I == J holds both orders of its AO pairs, as a shell pair
+ * ish == jsh does there). With hermi = 0, t5..t8 of the quartet kernels are the same four products
+ * with D^T, into sums of VK^T (vk = VK + VKT^T), and nothing is halved. The one-pass kernels make a few multiply-adds per dm and quartet on rows of
+ * D and VK spread over the arrays, and are bound by those accesses; the products run at matrix-multiply
+ * speed. The dms and the sums are kept by block pairs, [I][J][i][j][n], shared by all threads; a
+ * product goes to a thread's buffer and is added to its block of sums under that block's lock.
+ */
+#define GEMM_BS         16
+#define GEMM_MIN_CHUNKS 4
+
+typedef struct {
+        int32_t key;
+        int shls[4];
+} GemmQuartet;
+
+static int _gemm_quartet_cmp(const void *a, const void *b)
+{
+        int32_t ka = ((const GemmQuartet *)a)->key, kb = ((const GemmQuartet *)b)->key;
+        return (ka > kb) - (ka < kb);
+}
+
+// geometry of a block quartet for _gemm_place
+typedef struct {
+        int a0, b0, c0, d0;     // AO offsets of blocks I, J, K, L
+        int nJ, nL, nKL;
+        int bra_eq, ket_eq, bk_eq;      // I == J, K == L, (IJ) == (KL)
+} GemmBlockQ;
+
+// the integrals out[l][k][j][i] of shell quartet s into E[(i,j),(k,l)], with their images under the
+// symmetries of the block quartet
+static void _gemm_place(double *E, const double *out, int *s, int *ao_loc, GemmBlockQ *g)
+{
+        const int i0 = ao_loc[s[0]] - g->a0, di = ao_loc[s[0]+1] - ao_loc[s[0]];
+        const int j0 = ao_loc[s[1]] - g->b0, dj = ao_loc[s[1]+1] - ao_loc[s[1]];
+        const int k0 = ao_loc[s[2]] - g->c0, dk = ao_loc[s[2]+1] - ao_loc[s[2]];
+        const int l0 = ao_loc[s[3]] - g->d0, dl = ao_loc[s[3]+1] - ao_loc[s[3]];
+        const int nJ = g->nJ, nL = g->nL, nKL = g->nKL;
+        const int sb = g->bra_eq && s[0] != s[1];
+        const int sk = g->ket_eq && s[2] != s[3];
+        const int sx = g->bk_eq && (s[0] != s[2] || s[1] != s[3]);
+        int a, b, c, d;
+        for (d = 0; d < dl; d++) {
+        for (c = 0; c < dk; c++) {
+        for (b = 0; b < dj; b++) {
+        for (a = 0; a < di; a++) {
+                const double v = *out++;
+                const int i = i0 + a, j = j0 + b, k = k0 + c, l = l0 + d;
+                E[(size_t)(i * nJ + j) * nKL + k * nL + l] = v;
+                if (sb) E[(size_t)(j * nJ + i) * nKL + k * nL + l] = v;
+                if (sk) E[(size_t)(i * nJ + j) * nKL + l * nL + k] = v;
+                if (sb && sk) E[(size_t)(j * nJ + i) * nKL + l * nL + k] = v;
+                if (sx) {
+                        // (kl|ij): with (IJ) == (KL), k and l index blocks I and J
+                        E[(size_t)(k * nJ + l) * nKL + i * nL + j] = v;
+                        if (sb) E[(size_t)(k * nJ + l) * nKL + j * nL + i] = v;
+                        if (sk) E[(size_t)(l * nJ + k) * nKL + i * nL + j] = v;
+                        if (sb && sk) E[(size_t)(l * nJ + k) * nKL + j * nL + i] = v;
+                }
+        } } } }
+}
+
+static void _gemm_add(double *dst, const double *src, size_t n, omp_lock_t *lk)
+{
+        size_t x;
+        omp_set_lock(lk);
+        for (x = 0; x < n; x++) {
+                dst[x] += src[x];
+        }
+        omp_unset_lock(lk);
+}
+
+static void _direct_jk_gemm(int (*intor)(), double *vj, double *vk,
+                            double *dm, double *dms, int npad, int hermi,
+                            int *ao_loc, CINTOpt *cintopt, CVHFOpt *vhfopt,
+                            int lanes, int nt, int *stype, double *q_cond,
+                            double cutoff, double dmax4, int di, size_t cache_size,
+                            int *atm, int natm, int *bas, int nbas, double *env)
+{
+        const size_t nao = ao_loc[nbas];
+        int (*fprescreen)() = vhfopt->fprescreen;
+        int sh, Ib, Jb;
+        // blocks of contiguous shells with at most GEMM_BS AOs (or one bigger shell)
+        int *bsh = malloc(sizeof(int) * (nbas + 1) * 4);
+        int *bao = bsh + nbas + 1;
+        int *bn = bao + nbas + 1;
+        int *shblk = bn + nbas + 1;
+        int nb = 0;
+        bsh[0] = 0;
+        for (sh = 0; sh < nbas; sh++) {
+                if (sh > bsh[nb] && ao_loc[sh+1] - ao_loc[bsh[nb]] > GEMM_BS) {
+                        bsh[++nb] = sh;
+                }
+                shblk[sh] = nb;
+        }
+        bsh[++nb] = nbas;
+        int maxbn = 0, maxbs = 0;
+        for (Ib = 0; Ib < nb; Ib++) {
+                bao[Ib] = ao_loc[bsh[Ib]];
+                bn[Ib] = ao_loc[bsh[Ib+1]] - bao[Ib];
+                maxbn = MAX(maxbn, bn[Ib]);
+                maxbs = MAX(maxbs, bsh[Ib+1] - bsh[Ib]);
+        }
+        // block pairs (all orders): offsets of their [i][j][n] arrays, the largest q_cond in them
+        size_t *boff = malloc(sizeof(size_t) * nb * nb);
+        double *QB = malloc(sizeof(double) * nb * nb);
+        size_t tot = 0;
+        for (Ib = 0; Ib < nb; Ib++) {
+        for (Jb = 0; Jb < nb; Jb++) {
+                boff[Ib*nb+Jb] = tot;
+                tot += (size_t)bn[Ib] * bn[Jb] * npad;
+                double q = 0;
+                int ish, jsh;
+                for (ish = bsh[Ib]; ish < bsh[Ib+1]; ish++) {
+                for (jsh = bsh[Jb]; jsh < bsh[Jb+1]; jsh++) {
+                        q = MAX(q, q_cond[ish*nbas+jsh]);
+                } }
+                QB[Ib*nb+Jb] = q;
+        } }
+        double qbmax = 0;
+        for (Ib = 0; Ib < nb * nb; Ib++) {
+                qbmax = MAX(qbmax, QB[Ib]);
+        }
+        double *Dblk = malloc(sizeof(double) * tot);
+        double *Dsblk = vj != NULL ? malloc(sizeof(double) * tot) : NULL;
+        double *VJblk = vj != NULL ? calloc(tot, sizeof(double)) : NULL;
+        double *VKblk = vk != NULL ? calloc(tot, sizeof(double)) : NULL;
+        // hermi = 0: D^T by block pairs, DT[I,J][i][j] = D[j][i], and the sums of VK^T
+        const int kt = vk != NULL && hermi == 0;
+        double *DTblk = kt ? malloc(sizeof(double) * tot) : NULL;
+        double *VKTblk = kt ? calloc(tot, sizeof(double)) : NULL;
+        omp_lock_t *lk = malloc(sizeof(omp_lock_t) * nb * nb * 3);
+        if (Dblk == NULL || (vj != NULL && (Dsblk == NULL || VJblk == NULL)) ||
+            (vk != NULL && VKblk == NULL) || (kt && (DTblk == NULL || VKTblk == NULL)) || lk == NULL) {
+                fprintf(stderr, "CVHFnr_direct_jk_batch: out of memory for %ld dms\n", (long)npad);
+                exit(1);
+        }
+        for (Ib = 0; Ib < nb * nb * 3; Ib++) {
+                omp_init_lock(lk + Ib);
+        }
+        const size_t nbp = (size_t)nb * (nb + 1) / 2;
+
+#pragma omp parallel
+{
+        int Ib, Jb, Kb, Lb, i;
+        size_t pij, pkl, it;
+        // the dms by block pairs
+#pragma omp for schedule(dynamic, 1)
+        for (pij = 0; pij < (size_t)nb * nb; pij++) {
+                Ib = pij / nb;
+                Jb = pij % nb;
+                for (i = 0; i < bn[Ib]; i++) {
+                        size_t src = ((size_t)(bao[Ib] + i) * nao + bao[Jb]) * npad;
+                        size_t dst = boff[pij] + (size_t)i * bn[Jb] * npad;
+                        memcpy(Dblk + dst, dm + src, sizeof(double) * bn[Jb] * npad);
+                        if (Dsblk != NULL) {
+                                memcpy(Dsblk + dst, dms + src, sizeof(double) * bn[Jb] * npad);
+                        }
+                        if (DTblk != NULL) {
+                                int j;
+                                for (j = 0; j < bn[Jb]; j++) {
+                                        memcpy(DTblk + dst + (size_t)j * npad,
+                                               dm + ((size_t)(bao[Jb] + j) * nao + bao[Ib] + i) * npad,
+                                               sizeof(double) * npad);
+                                }
+                        }
+                }
+        }
+        const size_t nE = (size_t)maxbn * maxbn * maxbn * maxbn;
+        double *E = malloc(sizeof(double) * nE * 3);
+        double *X1 = E + nE;
+        double *X2 = X1 + nE;
+        double *G = malloc(sizeof(double) * maxbn * maxbn * npad);
+        const size_t maxq = (size_t)maxbs * maxbs * maxbs * maxbs;
+        GemmQuartet *ql = malloc(sizeof(GemmQuartet) * maxq);
+        double *buf = malloc(sizeof(double) * ((size_t)di*di*di*di + cache_size));
+        double *cache = buf + (size_t)di*di*di*di;
+        double *bout = NULL;
+        double *bcache = NULL;
+        if (lanes) {
+                bout = malloc(sizeof(double) * BATCH_MAX_NF * lanes);
+                bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
+        }
+        int shls[4];
+        int bq[4 * BATCH_MAX_LANES];
+        const char TRANS_N = 'N', TRANS_T = 'T';
+        const double D0 = 0;
+        const int inpad = npad;
+
+#pragma omp for schedule(dynamic, 1)
+        for (it = 0; it < nbp; it++) {
+                pij = nbp - 1 - it;
+                Ib = (int)(sqrt(2*pij+.25) - .5 + 1e-7);
+                Jb = pij - (size_t)Ib*(Ib+1)/2;
+                if (QB[Ib*nb+Jb] * qbmax * dmax4 <= cutoff) {
+                        continue;
+                }
+                for (pkl = 0; pkl <= pij; pkl++) {
+                        Kb = (int)(sqrt(2*pkl+.25) - .5 + 1e-7);
+                        Lb = pkl - (size_t)Kb*(Kb+1)/2;
+                        if (QB[Ib*nb+Jb] * QB[Kb*nb+Lb] * dmax4 <= cutoff) {
+                                continue;
+                        }
+                        // the block quartet's shell quartets of the one-pass loop
+                        size_t nq = 0;
+                        int ish, jsh, ksh, lsh;
+                        for (ish = bsh[Ib]; ish < bsh[Ib+1]; ish++) {
+                        for (jsh = bsh[Jb]; jsh < (Ib == Jb ? ish + 1 : bsh[Jb+1]); jsh++) {
+                                double qij = q_cond[ish*nbas+jsh];
+                                if (qij * dmax4 == 0) {
+                                        continue;
+                                }
+                                // the margin keeps quartets within rounding of the cutoff for fprescreen
+                                double qthr = cutoff / (qij * dmax4) * (1 - 1e-10);
+                                size_t ijp = (size_t)ish * (ish + 1) / 2 + jsh;
+                                for (ksh = bsh[Kb]; ksh < bsh[Kb+1]; ksh++) {
+                                for (lsh = bsh[Lb]; lsh < (Kb == Lb ? ksh + 1 : bsh[Lb+1]); lsh++) {
+                                        if (pij == pkl && (size_t)ksh * (ksh + 1) / 2 + lsh > ijp) {
+                                                continue;
+                                        }
+                                        if (q_cond[ksh*nbas+lsh] <= qthr) {
+                                                continue;
+                                        }
+                                        shls[0] = ish;
+                                        shls[1] = jsh;
+                                        shls[2] = ksh;
+                                        shls[3] = lsh;
+                                        if (!(*fprescreen)(shls, vhfopt, atm, bas, env)) {
+                                                continue;
+                                        }
+                                        GemmQuartet *q = ql + nq++;
+                                        q->key = lanes ? ((stype[ish] * nt + stype[jsh]) * nt + stype[ksh]) * nt + stype[lsh] : 0;
+                                        memcpy(q->shls, shls, sizeof(int) * 4);
+                                } }
+                        } }
+                        if (nq == 0) {
+                                continue;
+                        }
+                        const int nI = bn[Ib], nJ = bn[Jb], nK = bn[Kb], nL = bn[Lb];
+                        const int nIJ = nI * nJ, nKL = nK * nL;
+                        GemmBlockQ g = {bao[Ib], bao[Jb], bao[Kb], bao[Lb], nJ, nL, nKL,
+                                        Ib == Jb, Kb == Lb, pij == pkl};
+                        memset(E, 0, sizeof(double) * nIJ * nKL);
+                        // the integrals, quartets of a class in qcint's lanes where it takes them
+                        if (lanes) {
+                                qsort(ql, nq, sizeof(GemmQuartet), _gemm_quartet_cmp);
+                        }
+                        size_t q0 = 0;
+                        while (q0 < nq) {
+                                int nbq = 0;
+                                size_t q1 = q0;
+                                if (lanes) {
+                                        while (q1 < nq && ql[q1].key == ql[q0].key && nbq < lanes &&
+                                               int2e_sph_batch_ok(ql[q1].shls, bas, env)) {
+                                                memcpy(bq + 4 * nbq, ql[q1].shls, sizeof(int) * 4);
+                                                nbq++;
+                                                q1++;
+                                        }
+                                }
+                                if (2 * nbq >= lanes && nbq > 0) {
+                                        int *s = bq;
+                                        const size_t nf = (size_t)(ao_loc[s[0]+1] - ao_loc[s[0]]) *
+                                                                  (ao_loc[s[1]+1] - ao_loc[s[1]]) *
+                                                                  (ao_loc[s[2]+1] - ao_loc[s[2]]) *
+                                                                  (ao_loc[s[3]+1] - ao_loc[s[3]]);
+                                        int2e_sph_batch(bout, nbq, bq, atm, natm, bas, nbas, env, NULL, bcache);
+                                        int b;
+                                        for (b = 0; b < nbq; b++) {
+                                                _gemm_place(E, bout + nf * b, bq + 4 * b, ao_loc, &g);
+                                        }
+                                } else {
+                                        // one at a time: a short batch, or quartets qcint does not batch
+                                        if (nbq == 0) {
+                                                q1 = q0 + 1;
+                                        }
+                                        size_t q;
+                                        for (q = q0; q < q1; q++) {
+                                                if ((*intor)(buf, NULL, ql[q].shls, atm, natm, bas, nbas,
+                                                             env, cintopt, cache)) {
+                                                        _gemm_place(E, buf, ql[q].shls, ao_loc, &g);
+                                                }
+                                        }
+                                }
+                                q0 = q1;
+                        }
+                        // the weights of the quartet kernels, at the block level
+                        const int sij = Ib != Jb, skl = Kb != Lb, sbk = pij != pkl;
+                        const double cJ = (sij ? 1. : .5) * (skl ? 1. : .5);
+                        const double c = (sbk || hermi == 0) ? 1. : .5;
+                        if (vj != NULL) {
+                                const double *dsKL = Dsblk + boff[Kb*nb+Lb];
+                                dgemm_(&TRANS_N, &TRANS_N, &inpad, &nIJ, &nKL, &cJ, dsKL, &inpad,
+                                       E, &nKL, &D0, G, &inpad);
+                                _gemm_add(VJblk + boff[Ib*nb+Jb], G, (size_t)nIJ * npad, lk + Ib*nb+Jb);
+                                if (sbk) {
+                                        const double *dsIJ = Dsblk + boff[Ib*nb+Jb];
+                                        dgemm_(&TRANS_N, &TRANS_T, &inpad, &nKL, &nIJ, &cJ, dsIJ, &inpad,
+                                               E, &nKL, &D0, G, &inpad);
+                                        _gemm_add(VJblk + boff[Kb*nb+Lb], G, (size_t)nKL * npad, lk + Kb*nb+Lb);
+                                }
+                        }
+                        if (vk == NULL) {
+                                continue;
+                        }
+                        // X1[(i,l),(j,k)] and X2[(i,k),(j,l)]
+                        const int nJK = nJ * nK, nJL = nJ * nL, nIL = nI * nL, nIK = nI * nK;
+                        int j, k, l;
+                        for (i = 0; i < nI; i++) {
+                        for (j = 0; j < nJ; j++) {
+                                const double *e = E + (size_t)(i * nJ + j) * nKL;
+                                for (k = 0; k < nK; k++) {
+                                for (l = 0; l < nL; l++) {
+                                        const double v = e[k * nL + l];
+                                        X1[(size_t)(i * nL + l) * nJK + j * nK + k] = v;
+                                        X2[(size_t)(i * nK + k) * nJL + j * nL + l] = v;
+                                } }
+                        } }
+                        omp_lock_t *lkk = lk + nb * nb;
+                        // t1: VK[I,L] += c X1 D[J,K]
+                        dgemm_(&TRANS_N, &TRANS_N, &inpad, &nIL, &nJK, &c, Dblk + boff[Jb*nb+Kb], &inpad,
+                               X1, &nJK, &D0, G, &inpad);
+                        _gemm_add(VKblk + boff[Ib*nb+Lb], G, (size_t)nIL * npad, lkk + Ib*nb+Lb);
+                        if (skl) {
+                                // t3: VK[I,K] += c X2 D[J,L]
+                                dgemm_(&TRANS_N, &TRANS_N, &inpad, &nIK, &nJL, &c, Dblk + boff[Jb*nb+Lb], &inpad,
+                                       X2, &nJL, &D0, G, &inpad);
+                                _gemm_add(VKblk + boff[Ib*nb+Kb], G, (size_t)nIK * npad, lkk + Ib*nb+Kb);
+                        }
+                        if (sij) {
+                                // t2: VK[J,L] += c X2^T D[I,K]
+                                dgemm_(&TRANS_N, &TRANS_T, &inpad, &nJL, &nIK, &c, Dblk + boff[Ib*nb+Kb], &inpad,
+                                       X2, &nJL, &D0, G, &inpad);
+                                _gemm_add(VKblk + boff[Jb*nb+Lb], G, (size_t)nJL * npad, lkk + Jb*nb+Lb);
+                                if (skl) {
+                                        // t4: VK[J,K] += c X1^T D[I,L]
+                                        dgemm_(&TRANS_N, &TRANS_T, &inpad, &nJK, &nIL, &c, Dblk + boff[Ib*nb+Lb],
+                                               &inpad, X1, &nJK, &D0, G, &inpad);
+                                        _gemm_add(VKblk + boff[Jb*nb+Kb], G, (size_t)nJK * npad, lkk + Jb*nb+Kb);
+                                }
+                        }
+                        if (!kt || !sbk) {
+                                continue;
+                        }
+                        // hermi = 0, t5..t8: VKT[J,K] += X1^T DT[I,L] (t5), VKT[J,L] += skl X2^T DT[I,K]
+                        // (t6), VKT[I,K] += sij X2 DT[J,L] (t7), VKT[I,L] += sij skl X1 DT[J,K] (t8)
+                        omp_lock_t *lkt = lk + nb * nb * 2;
+                        dgemm_(&TRANS_N, &TRANS_T, &inpad, &nJK, &nIL, &c, DTblk + boff[Ib*nb+Lb], &inpad,
+                               X1, &nJK, &D0, G, &inpad);
+                        _gemm_add(VKTblk + boff[Jb*nb+Kb], G, (size_t)nJK * npad, lkt + Jb*nb+Kb);
+                        if (skl) {
+                                dgemm_(&TRANS_N, &TRANS_T, &inpad, &nJL, &nIK, &c, DTblk + boff[Ib*nb+Kb], &inpad,
+                                       X2, &nJL, &D0, G, &inpad);
+                                _gemm_add(VKTblk + boff[Jb*nb+Lb], G, (size_t)nJL * npad, lkt + Jb*nb+Lb);
+                        }
+                        if (sij) {
+                                dgemm_(&TRANS_N, &TRANS_N, &inpad, &nIK, &nJL, &c, DTblk + boff[Jb*nb+Lb], &inpad,
+                                       X2, &nJL, &D0, G, &inpad);
+                                _gemm_add(VKTblk + boff[Ib*nb+Kb], G, (size_t)nIK * npad, lkt + Ib*nb+Kb);
+                                if (skl) {
+                                        dgemm_(&TRANS_N, &TRANS_N, &inpad, &nIL, &nJK, &c, DTblk + boff[Jb*nb+Kb],
+                                               &inpad, X1, &nJK, &D0, G, &inpad);
+                                        _gemm_add(VKTblk + boff[Ib*nb+Lb], G, (size_t)nIL * npad, lkt + Ib*nb+Lb);
+                                }
+                        }
+                }
+        }
+        // the sums into vj (blocks I >= J, the rest 0) and vk
+#pragma omp for schedule(dynamic, 1)
+        for (pij = 0; pij < (size_t)nb * nb; pij++) {
+                Ib = pij / nb;
+                Jb = pij % nb;
+                for (i = 0; i < bn[Ib]; i++) {
+                        size_t dst = ((size_t)(bao[Ib] + i) * nao + bao[Jb]) * npad;
+                        size_t src = boff[pij] + (size_t)i * bn[Jb] * npad;
+                        if (vj != NULL) {
+                                if (Ib >= Jb) {
+                                        memcpy(vj + dst, VJblk + src, sizeof(double) * bn[Jb] * npad);
+                                } else {
+                                        memset(vj + dst, 0, sizeof(double) * bn[Jb] * npad);
+                                }
+                        }
+                        if (vk != NULL) {
+                                memcpy(vk + dst, VKblk + src, sizeof(double) * bn[Jb] * npad);
+                        }
+                        if (VKTblk != NULL) {
+                                // vk[p,q] += VKT[Q,P][q][p]
+                                int j, n;
+                                for (j = 0; j < bn[Jb]; j++) {
+                                        const double *t = VKTblk + boff[Jb*nb+Ib] + ((size_t)j * bn[Ib] + i) * npad;
+                                        double *o = vk + dst + (size_t)j * npad;
+                                        for (n = 0; n < npad; n++) {
+                                                o[n] += t[n];
+                                        }
+                                }
+                        }
+                }
+        }
+        free(E);
+        free(G);
+        free(ql);
+        free(buf);
+        if (lanes) {
+                free(bout);
+                free(bcache);
+        }
+}
+        for (Ib = 0; Ib < nb * nb * 3; Ib++) {
+                omp_destroy_lock(lk + Ib);
+        }
+        free(lk);
+        free(bsh);
+        free(boff);
+        free(QB);
+        free(Dblk);
+        free(Dsblk);
+        free(VJblk);
+        free(VKblk);
+        free(DTblk);
+        free(VKTblk);
+}
+
+/*
  * vj, vk: [nao,nao,npad] (either can be NULL), VJ and VK as described at the
  * top: the caller forms vj = VJ + VJ^T and, for hermi=1, vk = VK + VK^T.
  * dm, dms: [nao,nao,npad], D_n and D_n + D_n^T (dms is only read for J),
@@ -560,12 +1009,13 @@ static void _flush_stored(QuartetQueue *Q, CVHFsdCache *sd, int lanes, int (*int
  * fprescreen is applied to every quartet. sd (or NULL) is a semi-direct cache
  * for the same intor, molecule and q_cond; it is used with the CVHFnrs8_*
  * prescreen functions only. int2e_batch: int2e_sph evaluates several quartets
- * of one class at once where qcint offers that (see QuartetQueue).
+ * of one class at once where qcint offers that (see QuartetQueue). dm_mode:
+ * many dms through dense matrix products (see _direct_jk_gemm).
  */
 void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                             double *dm, double *dms, int npad, int hermi,
                             int *ao_loc, CINTOpt *cintopt, CVHFOpt *vhfopt,
-                            CVHFsdCache *sd, int int2e_batch,
+                            CVHFsdCache *sd, int int2e_batch, int dm_mode,
                             int *atm, int natm, int *bas, int nbas, double *env)
 {
         const size_t nao = ao_loc[nbas];
@@ -634,6 +1084,16 @@ void CVHFnr_direct_jk_batch(int (*intor)(), double *vj, double *vk,
                         }
                         stype[s] = t;
                 }
+        }
+        if (dm_mode && q_cond != NULL && npad / DM_CHUNK >= GEMM_MIN_CHUNKS) {
+                _direct_jk_gemm(intor, vj, vk, dm, dms, npad, hermi, ao_loc, cintopt, vhfopt,
+                                lanes, nt, stype, q_cond, cutoff, dmax4, di, cache_size,
+                                atm, natm, bas, nbas, env);
+                if (stype != NULL) {
+                        free(stype);
+                }
+                free(qmax_k);
+                return;
         }
         double **vjprivs = malloc(sizeof(double *) * omp_get_max_threads() * 2);
         double **vkprivs = vjprivs + omp_get_max_threads();

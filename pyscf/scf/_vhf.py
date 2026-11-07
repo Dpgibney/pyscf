@@ -590,6 +590,10 @@ DIRECT_BATCH_MIN = 1
 # libcint, which has no such function
 INT2E_BATCH = getattr(__config__, 'scf_vhf_int2e_batch', True)
 
+# Many dms (CPHF, TDDFT) in direct(): J and K through dense matrix products of blocks of
+# integrals with all dms (nr_direct_batch.c, _direct_jk_gemm), 13 dms or more
+JK_GEMM = getattr(__config__, 'scf_vhf_jk_gemm', True)
+
 def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
                      cvhfopt=None, cintopt=None, sd_eri=None):
     '''J and K of all dms from s8 ERIs computed on the fly, or kept in sd_eri
@@ -612,10 +616,17 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
     sym_k = with_k and hermi == 1 and (
         abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
 
-    # Each thread accumulates nao*nao*n doubles for J and for K. Batches of dms
-    # beyond the memory available recompute the integrals.
+    # Each thread accumulates nao*nao*n doubles for J and for K. With JK_GEMM, 13
+    # dms or more (16 with the padding) keep the dms, D + D^T and the sums once,
+    # by block pairs (and D^T and the sums of VK^T for non-symmetric K), and no
+    # thread has sums of its own (nr_direct_batch.c). Batches of dms beyond the
+    # memory available recompute the integrals.
     mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 2000) * .5e6
-    batch = max(1, int(mem_avail / (8 * nao**2 * (with_j + with_k) * lib.num_threads())))
+    if JK_GEMM and n_dm >= 13:
+        per_dm = 8 * nao**2 * (1 + 2 * with_j + with_k * (1 + 2 * (not sym_k)))
+    else:
+        per_dm = 8 * nao**2 * (with_j + with_k) * lib.num_threads()
+    batch = max(1, int(mem_avail / per_dm))
     vj = numpy.empty((n_dm, nao, nao)) if with_j else None
     vk = numpy.empty((n_dm, nao, nao)) if with_k else None
     null = lib.c_null_ptr()
@@ -638,7 +649,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
             null if dm_sum is None else dm_sum.ctypes.data_as(ctypes.c_void_p),
             ctypes.c_int(npad), ctypes.c_int(1 if sym_k else 0),
             ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cvhfopt, c_sd,
-            ctypes.c_int(1 if INT2E_BATCH else 0),
+            ctypes.c_int(1 if INT2E_BATCH else 0), ctypes.c_int(1 if JK_GEMM else 0),
             c_atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_atm.shape[0]),
             c_bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_bas.shape[0]),
             c_env.ctypes.data_as(ctypes.c_void_p))
