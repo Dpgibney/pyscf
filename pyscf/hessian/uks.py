@@ -119,6 +119,13 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     max_memory = max(2000, mf.max_memory*.9-mem_now)
     h1aoa, h1aob = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
     aoslices = mol.aoslice_by_atom()
+    if hybrid:
+        vhfopt = rhf_hess._make_h1_vhfopt(mol, [dm0, dm0a, dm0b], 'jk')
+        if omega != 0:
+            with mol.with_range_coulomb(omega):
+                vhfopt_lr = rhf_hess._make_h1_vhfopt(mol, [dm0a, dm0b], 'k')
+    else:
+        vhfopt = rhf_hess._make_h1_vhfopt(mol, dm0, 'j')
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
@@ -129,7 +136,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
                              'lk->s1ij', -dm0         ,
                              'li->s1kj', -dm0a[:,p0:p1], 'li->s1kj', -dm0b[:,p0:p1],
                              'jk->s1il', -dm0a         , 'jk->s1il', -dm0b         ],
-                            shls_slice=shls_slice)
+                            shls_slice=shls_slice, vhfopt=vhfopt)
             veffa = vj1 - hyb * vk1a
             veffb = vj1 - hyb * vk1b
             veffa[:,p0:p1] += vj2 - hyb * vk2a
@@ -142,7 +149,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
                                      'li->s1kj', -dm0b[:,p0:p1],
                                      'jk->s1il', -dm0a         ,
                                      'jk->s1il', -dm0b         ],
-                                    shls_slice=shls_slice)
+                                    shls_slice=shls_slice, vhfopt=vhfopt_lr)
                 veffa -= (alpha-hyb) * vk1a
                 veffb -= (alpha-hyb) * vk1b
                 veffa[:,p0:p1] -= (alpha-hyb) * vk2a
@@ -150,7 +157,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         else:
             vj1, vj2 = _get_jk(mol, 'int2e_ip1', 3, 's2kl',
                                ['ji->s2kl', -dm0[:,p0:p1], 'lk->s1ij', -dm0],
-                               shls_slice=shls_slice)
+                               shls_slice=shls_slice, vhfopt=vhfopt)
             veffa = vj1
             veffb = vj1.copy()
             veffa[:,p0:p1] += vj2

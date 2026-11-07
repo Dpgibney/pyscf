@@ -155,6 +155,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     hcore_deriv = hessobj.base.nuc_grad_method().hcore_generator(mol)
 
     aoslices = mol.aoslice_by_atom()
+    vhfopt = rhf_hess._make_h1_vhfopt(mol, [dm0, dm0a, dm0b], 'jk')
     h1aoa = [None] * mol.natm
     h1aob = [None] * mol.natm
     for i0, ia in enumerate(atmlst):
@@ -166,7 +167,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
                          'lk->s1ij', -dm0         ,
                          'li->s1kj', -dm0a[:,p0:p1], 'li->s1kj', -dm0b[:,p0:p1],
                          'jk->s1il', -dm0a         , 'jk->s1il', -dm0b         ],
-                        shls_slice=shls_slice)
+                        shls_slice=shls_slice, vhfopt=vhfopt)
         vhfa = vj1 - vk1a
         vhfb = vj1 - vk1b
         vhfa[:,p0:p1] += vj2 - vk2a

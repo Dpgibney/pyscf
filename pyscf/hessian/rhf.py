@@ -45,6 +45,9 @@ JK_ENERGY_TOL = getattr(__config__, 'hessian_rhf_jk_energy_tol', 1e-14)
 # The memory (MB) hess_jk_energy's chunk buffers may take; fixed, so that the results do not depend on the memory
 # available
 JK_ENERGY_BUF = 128
+# The screening threshold of make_h1's int2e_ip1 J/K (_make_h1_vhfopt); 0 computes every quartet, as without a
+# vhfopt
+MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-14)
 
 
 def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
@@ -392,6 +395,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     mocc = mo_coeff[:,mo_occ>0]
     dm0 = numpy.dot(mocc, mocc.T) * 2
     hcore_deriv = hessobj.base.nuc_grad_method().hcore_generator(mol)
+    vhfopt = _make_h1_vhfopt(mol, dm0, 'jk')
 
     aoslices = mol.aoslice_by_atom()
     h1ao = [None] * mol.natm
@@ -403,13 +407,38 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
                                       'lk->s1ij', -dm0         ,  # vj2
                                       'li->s1kj', -dm0[:,p0:p1],  # vk1
                                       'jk->s1il', -dm0         ], # vk2
-                                     shls_slice=shls_slice)
+                                     shls_slice=shls_slice, vhfopt=vhfopt)
         vhf = vj1 - vk1*.5
         vhf[:,p0:p1] += vj2 - vk2*.5
         h1 = vhf + vhf.transpose(0,2,1)
         h1 += hcore_deriv(ia)
         h1ao[ia] = h1
     return h1ao
+
+def _make_h1_vhfopt(mol, dms, screen='jk'):
+    '''The screening of make_h1's int2e_ip1 J/K (_get_jk over s2kl, the scripts ji->s2kl and lk->s1ij
+    for J, li->s1kj and jk->s1il for K): CVHFip1_h1_<screen>_prescreen at MAKE_H1_TOL, with the pair
+    bounds of the gradients (grad.rhf._calc_q_cond) and the largest elements of dms, the full densities
+    the scripts take or take slices of. Within mol.with_range_coulomb for range-separated K. None
+    (no screening) when MAKE_H1_TOL is 0.
+    '''
+    if MAKE_H1_TOL == 0:
+        return None
+    vhfopt = _vhf._VHFOpt(mol, 'int2e_ip1', 'CVHFip1_h1_%s_prescreen' % screen,
+                          direct_scf_tol=MAKE_H1_TOL)
+    vhfopt.q_cond = rhf._calc_q_cond(mol, vhfopt)
+    nao = mol.nao
+    nbas = mol.nbas
+    dms = numpy.asarray(dms, order='C', dtype=numpy.double).reshape(-1,nao,nao)
+    dm_cond = numpy.empty((nbas, nbas))
+    ao_loc = mol.ao_loc_nr()
+    _vhf.libcvhf.CVHFnr_dm_cond1(
+        dm_cond.ctypes, dms.ctypes, ctypes.c_int(len(dms)), ao_loc.ctypes, mol._atm.ctypes,
+        ctypes.c_int(mol.natm), mol._bas.ctypes, ctypes.c_int(nbas), mol._env.ctypes)
+    # Set here: direct_bindm's set_dm does nothing without a dmcondname (the scripts' slices cannot be
+    # stacked)
+    vhfopt.dm_cond = dm_cond
+    return vhfopt
 
 def get_hcore(mol):
     '''Part of the second derivatives of core Hamiltonian'''

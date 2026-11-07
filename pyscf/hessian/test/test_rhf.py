@@ -304,6 +304,29 @@ class KnownValues(unittest.TestCase):
                         self.assertAlmostEqual(abs(ej - ref[0]).max(), 0, 11)
                         self.assertAlmostEqual(abs(ek - ref[1]).max(), 0, 11)
 
+    def test_make_h1_screening(self):
+        # make_h1's int2e_ip1 J/K with the screening of _make_h1_vhfopt against every quartet:
+        # RHF, hybrid, pure and range-separated RKS, UHF, hybrid and range-separated UKS
+        from pyscf import dft
+        from pyscf.hessian import rhf as rhf_hess
+        for build, charge, spin in ((scf.RHF, 0, 0), (lambda m: dft.RKS(m, xc='b3lyp'), 0, 0),
+                                    (lambda m: dft.RKS(m, xc='pbe'), 0, 0),
+                                    (lambda m: dft.RKS(m, xc='wb97x'), 0, 0),
+                                    (scf.UHF, 1, 1), (lambda m: dft.UKS(m, xc='b3lyp'), 1, 1),
+                                    (lambda m: dft.UKS(m, xc='camb3lyp'), 1, 1)):
+            mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587; He .2 .1 2.4',
+                         basis={'default': 'def2-svp', 'He': 'cc-pvdz'}, charge=charge, spin=spin,
+                         verbose=0)
+            mf1 = build(mol1)
+            mf1.conv_tol = 1e-12
+            mf1.kernel()
+            hobj = mf1.Hessian()
+            with lib.temporary_env(rhf_hess, MAKE_H1_TOL=0):
+                ref = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
+            h1 = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
+            self.assertTrue(abs(ref).max() > .1)
+            self.assertAlmostEqual(abs(h1 - ref).max(), 0, 11)
+
 
 if __name__ == "__main__":
     print("Full Tests for RHF Hessian")

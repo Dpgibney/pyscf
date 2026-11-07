@@ -116,6 +116,50 @@ int CVHFgrad_k_prescreen(int *shls, CVHFOpt *opt,
             || (opt->dm_cond[j*n+l] > dmin));
 }
 
+/*
+ * make_h1 of hessian/rhf.py, rks.py, uhf.py, uks.py: int2e_ip1 over s2kl with the scripts
+ *   ji->s2kl, lk->s1ij (J), li->s1kj, jk->s1il (K),
+ * the K scripts also through their kl -> lk partners (dm[k,i], dm[j,l]). q_cond: the int2e_ip1ip2
+ * pair bounds (CVHFnr_int2e_pp_q_cond), then those of int2e; dm_cond: of the full densities the
+ * scripts take, or slices of.
+ */
+static int _h1_prescreen(int *shls, CVHFOpt *opt, int with_j, int with_k)
+{
+        if (opt == NULL) {
+                return 1; // no screen
+        }
+        int i = shls[0];
+        int j = shls[1];
+        int k = shls[2];
+        int l = shls[3];
+        int n = opt->nbas;
+        assert(opt->q_cond);
+        assert(opt->dm_cond);
+        double *q_cond_kl = opt->q_cond + n * n;
+        double *dm_cond = opt->dm_cond;
+        double qijkl = opt->q_cond[i*n+j] * q_cond_kl[k*n+l];
+        double dmin = opt->direct_scf_cutoff / qijkl;
+        return qijkl > opt->direct_scf_cutoff
+            && ((with_j && ((dm_cond[j*n+i] > dmin) || (2*dm_cond[l*n+k] > dmin)))
+             || (with_k && ((dm_cond[l*n+i] > dmin) || (dm_cond[k*n+i] > dmin) ||
+                            (dm_cond[j*n+k] > dmin) || (dm_cond[j*n+l] > dmin))));
+}
+
+int CVHFip1_h1_jk_prescreen(int *shls, CVHFOpt *opt, int *atm, int *bas, double *env)
+{
+        return _h1_prescreen(shls, opt, 1, 1);
+}
+
+int CVHFip1_h1_j_prescreen(int *shls, CVHFOpt *opt, int *atm, int *bas, double *env)
+{
+        return _h1_prescreen(shls, opt, 1, 0);
+}
+
+int CVHFip1_h1_k_prescreen(int *shls, CVHFOpt *opt, int *atm, int *bas, double *env)
+{
+        return _h1_prescreen(shls, opt, 0, 1);
+}
+
 void CVHFnr_int2e_pp_q_cond(int (*intor)(), CINTOpt *cintopt, double *q_cond,
                             int *ao_loc, int *atm, int natm,
                             int *bas, int nbas, double *env)
