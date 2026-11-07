@@ -59,9 +59,10 @@ else()
   endif()
 endif()
 
-# The XC quadrature kernels (dft/nr_numint*.c) and the AO evaluation on grids (gto/grid_ao_drv.c,
-# deriv1.c, deriv2.c) vectorized for x86-64-v3 (AVX2). FMA contraction stays off, so the results are
-# bitwise identical to the default build. The libraries then require an AVX2 CPU.
+# The XC quadrature kernels (dft/nr_numint*.c), the AO evaluation on grids (gto/grid_ao_drv.c,
+# deriv1.c, deriv2.c) and the SGX J/K contractions (vhf/nr_sgx_direct.c) vectorized for x86-64-v3
+# (AVX2). FMA contraction stays off, so the results are bitwise identical to the default build. The
+# libraries then require an AVX2 CPU.
 option(NUMINT_X86_64_V3 "-O3 -march=x86-64-v3 -ffp-contract=off for the numint and GTO grid kernels" off)
 if (NUMINT_X86_64_V3)
   include(CheckCCompilerFlag)
