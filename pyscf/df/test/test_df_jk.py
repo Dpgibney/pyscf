@@ -194,6 +194,21 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(vj0-vj1).max(), 0, 12)
         self.assertAlmostEqual(lib.fp(vj0), -194.15910890730052, 9)
 
+    def test_get_j_engine(self):
+        # the J-engine (rij_engine.c) against the RI-J through int3c2e: general contractions
+        # (cc-pVDZ), g functions (def2-QZVP), densities that are not symmetric
+        numpy.random.seed(1)
+        for basis, auxbasis in [('cc-pvdz', 'weigend'), ('def2-qzvp', 'def2-universal-jfit')]:
+            m = gto.M(atom=mol.atom, basis=basis, verbose=0)
+            dms = numpy.random.random((2, m.nao, m.nao))
+            with_df = df.DF(m, auxbasis=auxbasis)
+            with lib.temporary_env(df_jk, RIJ_ENGINE=False):
+                vj0 = df_jk.get_j(with_df, dms)
+            with_df = df.DF(m, auxbasis=auxbasis)
+            vj1 = df_jk.get_j(with_df, dms)
+            self.assertTrue(getattr(with_df, '_rij_engine', None) is not None)
+            self.assertAlmostEqual(abs(vj1-vj0).max(), 0, 11)
+
     def test_get_j_cderi(self):
         # J only: the 3-center tensor is built when it fits in memory, otherwise
         # get_j evaluates the integrals. Both fit the same way.

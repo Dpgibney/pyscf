@@ -23,8 +23,12 @@ from pyscf import lib
 from pyscf import scf
 from pyscf.lib import logger
 from pyscf.ao2mo import _ao2mo
+from pyscf import __config__
 
 DEBUG = False
+# get_j by the McMurchie-Davidson J-engine of libcvhf (rij_engine.c): the same integral-direct RI-J,
+# the three-center integrals through Hermite Gaussians instead of int3c2e
+RIJ_ENGINE = getattr(__config__, 'df_df_jk_rij_engine', True)
 
 libri = lib.load_library('libri')
 
@@ -435,6 +439,157 @@ def get_jk(dfobj, dm, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-13):
     logger.timer(dfobj, 'df vj and vk', *t0)
     return vj, vk
 
+def _split_contractions(bas, env):
+    '''The shells of bas with one contracted function each (a shell of nctr functions
+    becomes nctr shells, in the same order of the functions)'''
+    out = []
+    for b in bas:
+        nctr = b[3]
+        if nctr == 1:
+            out.append(b)
+            continue
+        for ic in range(nctr):
+            b1 = b.copy()
+            b1[3] = 1
+            b1[6] = b[6] + ic * b[2]
+            out.append(b1)
+    return numpy.asarray(out, dtype=numpy.int32).reshape(-1, 8)
+
+
+class _RIJEngineData:
+    '''What the J-engine (rij_engine.c) keeps for a molecule and auxiliary basis'''
+    def __init__(self, mol, auxmol, direct_scf_tol):
+        from pyscf import gto
+        from pyscf.scf import _vhf
+        self.mol = mol
+        self.auxmol = auxmol
+        self.direct_scf_tol = direct_scf_tol
+        # what the data were made from: a Mole moved in place (set_geom_) or rebuilt keeps its identity
+        self.mol_arrays = (mol._atm.copy(), mol._bas.copy(), mol._env.copy())
+        self.atm = numpy.asarray(mol._atm, dtype=numpy.int32, order='C')
+        self.env = numpy.asarray(mol._env, dtype=numpy.double, order='C')
+        self.bas = _split_contractions(mol._bas, mol._env)
+        self.ao_loc = gto.moleintor.make_loc(self.bas, 'cart').astype(numpy.int32)
+        self.auxatm = numpy.asarray(auxmol._atm, dtype=numpy.int32, order='C')
+        self.auxenv = numpy.asarray(auxmol._env, dtype=numpy.double, order='C')
+        self.auxbas = _split_contractions(auxmol._bas, auxmol._env)
+        self.aux_loc = gto.moleintor.make_loc(self.auxbas, 'sph').astype(numpy.int32)
+        # the Cartesian functions of mol: c2s maps them to mol's functions
+        if mol.cart:
+            self.c2s_ao = None
+        else:
+            self.c2s_ao = mol.cart2sph_coeff()
+        lmax = int(self.auxbas[:, 1].max())
+        c2s = []
+        c2s_off = []
+        off = 0
+        for l in range(lmax + 1):
+            c = numpy.asarray(gto.mole.cart2sph(l, normalized='sp'), order='C')
+            c2s_off.append(off)
+            c2s.append(c.ravel())
+            off += c.size
+        self.c2s = numpy.hstack(c2s)
+        self.c2s_off = numpy.asarray(c2s_off, dtype=numpy.int32)
+        # q_AB = max (ab|ab)^1/2 of the shell pairs of the split basis, Cartesian functions
+        mol1 = mol.copy()
+        mol1._bas = self.bas
+        mol1.cart = True
+        opt = _vhf._VHFOpt(mol1, 'int2e', 'CVHFnrs8_prescreen',
+                           direct_scf_tol=direct_scf_tol)
+        opt.init_cvhf_direct(mol1, 'int2e', 'CVHFnr_int2e_q_cond')
+        self.q_cond = numpy.asarray(opt.q_cond).reshape(mol1.nbas, mol1.nbas)
+        j2c = auxmol.intor('int2c2e', hermi=1)
+        j2c_diag = numpy.sqrt(abs(j2c.diagonal()))
+        # the auxiliary shells of the split basis
+        loc = self.aux_loc
+        self.qaux = numpy.array([j2c_diag[i0:i1].max() for i0, i1 in zip(loc[:-1], loc[1:])])
+        try:
+            self.j2c = scipy.linalg.cho_factor(j2c, lower=True)
+            self.j2c_type = 'cd'
+        except scipy.linalg.LinAlgError:
+            self.j2c = j2c
+            self.j2c_type = 'regular'
+        nbas = self.bas.shape[0]
+        i, j = numpy.tril_indices(nbas)
+        keep = self.q_cond[i, j] * self.qaux.max() > direct_scf_tol
+        self.pairs = numpy.asarray(numpy.vstack((i[keep], j[keep])).T, dtype=numpy.int32, order='C')
+        self.qpair = numpy.ascontiguousarray(self.q_cond[i[keep], j[keep]])
+
+    def matches(self, mol, auxmol, direct_scf_tol):
+        atm, bas, env = self.mol_arrays
+        return (self.mol is mol and self.auxmol is auxmol
+                and self.direct_scf_tol == direct_scf_tol
+                and atm.shape == mol._atm.shape and bas.shape == mol._bas.shape
+                and env.shape == mol._env.shape and numpy.array_equal(atm, mol._atm)
+                and numpy.array_equal(bas, mol._bas) and numpy.array_equal(env, mol._env))
+
+    def drv(self, npass, out, dm, cfit, qaux):
+        from pyscf.scf import _vhf
+        order = numpy.asarray(numpy.argsort(-qaux, kind='stable'), dtype=numpy.int32)
+        qaux = numpy.ascontiguousarray(qaux)
+        _vhf.libcvhf.RIJdrv.restype = ctypes.c_int
+        err = _vhf.libcvhf.RIJdrv(
+            ctypes.c_int(npass), out.ctypes.data_as(ctypes.c_void_p),
+            dm.ctypes.data_as(ctypes.c_void_p) if dm is not None else None,
+            cfit.ctypes.data_as(ctypes.c_void_p) if cfit is not None else None,
+            self.pairs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.pairs.shape[0]),
+            self.qpair.ctypes.data_as(ctypes.c_void_p), ctypes.c_double(self.direct_scf_tol),
+            self.ao_loc.ctypes.data_as(ctypes.c_void_p),
+            self.atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.atm.shape[0]),
+            self.bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.bas.shape[0]),
+            self.env.ctypes.data_as(ctypes.c_void_p),
+            self.auxatm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxatm.shape[0]),
+            self.auxbas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxbas.shape[0]),
+            self.auxenv.ctypes.data_as(ctypes.c_void_p),
+            self.aux_loc.ctypes.data_as(ctypes.c_void_p),
+            qaux.ctypes.data_as(ctypes.c_void_p), order.ctypes.data_as(ctypes.c_void_p),
+            self.c2s.ctypes.data_as(ctypes.c_void_p), self.c2s_off.ctypes.data_as(ctypes.c_void_p))
+        if err != 0:
+            raise NotImplementedError('angular momentum beyond the J-engine')
+        return out
+
+    def get_j(self, dm):
+        dm = numpy.asarray(dm)
+        dm_shape = dm.shape
+        nao = dm_shape[-1]
+        dms = dm.reshape(-1, nao, nao)
+        nao_cart = self.ao_loc[-1]
+        naux = self.aux_loc[-1]
+        loc = self.aux_loc
+        vj = []
+        for d in dms:
+            d = (d + d.T) * .5
+            if self.c2s_ao is not None:
+                d = lib.ddot(self.c2s_ao, lib.ddot(d, self.c2s_ao.T))
+            d = numpy.ascontiguousarray(d)
+            gam = self.drv(1, numpy.empty(naux), d, None, self.qaux)
+            if self.j2c_type == 'cd':
+                rho = scipy.linalg.cho_solve(self.j2c, gam)
+            else:
+                rho = scipy.linalg.solve(self.j2c, gam)
+            rho = numpy.ascontiguousarray(rho)
+            cmax = numpy.array([abs(rho[i0:i1]).max() for i0, i1 in zip(loc[:-1], loc[1:])])
+            v = self.drv(2, numpy.empty((nao_cart, nao_cart)), None, rho, self.qaux * cmax)
+            if self.c2s_ao is not None:
+                v = lib.ddot(self.c2s_ao.T, lib.ddot(v, self.c2s_ao))
+            vj.append(v)
+        return numpy.asarray(vj).reshape(dm_shape)
+
+
+def _get_j_engine(dfobj, dm, direct_scf_tol):
+    from pyscf.df import addons
+    mol = dfobj.mol
+    if dfobj.auxmol is None:
+        dfobj.auxmol = addons.make_auxmol(mol, dfobj.auxbasis)
+    data = getattr(dfobj, '_rij_engine', None)
+    # reset() of the DF and SGX objects drops auxmol, so new data follow a new molecule, geometry
+    # or auxiliary basis
+    if data is None or not data.matches(mol, dfobj.auxmol, direct_scf_tol):
+        data = _RIJEngineData(mol, dfobj.auxmol, direct_scf_tol)
+        dfobj._rij_engine = data
+    return data.get_j(dm)
+
+
 def get_j(dfobj, dm, hermi=0, direct_scf_tol=1e-13):
     from pyscf.scf import _vhf
     from pyscf.scf import jk
@@ -442,6 +597,16 @@ def get_j(dfobj, dm, hermi=0, direct_scf_tol=1e-13):
     t0 = t1 = (logger.process_clock(), logger.perf_counter())
 
     mol = dfobj.mol
+    # the J-engine takes spherical auxiliary functions (make_auxmol makes them Cartesian when mol.cart)
+    if (RIJ_ENGINE and hasattr(_vhf.libcvhf, 'RIJdrv') and not mol.cart
+            and mol.omega == 0 and getattr(dfobj, 'omega', None) in (None, 0)
+            and (dfobj.auxmol is None or not dfobj.auxmol.cart)):
+        try:
+            vj = _get_j_engine(dfobj, dm, direct_scf_tol)
+            logger.timer(dfobj, 'df-vj (J-engine)', *t0)
+            return vj
+        except NotImplementedError:
+            pass
     if dfobj._vjopt is None:
         dfobj.auxmol = auxmol = addons.make_auxmol(mol, dfobj.auxbasis)
         opt = _vhf._VHFOpt(mol, 'int3c2e', 'CVHFnr3c2e_schwarz_cond',

@@ -18,10 +18,10 @@ add_library(cvhf SHARED
   time_rev.c r_direct_o1.c rkb_screen.c
   r_direct_dot.c rah_direct_dot.c rha_direct_dot.c
   hessian_screen.c nr_sgx_direct.c nr_sr_vhf.c grad_jk_energy.c hess_jk_energy.c
-  orbit_engine.c)
+  orbit_engine.c rij_engine.c)
 add_dependencies(cvhf cgto np_helper)
 if(NUMINT_KERNEL_FLAGS)
-  set_source_files_properties(nr_sgx_direct.c
+  set_source_files_properties(nr_sgx_direct.c rij_engine.c
     PROPERTIES COMPILE_OPTIONS "${NUMINT_KERNEL_FLAGS}")
 endif()
 
