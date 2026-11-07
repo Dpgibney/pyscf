@@ -40,9 +40,9 @@
  * or all 4 centers through translational invariance. Both include everything
  * the s2kl driver includes.
  *
- * The orbits are summed in chunks of a fixed partition of the pair list, each
- * into its own buffer, and the buffers in chunk order: the result does not
- * depend on the thread count or the schedule.
+ * The loop over the orbits, their chunks (summed in a fixed order: the result
+ * does not depend on the thread count or the schedule) and the queues of the
+ * batched integrals are those of orbit_engine.h.
  */
 
 #include <stdlib.h>
@@ -57,29 +57,11 @@
 #include "optimizer.h"
 #include "np_helper/np_helper.h"
 #include "gto/gto.h"
+#include "orbit_engine.h"
 
 // Upper limits of the chunk count: chunks in all, and chunk buffer doubles
 #define EJK_NCHUNK      4096
 #define EJK_CHUNK_BUF   4000000
-
-typedef struct {
-        double q;
-        int i;
-        int j;
-} EJKPair;
-
-static int _cmp_pair(const void *a, const void *b)
-{
-        const EJKPair *pa = a;
-        const EJKPair *pb = b;
-        if (pa->q != pb->q) {
-                return pa->q < pb->q ? -1 : 1;
-        }
-        if (pa->i != pb->i) {
-                return pa->i - pb->i;
-        }
-        return pa->j - pb->j;
-}
 
 // CVHFgrad_jk_prescreen (with_j and with_k), CVHFgrad_j_prescreen (with_j)
 // or CVHFgrad_k_prescreen (with_k) for the shells (a,b,c,d)
@@ -385,12 +367,9 @@ static void _orbit_eval(double *de, EJKOrbit *o, EJKEnvs *e, double *buf, double
  * orbits whose quartets int2e_ip1_sph_batch_ok takes. An orbit is queued by the
  * types (l, number of primitives) of its 4 shells and the set of centres it
  * evaluates, so that the orbits of a queue need the same integral classes; a
- * queue holding int2e_sph_batch_lanes() orbits is evaluated centre by centre
- * for all of them, each orbit's Gamma computed once. The queues live in a small
- * hash table per thread, flushed in table order at the end of each chunk (and
- * when the table fills), so the sums do not depend on the thread count. A queue
- * of fewer than half the lanes goes orbit by orbit. Weak: libcint and older
- * qcint have none of these functions.
+ * full queue (orbit_engine.h) is evaluated centre by centre for all of them,
+ * each orbit's Gamma computed once. Weak: libcint and older qcint have none of
+ * these functions.
  */
 int int2e_ip1_sph();
 int int2e_ip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int *bas, int nbas,
@@ -399,110 +378,136 @@ int int2e_ip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak
 int int2e_sph_batch_lanes(void) __attribute__((weak));
 size_t int2e_sph_batch_cache_size(void) __attribute__((weak));
 
-#define EJK_MAX_LANES   8
+#define EJK_MAX_LANES   OE_MAX_LANES
 #define EJK_QCAP        1024    // hash table entries per thread, a power of 2
 
+// The client of orbit_engine.h
 typedef struct {
-        uint64_t key;           // 0: empty
-        int n;
-        EJKOrbit o[EJK_MAX_LANES];
-} EJKQueue;
-
-typedef struct {
-        EJKQueue *q;
-        int nused;
+        EJKEnvs *e;
         int lanes;
         int nt;                 // shell types
         int *stype;
+        size_t di4;
+        size_t cache_size;
+        double norbit;
+        double neval;
+        double npass;
+} EJKClient;
+
+typedef struct {
+        double *buf;
+        double *gam;
+        double *cache;
         double *bout;           // lanes * 3 * the largest block
         double *bcache;
         double *gams;           // lanes * the largest block
-} EJKBatch;
+        double norbit;
+        double neval;
+        double npass;
+} EJKThread;
 
-static void _flush_orbits(double *de, EJKQueue *Q, EJKBatch *bt, EJKEnvs *e,
-                          double *buf, double *gam, double *cache)
+static void *_thread_init(void *ctx)
 {
-        int q, c;
-        if (2 * Q->n < bt->lanes) {
-                for (q = 0; q < Q->n; q++) {
-                        _orbit_eval(de, Q->o + q, e, buf, gam, cache);
-                }
-                Q->n = 0;
-                return;
+        EJKClient *cl = ctx;
+        const size_t di4 = cl->di4;
+        EJKThread *th = calloc(1, sizeof(EJKThread));
+        th->buf = malloc(sizeof(double) * (di4 * 4 + cl->cache_size));
+        th->gam = th->buf + di4 * 3;
+        th->cache = th->gam + di4;
+        if (cl->lanes) {
+                th->bout = malloc(sizeof(double) * di4 * 3 * cl->lanes);
+                th->bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
+                th->gams = malloc(sizeof(double) * di4 * cl->lanes);
         }
+        return th;
+}
+
+static void _thread_done(void *ctx, void *pth)
+{
+        EJKClient *cl = ctx;
+        EJKThread *th = pth;
+        cl->norbit += th->norbit;
+        cl->neval += th->neval;
+        cl->npass += th->npass;
+        free(th->buf);
+        if (cl->lanes) {
+                free(th->bout);
+                free(th->bcache);
+                free(th->gams);
+        }
+        free(th);
+}
+
+static int _plan(void *ctx, void *pth, int ish, int jsh, int ksh, int lsh,
+                 void *orbit, uint64_t *key)
+{
+        EJKClient *cl = ctx;
+        EJKThread *th = pth;
+        EJKEnvs *e = cl->e;
+        EJKOrbit *o = orbit;
+        int np = _orbit_plan(o, ish, jsh, ksh, lsh, e);
+        th->norbit += np > 0;
+        th->npass += np;
+        if (np == 0 || o->neval == 0) {
+                return 0;
+        }
+        th->neval += o->neval;
+        *key = 0;
+        if (cl->lanes && int2e_ip1_sph_batch_ok(o->sh[0], e->bas, e->env)) {
+                const int *sh0 = o->sh[0];
+                const uint64_t nt = cl->nt;
+                int mask = o->evaluate[0] | o->evaluate[1] << 1 | o->evaluate[2] << 2 |
+                        o->evaluate[3] << 3;
+                *key = ((((cl->stype[sh0[0]] * nt + cl->stype[sh0[1]]) * nt +
+                          cl->stype[sh0[2]]) * nt + cl->stype[sh0[3]]) << 4 | mask) + 1;
+        }
+        return 1;
+}
+
+static void _eval(void *ctx, void *pth, double *de, void *orbit)
+{
+        EJKClient *cl = ctx;
+        EJKThread *th = pth;
+        _orbit_eval(de, orbit, cl->e, th->buf, th->gam, th->cache);
+}
+
+static void _eval_batch(void *ctx, void *pth, double *de, void *orbits, int nq)
+{
+        EJKClient *cl = ctx;
+        EJKThread *th = pth;
+        EJKEnvs *e = cl->e;
+        EJKOrbit *os = orbits;
+        int q, c;
         int *ao_loc = e->ao_loc;
-        int *sh0 = Q->o[0].sh[0];
+        int *sh0 = os[0].sh[0];
         int di = ao_loc[sh0[0]+1] - ao_loc[sh0[0]];
         int dj = ao_loc[sh0[1]+1] - ao_loc[sh0[1]];
         int dk = ao_loc[sh0[2]+1] - ao_loc[sh0[2]];
         int dl = ao_loc[sh0[3]+1] - ao_loc[sh0[3]];
         size_t nf = (size_t)di * dj * dk * dl;
-        for (q = 0; q < Q->n; q++) {
-                int *s = Q->o[q].sh[0];
-                _gamma(bt->gams + nf * q, e->dmj, e->dmk, e->nk, e->cj, e->ck, e->nao,
+        for (q = 0; q < nq; q++) {
+                int *s = os[q].sh[0];
+                _gamma(th->gams + nf * q, e->dmj, e->dmk, e->nk, e->cj, e->ck, e->nao,
                        ao_loc[s[0]], di, ao_loc[s[1]], dj, ao_loc[s[2]], dk, ao_loc[s[3]], dl);
         }
         double g[EJK_MAX_LANES][4][3];
         int shls[4 * EJK_MAX_LANES];
         for (c = 0; c < 4; c++) {
-                if (!Q->o[0].evaluate[c]) {
+                if (!os[0].evaluate[c]) {
                         continue;
                 }
-                for (q = 0; q < Q->n; q++) {
-                        memcpy(shls + 4 * q, Q->o[q].sh[c], sizeof(int) * 4);
+                for (q = 0; q < nq; q++) {
+                        memcpy(shls + 4 * q, os[q].sh[c], sizeof(int) * 4);
                 }
-                int2e_ip1_sph_batch(bt->bout, Q->n, shls, e->atm, e->natm, e->bas, e->nbas,
-                                    e->env, NULL, bt->bcache);
-                for (q = 0; q < Q->n; q++) {
-                        _contract(g[q][c], bt->bout + 3 * nf * q, bt->gams + nf * q, c,
+                int2e_ip1_sph_batch(th->bout, nq, shls, e->atm, e->natm, e->bas, e->nbas,
+                                    e->env, NULL, th->bcache);
+                for (q = 0; q < nq; q++) {
+                        _contract(g[q][c], th->bout + 3 * nf * q, th->gams + nf * q, c,
                                   di, dj, dk, dl);
                 }
         }
-        for (q = 0; q < Q->n; q++) {
-                _orbit_add(de, Q->o + q, g[q]);
-        }
-        Q->n = 0;
-}
-
-static void _flush_all(double *de, EJKBatch *bt, EJKEnvs *e, double *buf, double *gam,
-                       double *cache)
-{
-        int x;
-        for (x = 0; x < EJK_QCAP; x++) {
-                EJKQueue *Q = bt->q + x;
-                if (Q->key != 0 && Q->n > 0) {
-                        _flush_orbits(de, Q, bt, e, buf, gam, cache);
-                }
-                Q->key = 0;
-        }
-        bt->nused = 0;
-}
-
-// Queues the orbit o (planned, with evaluations), evaluating its queue when full
-static void _queue_orbit(double *de, EJKOrbit *o, EJKBatch *bt, EJKEnvs *e,
-                         double *buf, double *gam, double *cache)
-{
-        const int *sh0 = o->sh[0];
-        const uint64_t nt = bt->nt;
-        int mask = o->evaluate[0] | o->evaluate[1] << 1 | o->evaluate[2] << 2 | o->evaluate[3] << 3;
-        uint64_t key = ((((bt->stype[sh0[0]] * nt + bt->stype[sh0[1]]) * nt +
-                          bt->stype[sh0[2]]) * nt + bt->stype[sh0[3]]) << 4 | mask) + 1;
-        if (bt->nused * 4 >= EJK_QCAP * 3) {
-                _flush_all(de, bt, e, buf, gam, cache);
-        }
-        size_t x = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 54) & (EJK_QCAP - 1);
-        while (bt->q[x].key != 0 && bt->q[x].key != key) {
-                x = (x + 1) & (EJK_QCAP - 1);
-        }
-        EJKQueue *Q = bt->q + x;
-        if (Q->key == 0) {
-                Q->key = key;
-                Q->n = 0;
-                bt->nused++;
-        }
-        Q->o[Q->n] = *o;
-        if (++Q->n == bt->lanes) {
-                _flush_orbits(de, Q, bt, e, buf, gam, cache);
+        for (q = 0; q < nq; q++) {
+                _orbit_add(de, os + q, g[q]);
         }
 }
 
@@ -516,7 +521,7 @@ static void _queue_orbit(double *de, EJKOrbit *o, EJKBatch *bt, EJKEnvs *e,
  * stats, if not NULL, receives the counts of orbits that pass the screening,
  * of integral evaluations, and of the evaluations of the s2kl driver.
  * int2e_batch: int2e_ip1_sph evaluates several orbits at once where qcint offers
- * that (see EJKQueue); CVHFgrad_jk_energy takes it on.
+ * that (the queues of orbit_engine.h); CVHFgrad_jk_energy takes it on.
  */
 void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
                              CVHFOpt *vhfopt, double *dmj, double *dmk, int nk,
@@ -548,162 +553,56 @@ void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
         for (i = 0; i < nbas2; i++) {
                 dmax = MAX(dmax, envs.dmc[i]);
         }
-        const double fac = MIN(1., 2 * dmax);
-        const double thr = .5 * cutoff;
-        size_t npair = nbas2 / 2 + nbas;
-        EJKPair *pairs = malloc(sizeof(EJKPair) * npair);
-        double qmax = 0;
-        size_t nsig = 0;
+        double *qpair = malloc(sizeof(double) * nbas2);
         for (ish = 0; ish < nbas; ish++) {
         for (jsh = 0; jsh <= ish; jsh++) {
                 double q = MAX(q0[ish*nbas+jsh], q0[jsh*nbas+ish]);
-                q = MAX(q, q1[ish*nbas+jsh]);
-                qmax = MAX(qmax, q);
-                pairs[nsig].q = q;
-                pairs[nsig].i = ish;
-                pairs[nsig].j = jsh;
-                nsig++;
+                qpair[ish*nbas+jsh] = MAX(q, q1[ish*nbas+jsh]);
         } }
-        npair = nsig;
-        nsig = 0;
-        for (i = 0; i < npair; i++) {
-                if (pairs[i].q * qmax * fac > thr) {
-                        pairs[nsig] = pairs[i];
-                        nsig++;
-                }
-        }
-        // Ascending q: for pair t the partners u <= t are visited from t
-        // down, and the bound decreases, so the loop stops at the first that
-        // fails it.
-        qsort(pairs, nsig, sizeof(EJKPair), _cmp_pair);
-
-        // Chunks of equal (t+1) sums, taken heaviest first
-        int nchunk = MIN(EJK_NCHUNK, EJK_CHUNK_BUF / (natm * 3));
-        nchunk = MIN(nchunk, (int)nsig);
-        nchunk = MAX(nchunk, 1);
-        size_t *chunk_loc = malloc(sizeof(size_t) * (nchunk + 1));
-        double area = (double)nsig * (nsig + 1) / 2;
-        int c = 0;
-        chunk_loc[0] = 0;
-        for (i = 0; i < nsig && c < nchunk - 1; i++) {
-                if ((double)(i+1) * (i+2) / 2 >= area * (c + 1) / nchunk) {
-                        c++;
-                        chunk_loc[c] = i + 1;
-                }
-        }
-        for (c++; c <= nchunk; c++) {
-                chunk_loc[c] = nsig;
-        }
-        double *de_chunks = calloc((size_t)nchunk * natm * 3, sizeof(double));
 
         int shls_slice[8] = {0, nbas, 0, nbas, 0, nbas, 0, nbas};
         size_t di = GTOmax_shell_dim(ao_loc, shls_slice, 1);
-        size_t di4 = di * di * di * di;
         size_t cache_size = GTOmax_cache_size(intor, shls_slice, 4,
                                               atm, natm, bas, nbas, env);
-        double norbit = 0;
-        double neval = 0;
-        double npass = 0;
+        EJKClient cl = {&envs, 0, 0, NULL, di * di * di * di, cache_size, 0, 0, 0};
 
         // the queues of orbits for int2e_ip1_sph_batch, by shell type (l, nprim)
-        int lanes = 0;
-        int nt = 0;
-        int *stype = NULL;
         if (int2e_batch && int2e_ip1_sph_batch != NULL && intor == int2e_ip1_sph &&
             env[PTR_RANGE_OMEGA] >= 0) {
-                lanes = MIN(int2e_sph_batch_lanes(), EJK_MAX_LANES);
-                stype = malloc(sizeof(int) * nbas * 3);
-                int *tl = stype + nbas;
+                cl.lanes = MIN(int2e_sph_batch_lanes(), EJK_MAX_LANES);
+                cl.stype = malloc(sizeof(int) * nbas * 3);
+                int *tl = cl.stype + nbas;
                 int *tp = tl + nbas;
                 int s, t;
                 for (s = 0; s < nbas; s++) {
-                        for (t = 0; t < nt; t++) {
+                        for (t = 0; t < cl.nt; t++) {
                                 if (tl[t] == bas[ANG_OF+s*BAS_SLOTS] &&
                                     tp[t] == bas[NPRIM_OF+s*BAS_SLOTS]) {
                                         break;
                                 }
                         }
-                        if (t == nt) {
+                        if (t == cl.nt) {
                                 tl[t] = bas[ANG_OF+s*BAS_SLOTS];
                                 tp[t] = bas[NPRIM_OF+s*BAS_SLOTS];
-                                nt++;
+                                cl.nt++;
                         }
-                        stype[s] = t;
+                        cl.stype[s] = t;
                 }
         }
 
-#pragma omp parallel reduction(+:norbit, neval, npass)
-{
-        double *buf = malloc(sizeof(double) * (di4 * 4 + cache_size));
-        double *gam = buf + di4 * 3;
-        double *cache = gam + di4;
-        EJKBatch bt = {NULL, 0, lanes, nt, stype, NULL, NULL, NULL};
-        if (lanes) {
-                bt.q = calloc(EJK_QCAP, sizeof(EJKQueue));
-                bt.bout = malloc(sizeof(double) * di4 * 3 * lanes);
-                bt.bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
-                bt.gams = malloc(sizeof(double) * di4 * lanes);
-        }
-        EJKOrbit o;
-        size_t t, u;
-        int ic, np;
-#pragma omp for schedule(dynamic, 1)
-        for (ic = 0; ic < nchunk; ic++) {
-                int c = nchunk - 1 - ic;
-                double *dec = de_chunks + (size_t)c * natm * 3;
-                for (t = chunk_loc[c]; t < chunk_loc[c+1]; t++) {
-                        double qt = pairs[t].q * fac;
-                        int ish = pairs[t].i;
-                        int jsh = pairs[t].j;
-                        for (u = t + 1; u-- > 0;) {
-                                if (qt * pairs[u].q <= thr) {
-                                        break;
-                                }
-                                np = _orbit_plan(&o, ish, jsh, pairs[u].i, pairs[u].j, &envs);
-                                norbit += np > 0;
-                                npass += np;
-                                if (np == 0 || o.neval == 0) {
-                                        continue;
-                                }
-                                neval += o.neval;
-                                if (lanes && int2e_ip1_sph_batch_ok(o.sh[0], bas, env)) {
-                                        _queue_orbit(dec, &o, &bt, &envs, buf, gam, cache);
-                                } else {
-                                        _orbit_eval(dec, &o, &envs, buf, gam, cache);
-                                }
-                        }
-                }
-                if (lanes) {
-                        _flush_all(dec, &bt, &envs, buf, gam, cache);
-                }
-        }
-        free(buf);
-        if (lanes) {
-                free(bt.q);
-                free(bt.bout);
-                free(bt.bcache);
-                free(bt.gams);
-        }
-}
-        if (stype != NULL) {
-                free(stype);
-        }
-        size_t nde = (size_t)natm * 3;
-        NPdset0(de, nde);
-        for (c = 0; c < nchunk; c++) {
-                double *dec = de_chunks + (size_t)c * nde;
-                for (i = 0; i < nde; i++) {
-                        de[i] += dec[i];
-                }
+        OEDriver d = {&cl, nbas, qpair, MIN(1., 2 * dmax), .5 * cutoff, (size_t)natm * 3,
+                EJK_NCHUNK, EJK_CHUNK_BUF, cl.lanes, EJK_QCAP, sizeof(EJKOrbit),
+                _thread_init, _thread_done, _plan, _eval, _eval_batch};
+        CVHFoe_run(&d, de);
+        if (cl.stype != NULL) {
+                free(cl.stype);
         }
         if (stats != NULL) {
-                stats[0] = norbit;
-                stats[1] = neval;
-                stats[2] = npass;
+                stats[0] = cl.norbit;
+                stats[1] = cl.neval;
+                stats[2] = cl.npass;
         }
-        free(de_chunks);
-        free(chunk_loc);
-        free(pairs);
+        free(qpair);
 }
 
 void CVHFgrad_jk_energy(double *de, int (*intor)(), CINTOpt *cintopt,

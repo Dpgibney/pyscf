@@ -63,9 +63,9 @@
  * out. A computed orbit takes all its integrals. cutoff = 0 computes every
  * orbit whose Gammas are not zero.
  *
- * The orbits are summed in chunks of a fixed partition of the pair list, each
- * into its own buffer, and the buffers in chunk order: the result does not
- * depend on the thread count or the schedule.
+ * The loop over the orbits, their chunks (summed in a fixed order: the result
+ * does not depend on the thread count or the schedule) and the queues of the
+ * batched integrals are those of orbit_engine.h.
  */
 
 #include <stdlib.h>
@@ -80,6 +80,7 @@
 #include "optimizer.h"
 #include "np_helper/np_helper.h"
 #include "gto/gto.h"
+#include "orbit_engine.h"
 
 // Upper limit of the chunk count: 256 left fewer part-filled batches than 1024 at the chunk ends
 // (caffeine/def2-TZVP, 10 threads: 157.5 -> 149.8 s), and is still 4 chunks per thread on 64 threads
@@ -90,16 +91,15 @@
 #define HJK_IPVIP1      1
 #define HJK_IP1IP2      2
 
-// The orders of the shells (I,J,K,L) in an evaluation
-#define O_IJKL          0
-#define O_JIKL          1
-#define O_KLIJ          2
-#define O_LKIJ          3
-#define O_IJLK          4
-#define O_JILK          5
-#define HJK_NORDER      6
-static const int _order_sh[HJK_NORDER][4] = {
-        {0, 1, 2, 3}, {1, 0, 2, 3}, {2, 3, 0, 1}, {3, 2, 0, 1}, {0, 1, 3, 2}, {1, 0, 3, 2}};
+// The orders of the shells (I,J,K,L) in an evaluation (orbit_engine.h)
+#define O_IJKL          OE_IJKL
+#define O_JIKL          OE_JIKL
+#define O_KLIJ          OE_KLIJ
+#define O_LKIJ          OE_LKIJ
+#define O_IJLK          OE_IJLK
+#define O_JILK          OE_JILK
+#define HJK_NORDER      OE_NORDER
+#define _order_sh       CVHFoe_order_sh
 
 // The evaluations of an orbit: M_cc for c = 0..3, then M_01, M_23, M_02,
 // M_03, M_12, M_13, each with the integral and the order of its shells
@@ -111,25 +111,6 @@ static const int _eval_order[HJK_NEVAL] = {
         O_IJKL, O_JIKL, O_KLIJ, O_LKIJ, O_IJKL, O_KLIJ, O_IJKL, O_IJLK, O_JIKL, O_JILK};
 // the evaluation of M_cd, c <= d
 static const int _eval_of[4][4] = {{0, 4, 6, 7}, {4, 1, 8, 9}, {6, 8, 2, 5}, {7, 9, 5, 3}};
-
-typedef struct {
-        double q;
-        int i;
-        int j;
-} HJKPair;
-
-static int _cmp_pair(const void *a, const void *b)
-{
-        const HJKPair *pa = a;
-        const HJKPair *pb = b;
-        if (pa->q != pb->q) {
-                return pa->q < pb->q ? -1 : 1;
-        }
-        if (pa->i != pb->i) {
-                return pa->i - pb->i;
-        }
-        return pa->j - pb->j;
-}
 
 /*
  * The plan of an orbit by the pattern of its atoms, grp[c] being the first
@@ -361,59 +342,6 @@ static void _gamma(double *gj, double *gk, HJKEnvs *e, const int *sh)
         } }
 }
 
-// out = g (in the layout of (I,J,K,L)) in the layout of the shell order o
-static void _permute(double *out, const double *g, int o, int di, int dj, int dk, int dl)
-{
-        const int dij = di * dj;
-        const int dkl = dk * dl;
-        int p, q, r, s, pq, rs;
-        switch (o) {
-        case O_JIKL:
-                for (rs = 0; rs < dkl; rs++) {
-                        const double *pg = g + rs * dij;
-                        double *po = out + rs * dij;
-                        for (p = 0; p < di; p++) {
-                        for (q = 0; q < dj; q++) {
-                                po[q+dj*p] = pg[p+di*q];
-                        } }
-                }
-                break;
-        case O_KLIJ:
-                for (pq = 0; pq < dij; pq++) {
-                for (rs = 0; rs < dkl; rs++) {
-                        out[rs+dkl*pq] = g[pq+dij*rs];
-                } }
-                break;
-        case O_LKIJ:
-                for (pq = 0; pq < dij; pq++) {
-                for (r = 0; r < dk; r++) {
-                for (s = 0; s < dl; s++) {
-                        out[s+dl*(r+dk*pq)] = g[pq+dij*(r+dk*s)];
-                } } }
-                break;
-        case O_IJLK:
-                for (r = 0; r < dk; r++) {
-                for (s = 0; s < dl; s++) {
-                        memcpy(out + dij * (s + dl * r), g + dij * (r + dk * s),
-                               sizeof(double) * dij);
-                } }
-                break;
-        case O_JILK:
-                for (r = 0; r < dk; r++) {
-                for (s = 0; s < dl; s++) {
-                        const double *pg = g + dij * (r + dk * s);
-                        double *po = out + dij * (s + dl * r);
-                        for (p = 0; p < di; p++) {
-                        for (q = 0; q < dj; q++) {
-                                po[q+dj*p] = pg[p+di*q];
-                        } }
-                } }
-                break;
-        default:
-                memcpy(out, g, sizeof(double) * dij * dkl);
-        }
-}
-
 // m[n][x] = sum_i buf[x*nf+i] g[n*nf+i] for the 9 components x and the nh
 // (1 or 2) Gammas g
 static void _contract(double m[2][9], const double *buf, const double *g, int nh, size_t nf)
@@ -572,7 +500,7 @@ static void _orbit_eval(double *h, size_t ntri, HJKOrbit *o, HJKEnvs *e,
                 double *g = gam;
                 if (ord != O_IJKL) {
                         for (n = 0; n < nh; n++) {
-                                _permute(gperm + n * nf, gam + n * nf, ord,
+                                CVHFoe_permute(gperm + n * nf, gam + n * nf, ord,
                                          dims[0], dims[1], dims[2], dims[3]);
                         }
                         g = gperm;
@@ -638,54 +566,148 @@ int int2e_ip1ip2_sph_batch_dot(double *out, int nq, int *shls, int *atm, int nat
                                int nbas, double *env, const double *gam, int ng, double *cache)
         __attribute__((weak));
 
-#define HJK_MAX_LANES   8
+#define HJK_MAX_LANES   OE_MAX_LANES
 #define HJK_QCAP        4096    // hash table entries per thread, a power of 2
 
+// The client of orbit_engine.h
 typedef struct {
-        uint64_t key;           // 0: empty
-        int n;
-        HJKOrbit o[HJK_MAX_LANES];
-} HJKQueue;
-
-typedef struct {
-        HJKQueue *q;
-        int nused;
+        HJKEnvs *e;
+        size_t ntri;
         int lanes;
         int nt;                 // shell types
         int *stype;
+        int dot;                // the integrals contracted with the Gammas inside qcint's kernels
+        size_t di4;
+        size_t cache_size;
+        int *ncross_of;
+        double norbit;
+        double neval;
+        double ncross;
+        double nbatched;        // orbits through the batched integrals
+} HJKClient;
+
+typedef struct {
+        double *buf;
+        double *gam;
+        double *gperm;
+        double *cache;
         double *bout;           // lanes * 9 * the largest block (at least 2: the sums of _dot)
         double *bcache;
         double *gams;           // lanes * nh * the largest block
-        double *gperm;          // the same, in the order of an evaluation
-        double nbatched;        // orbits through the batched integrals
-        int dot;                // the integrals contracted with the Gammas inside qcint's kernels
-} HJKBatch;
+        double *gpermb;         // the same, in the order of an evaluation
+        double norbit;
+        double neval;
+        double ncross;
+        double nbatched;
+} HJKThread;
 
-static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJKEnvs *e,
-                          double *buf, double *gam, double *gperm, double *cache)
+static void *_thread_init(void *ctx)
 {
-        int q, ev, ord, c, n;
-        if (2 * Q->n < bt->lanes) {
-                for (q = 0; q < Q->n; q++) {
-                        _orbit_eval(h, ntri, Q->o + q, e, buf, gam, gperm, cache);
-                }
-                Q->n = 0;
-                return;
+        HJKClient *cl = ctx;
+        const int nh = cl->e->nh;
+        const size_t di4 = cl->di4;
+        HJKThread *th = calloc(1, sizeof(HJKThread));
+        th->buf = malloc(sizeof(double) * (di4 * (9 + 2 * nh) + cl->cache_size));
+        th->gam = th->buf + di4 * 9;
+        th->gperm = th->gam + di4 * nh;
+        th->cache = th->gperm + di4 * nh;
+        if (cl->lanes) {
+                const int lanes = cl->lanes;
+                // a block of 9 x nf integrals per quartet, or 9 x nh sums (_dot): nh (2) is more
+                // than nf when every shell is an s shell
+                th->bout = malloc(sizeof(double) * MAX(di4, 2) * 9 * lanes);
+                th->bcache = malloc(sizeof(double) * int2e_hess_sph_batch_cache_size());
+                th->gams = malloc(sizeof(double) * di4 * nh * lanes);
+                th->gpermb = malloc(sizeof(double) * di4 * nh * lanes);
         }
+        return th;
+}
+
+static void _thread_done(void *ctx, void *pth)
+{
+        HJKClient *cl = ctx;
+        HJKThread *th = pth;
+        cl->norbit += th->norbit;
+        cl->neval += th->neval;
+        cl->ncross += th->ncross;
+        cl->nbatched += th->nbatched;
+        free(th->buf);
+        if (cl->lanes) {
+                free(th->bout);
+                free(th->bcache);
+                free(th->gams);
+                free(th->gpermb);
+        }
+        free(th);
+}
+
+static int _plan(void *ctx, void *pth, int ish, int jsh, int ksh, int lsh,
+                 void *orbit, uint64_t *key)
+{
+        HJKClient *cl = ctx;
+        HJKThread *th = pth;
+        HJKEnvs *e = cl->e;
+        if (!_orbit_screen(e, ish, jsh, ksh, lsh)) {
+                return 0;
+        }
+        HJKOrbit *o = orbit;
+        _orbit_init(o, e, ish, jsh, ksh, lsh);
+        HJKPlan *pl = e->plans + o->code;
+        if (pl->mask == 0) {
+                return 0;
+        }
+        th->norbit += 1;
+        th->neval += __builtin_popcount(pl->mask);
+        th->ncross += cl->ncross_of[o->code];
+        *key = 0;
+        if (cl->lanes && int2e_ipip1_sph_batch_ok(o->sh, e->bas, e->env)) {
+                // the types (l, number of primitives) of the 4 shells and the pattern of the atoms,
+                // so that the orbits of a queue need the same integral classes
+                const int *sh = o->sh;
+                const uint64_t nt = cl->nt;
+                *key = ((((cl->stype[sh[0]] * nt + cl->stype[sh[1]]) * nt +
+                          cl->stype[sh[2]]) * nt + cl->stype[sh[3]]) * HJK_NCODE + o->code) + 1;
+        }
+        return 1;
+}
+
+static void _eval(void *ctx, void *pth, double *acc, void *orbit)
+{
+        HJKClient *cl = ctx;
+        HJKThread *th = pth;
+        _orbit_eval(acc, cl->ntri, orbit, cl->e, th->buf, th->gam, th->gperm, th->cache);
+}
+
+/*
+ * Several orbits at once: qcint's int2e_ipip1_sph_batch, int2e_ipvip1_sph_batch
+ * and int2e_ip1ip2_sph_batch (cint2e_batch.c) for the orbits whose quartets
+ * int2e_ipip1_sph_batch_ok takes, one evaluation of the plan at a time for all
+ * of them; their _dot kernels contract the integrals with the Gammas inside
+ * qcint where it offers them. Weak: libcint and older qcint have none of these
+ * functions.
+ */
+static void _eval_batch(void *ctx, void *pth, double *h, void *orbits, int nq)
+{
+        HJKClient *cl = ctx;
+        HJKThread *th = pth;
+        HJKEnvs *e = cl->e;
+        HJKOrbit *os = orbits;
+        const size_t ntri = cl->ntri;
+        int q, ev, ord, c, n;
         int (*fbatch[3])() = {int2e_ipip1_sph_batch, int2e_ipvip1_sph_batch,
                               int2e_ip1ip2_sph_batch};
         int (*fdot[3])() = {int2e_ipip1_sph_batch_dot, int2e_ipvip1_sph_batch_dot,
                             int2e_ip1ip2_sph_batch_dot};
-        HJKPlan *pl = e->plans + Q->o[0].code;
-        bt->nbatched += Q->n;
+        HJKPlan *pl = e->plans + os[0].code;
+        th->nbatched += nq;
         int dims[4];
-        _orbit_dims(dims, Q->o, e->ao_loc);
+        _orbit_dims(dims, os, e->ao_loc);
         const size_t nf = (size_t)dims[0] * dims[1] * dims[2] * dims[3];
         const int nh = e->nh;
         const size_t ng = nf * nh;
-        for (q = 0; q < Q->n; q++) {
-                double *g = bt->gams + ng * q;
-                _gamma(g, g + nf * e->with_j, e, Q->o[q].sh);
+        for (q = 0; q < nq; q++) {
+                double *g = th->gams + ng * q;
+                _gamma(g, g + nf * e->with_j, e, os[q].sh);
         }
         double m[HJK_MAX_LANES][2][HJK_NEVAL][9];
         double mt[2][9];
@@ -698,17 +720,17 @@ static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJK
                 if (!any) {
                         continue;
                 }
-                double *g = bt->gams;
+                double *g = th->gams;
                 if (ord != O_IJKL) {
-                        for (q = 0; q < Q->n * nh; q++) {
-                                _permute(bt->gperm + nf * q, bt->gams + nf * q, ord,
-                                         dims[0], dims[1], dims[2], dims[3]);
+                        for (q = 0; q < nq * nh; q++) {
+                                CVHFoe_permute(th->gpermb + nf * q, th->gams + nf * q, ord,
+                                               dims[0], dims[1], dims[2], dims[3]);
                         }
-                        g = bt->gperm;
+                        g = th->gpermb;
                 }
-                for (q = 0; q < Q->n; q++) {
+                for (q = 0; q < nq; q++) {
                         for (c = 0; c < 4; c++) {
-                                shls[4*q+c] = Q->o[q].sh[_order_sh[ord][c]];
+                                shls[4*q+c] = os[q].sh[_order_sh[ord][c]];
                         }
                 }
                 for (ev = 0; ev < HJK_NEVAL; ev++) {
@@ -716,73 +738,31 @@ static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJK
                                 continue;
                         }
                         int k = _eval_intor[ev];
-                        if (bt->dot) {
-                                (*fdot[k])(bt->bout, Q->n, shls, e->atm, e->natm, e->bas,
-                                           e->nbas, e->env, g, nh, bt->bcache);
-                                for (q = 0; q < Q->n; q++) {
+                        if (cl->dot) {
+                                (*fdot[k])(th->bout, nq, shls, e->atm, e->natm, e->bas,
+                                           e->nbas, e->env, g, nh, th->bcache);
+                                for (q = 0; q < nq; q++) {
                                         for (n = 0; n < nh; n++) {
-                                                memcpy(m[q][n][ev], bt->bout + (q * nh + n) * 9,
+                                                memcpy(m[q][n][ev], th->bout + (q * nh + n) * 9,
                                                        sizeof(double) * 9);
                                         }
                                 }
                                 continue;
                         }
-                        (*fbatch[k])(bt->bout, Q->n, shls, e->atm, e->natm,
-                                     e->bas, e->nbas, e->env, NULL, bt->bcache);
-                        for (q = 0; q < Q->n; q++) {
-                                _contract(mt, bt->bout + 9 * nf * q, g + ng * q, nh, nf);
+                        (*fbatch[k])(th->bout, nq, shls, e->atm, e->natm,
+                                     e->bas, e->nbas, e->env, NULL, th->bcache);
+                        for (q = 0; q < nq; q++) {
+                                _contract(mt, th->bout + 9 * nf * q, g + ng * q, nh, nf);
                                 for (n = 0; n < nh; n++) {
                                         memcpy(m[q][n][ev], mt[n], sizeof(double) * 9);
                                 }
                         }
                 }
         }
-        for (q = 0; q < Q->n; q++) {
+        for (q = 0; q < nq; q++) {
                 for (n = 0; n < nh; n++) {
-                        _orbit_add(h + ntri * 9 * n, Q->o + q, pl, m[q][n]);
+                        _orbit_add(h + ntri * 9 * n, os + q, pl, m[q][n]);
                 }
-        }
-        Q->n = 0;
-}
-
-static void _flush_all(double *h, size_t ntri, HJKBatch *bt, HJKEnvs *e,
-                       double *buf, double *gam, double *gperm, double *cache)
-{
-        int x;
-        for (x = 0; x < HJK_QCAP; x++) {
-                HJKQueue *Q = bt->q + x;
-                if (Q->key != 0 && Q->n > 0) {
-                        _flush_orbits(h, ntri, Q, bt, e, buf, gam, gperm, cache);
-                }
-                Q->key = 0;
-        }
-        bt->nused = 0;
-}
-
-// Queues the orbit o, evaluating its queue when full
-static void _queue_orbit(double *h, size_t ntri, HJKOrbit *o, HJKBatch *bt, HJKEnvs *e,
-                         double *buf, double *gam, double *gperm, double *cache)
-{
-        const int *sh = o->sh;
-        const uint64_t nt = bt->nt;
-        uint64_t key = ((((bt->stype[sh[0]] * nt + bt->stype[sh[1]]) * nt +
-                          bt->stype[sh[2]]) * nt + bt->stype[sh[3]]) * HJK_NCODE + o->code) + 1;
-        if (bt->nused * 4 >= HJK_QCAP * 3) {
-                _flush_all(h, ntri, bt, e, buf, gam, gperm, cache);
-        }
-        size_t x = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 52) & (HJK_QCAP - 1);
-        while (bt->q[x].key != 0 && bt->q[x].key != key) {
-                x = (x + 1) & (HJK_QCAP - 1);
-        }
-        HJKQueue *Q = bt->q + x;
-        if (Q->key == 0) {
-                Q->key = key;
-                Q->n = 0;
-                bt->nused++;
-        }
-        Q->o[Q->n] = *o;
-        if (++Q->n == bt->lanes) {
-                _flush_orbits(h, ntri, Q, bt, e, buf, gam, gperm, cache);
         }
 }
 
@@ -796,9 +776,10 @@ static void _queue_orbit(double *h, size_t ntri, HJKOrbit *o, HJKBatch *bt, HJKE
  * stats, if not NULL, receives the counts of orbits computed, of their
  * integral evaluations, of their cross-atom centre pairs, and of the orbits
  * through the batched integrals.
- * int2e_batch: several orbits at once where qcint offers that (HJKQueue), their
- * integrals contracted with the Gammas in qcint's kernels where it offers that
- * (int2e_*_sph_batch_dot); 2: the batched integrals contracted here.
+ * int2e_batch: several orbits at once where qcint offers that (the queues of
+ * orbit_engine.h), their integrals contracted with the Gammas in qcint's
+ * kernels where it offers that (int2e_*_sph_batch_dot); 2: the batched
+ * integrals contracted here.
  */
 void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cintopts,
                         double *q_cond, double *dm_cond, double cutoff,
@@ -833,7 +814,7 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
         const double *qv = envs.qv;
         const double *q1 = envs.q;
         size_t i;
-        int ish, jsh;
+        int ish, jsh, k;
 
         // A pair (I,J) bounds every term of Q: qd[I,J], qd[J,I], qv[I,J], q[I,J] <= q.
         // An orbit passes only if Q > cutoff and Q * D > cutoff, D <= 2 * max(dm_cond).
@@ -841,102 +822,21 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
         for (i = 0; i < nbas2; i++) {
                 dmax = MAX(dmax, dm_cond[i]);
         }
-        const double fac = MIN(1., 2 * dmax);
-        size_t npair = nbas2 / 2 + nbas;
-        HJKPair *pairs = malloc(sizeof(HJKPair) * npair);
-        double qmax = 0;
-        size_t nsig = 0;
+        double *qpair = malloc(sizeof(double) * nbas2);
         for (ish = 0; ish < nbas; ish++) {
         for (jsh = 0; jsh <= ish; jsh++) {
                 double q = MAX(qd[ish*nbas+jsh], qd[jsh*nbas+ish]);
                 q = MAX(q, qv[ish*nbas+jsh]);
-                q = MAX(q, q1[ish*nbas+jsh]);
-                qmax = MAX(qmax, q);
-                pairs[nsig].q = q;
-                pairs[nsig].i = ish;
-                pairs[nsig].j = jsh;
-                nsig++;
+                qpair[ish*nbas+jsh] = MAX(q, q1[ish*nbas+jsh]);
         } }
-        npair = nsig;
-        nsig = 0;
-        for (i = 0; i < npair; i++) {
-                if (pairs[i].q * qmax * fac > cutoff) {
-                        pairs[nsig] = pairs[i];
-                        nsig++;
-                }
-        }
-        // Ascending q: for pair t the partners u <= t are visited from t
-        // down, and the bound decreases, so the loop stops at the first that
-        // fails it.
-        qsort(pairs, nsig, sizeof(HJKPair), _cmp_pair);
-
-        // Chunks of equal (t+1) sums, taken heaviest first
-        const size_t chunk_size = ntri * 9 * envs.nh;
-        int nchunk = MIN(HJK_NCHUNK, max_buf / chunk_size);
-        nchunk = MIN(nchunk, (int)nsig);
-        nchunk = MAX(nchunk, 1);
-        size_t *chunk_loc = malloc(sizeof(size_t) * (nchunk + 1));
-        double area = (double)nsig * (nsig + 1) / 2;
-        int c = 0;
-        chunk_loc[0] = 0;
-        for (i = 0; i < nsig && c < nchunk - 1; i++) {
-                if ((double)(i+1) * (i+2) / 2 >= area * (c + 1) / nchunk) {
-                        c++;
-                        chunk_loc[c] = i + 1;
-                }
-        }
-        for (c++; c <= nchunk; c++) {
-                chunk_loc[c] = nsig;
-        }
-        double *h_chunks = calloc((size_t)nchunk * chunk_size, sizeof(double));
 
         int shls_slice[8] = {0, nbas, 0, nbas, 0, nbas, 0, nbas};
         size_t di = GTOmax_shell_dim(ao_loc, shls_slice, 1);
-        size_t di4 = di * di * di * di;
         size_t cache_size = 0;
-        int k;
         for (k = 0; k < 3; k++) {
                 cache_size = MAX(cache_size, GTOmax_cache_size(intors[k], shls_slice, 4,
                                                                atm, natm, bas, nbas, env));
         }
-        double norbit = 0;
-        double neval = 0;
-        double ncross = 0;
-        double nbatched = 0;
-
-        // the queues of orbits for the batched integrals, by shell type (l, nprim)
-        int lanes = 0;
-        int nt = 0;
-        int *stype = NULL;
-        if (int2e_batch && int2e_ipip1_sph_batch != NULL && int2e_ipvip1_sph_batch != NULL &&
-            int2e_ip1ip2_sph_batch != NULL && int2e_ipip1_sph_batch_ok != NULL &&
-            int2e_sph_batch_lanes != NULL && int2e_hess_sph_batch_cache_size != NULL &&
-            intors[0] == int2e_ipip1_sph && intors[1] == int2e_ipvip1_sph &&
-            intors[2] == int2e_ip1ip2_sph && env[PTR_RANGE_OMEGA] >= 0) {
-                lanes = MIN(int2e_sph_batch_lanes(), HJK_MAX_LANES);
-                stype = malloc(sizeof(int) * nbas * 3);
-                int *tl = stype + nbas;
-                int *tp = tl + nbas;
-                int s, t;
-                for (s = 0; s < nbas; s++) {
-                        for (t = 0; t < nt; t++) {
-                                if (tl[t] == bas[ANG_OF+s*BAS_SLOTS] &&
-                                    tp[t] == bas[NPRIM_OF+s*BAS_SLOTS]) {
-                                        break;
-                                }
-                        }
-                        if (t == nt) {
-                                tl[t] = bas[ANG_OF+s*BAS_SLOTS];
-                                tp[t] = bas[NPRIM_OF+s*BAS_SLOTS];
-                                nt++;
-                        }
-                        stype[s] = t;
-                }
-        }
-        // int2e_*_sph_batch_dot: qcint contracts the batched integrals with the Gammas (int2e_batch 2
-        // keeps the contraction here, for tests)
-        const int use_dot = lanes && int2e_batch == 1 && int2e_ipip1_sph_batch_dot != NULL &&
-                int2e_ipvip1_sph_batch_dot != NULL && int2e_ip1ip2_sph_batch_dot != NULL;
         // cross-atom centre pairs of each pattern
         int ncross_of[HJK_NCODE];
         for (k = 0; k < HJK_NCODE; k++) {
@@ -947,77 +847,51 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
                         ncross_of[k] += plans[k].valid && plans[k].grp[a] != plans[k].grp[b];
                 } }
         }
+        HJKClient cl = {&envs, ntri, 0, 0, NULL, 0, di * di * di * di, cache_size, ncross_of,
+                        0, 0, 0, 0};
 
-#pragma omp parallel reduction(+:norbit, neval, ncross, nbatched)
-{
-        const int nh = envs.nh;
-        double *buf = malloc(sizeof(double) * (di4 * (9 + 2 * nh) + cache_size));
-        double *gam = buf + di4 * 9;
-        double *gperm = gam + di4 * nh;
-        double *cache = gperm + di4 * nh;
-        HJKBatch bt = {NULL, 0, lanes, nt, stype, NULL, NULL, NULL, NULL, 0, use_dot};
-        if (lanes) {
-                bt.q = calloc(HJK_QCAP, sizeof(HJKQueue));
-                // a block of 9 x nf integrals per quartet, or 9 x nh sums (_dot): nh (2) is more
-                // than nf when every shell is an s shell
-                bt.bout = malloc(sizeof(double) * MAX(di4, 2) * 9 * lanes);
-                bt.bcache = malloc(sizeof(double) * int2e_hess_sph_batch_cache_size());
-                bt.gams = malloc(sizeof(double) * di4 * nh * lanes);
-                bt.gperm = malloc(sizeof(double) * di4 * nh * lanes);
-        }
-        HJKOrbit o;
-        size_t t, u;
-        int ic;
-#pragma omp for schedule(dynamic, 1)
-        for (ic = 0; ic < nchunk; ic++) {
-                int c = nchunk - 1 - ic;
-                double *hc = h_chunks + (size_t)c * chunk_size;
-                for (t = chunk_loc[c]; t < chunk_loc[c+1]; t++) {
-                        double qt = pairs[t].q * fac;
-                        int ish = pairs[t].i;
-                        int jsh = pairs[t].j;
-                        for (u = t + 1; u-- > 0;) {
-                                if (qt * pairs[u].q <= cutoff) {
+        // the queues of orbits for the batched integrals, by shell type (l, nprim)
+        if (int2e_batch && int2e_ipip1_sph_batch != NULL && int2e_ipvip1_sph_batch != NULL &&
+            int2e_ip1ip2_sph_batch != NULL && int2e_ipip1_sph_batch_ok != NULL &&
+            int2e_sph_batch_lanes != NULL && int2e_hess_sph_batch_cache_size != NULL &&
+            intors[0] == int2e_ipip1_sph && intors[1] == int2e_ipvip1_sph &&
+            intors[2] == int2e_ip1ip2_sph && env[PTR_RANGE_OMEGA] >= 0) {
+                cl.lanes = MIN(int2e_sph_batch_lanes(), HJK_MAX_LANES);
+                cl.stype = malloc(sizeof(int) * nbas * 3);
+                int *tl = cl.stype + nbas;
+                int *tp = tl + nbas;
+                int s, t;
+                for (s = 0; s < nbas; s++) {
+                        for (t = 0; t < cl.nt; t++) {
+                                if (tl[t] == bas[ANG_OF+s*BAS_SLOTS] &&
+                                    tp[t] == bas[NPRIM_OF+s*BAS_SLOTS]) {
                                         break;
                                 }
-                                int ksh = pairs[u].i;
-                                int lsh = pairs[u].j;
-                                if (!_orbit_screen(&envs, ish, jsh, ksh, lsh)) {
-                                        continue;
-                                }
-                                _orbit_init(&o, &envs, ish, jsh, ksh, lsh);
-                                HJKPlan *pl = plans + o.code;
-                                if (pl->mask == 0) {
-                                        continue;
-                                }
-                                norbit += 1;
-                                neval += __builtin_popcount(pl->mask);
-                                ncross += ncross_of[o.code];
-                                if (lanes && int2e_ipip1_sph_batch_ok(o.sh, bas, env)) {
-                                        _queue_orbit(hc, ntri, &o, &bt, &envs, buf, gam, gperm, cache);
-                                } else {
-                                        _orbit_eval(hc, ntri, &o, &envs, buf, gam, gperm, cache);
-                                }
                         }
+                        if (t == cl.nt) {
+                                tl[t] = bas[ANG_OF+s*BAS_SLOTS];
+                                tp[t] = bas[NPRIM_OF+s*BAS_SLOTS];
+                                cl.nt++;
+                        }
+                        cl.stype[s] = t;
                 }
-                if (lanes) {
-                        _flush_all(hc, ntri, &bt, &envs, buf, gam, gperm, cache);
-                }
         }
-        free(buf);
-        if (lanes) {
-                free(bt.q);
-                free(bt.bout);
-                free(bt.bcache);
-                free(bt.gams);
-                free(bt.gperm);
+        // int2e_*_sph_batch_dot: qcint contracts the batched integrals with the Gammas (int2e_batch 2
+        // keeps the contraction here, for tests)
+        cl.dot = cl.lanes && int2e_batch == 1 && int2e_ipip1_sph_batch_dot != NULL &&
+                int2e_ipvip1_sph_batch_dot != NULL && int2e_ip1ip2_sph_batch_dot != NULL;
+
+        // the blocks A > B of each Gamma
+        const size_t chunk_size = ntri * 9 * envs.nh;
+        double *tri = malloc(sizeof(double) * chunk_size);
+        OEDriver d = {&cl, nbas, qpair, MIN(1., 2 * dmax), cutoff, chunk_size,
+                HJK_NCHUNK, max_buf, cl.lanes, HJK_QCAP, sizeof(HJKOrbit),
+                _thread_init, _thread_done, _plan, _eval, _eval_batch};
+        CVHFoe_run(&d, tri);
+        if (cl.stype != NULL) {
+                free(cl.stype);
         }
-        nbatched += bt.nbatched;
-}
-        if (stype != NULL) {
-                free(stype);
-        }
-        // the blocks A > B in chunk order, then B < A and the diagonal blocks
+        // B < A and the diagonal blocks
         double *hs[2] = {hj, hk};
         int n = 0;
         for (k = 0; k < 2; k++) {
@@ -1025,17 +899,11 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
                 if (h == NULL || (k == 1 && !envs.with_k)) {
                         continue;
                 }
-                double *tri = calloc(ntri * 9, sizeof(double));
-                for (c = 0; c < nchunk; c++) {
-                        double *hc = h_chunks + (size_t)c * chunk_size + ntri * 9 * n;
-                        for (i = 0; i < ntri * 9; i++) {
-                                tri[i] += hc[i];
-                        }
-                }
+                double *tn = tri + ntri * 9 * n;
                 int ia, ib, x, y;
                 for (ia = 0; ia < natm; ia++) {
                 for (ib = 0; ib < ia; ib++) {
-                        double *v = tri + ((size_t)ia * (ia - 1) / 2 + ib) * 9;
+                        double *v = tn + ((size_t)ia * (ia - 1) / 2 + ib) * 9;
                         double *hab = h + ((size_t)ia * natm + ib) * 9;
                         double *hba = h + ((size_t)ib * natm + ia) * 9;
                         for (x = 0; x < 3; x++) {
@@ -1056,16 +924,14 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
                                 }
                         }
                 }
-                free(tri);
                 n++;
         }
         if (stats != NULL) {
-                stats[0] = norbit;
-                stats[1] = neval;
-                stats[2] = ncross;
-                stats[3] = nbatched;
+                stats[0] = cl.norbit;
+                stats[1] = cl.neval;
+                stats[2] = cl.ncross;
+                stats[3] = cl.nbatched;
         }
-        free(h_chunks);
-        free(chunk_loc);
-        free(pairs);
+        free(tri);
+        free(qpair);
 }
