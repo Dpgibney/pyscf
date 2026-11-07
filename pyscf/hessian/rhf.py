@@ -29,11 +29,22 @@ from pyscf import gto
 from pyscf.lib import logger
 from pyscf.scf import _vhf, hf
 from pyscf.scf import cphf
+from pyscf import __config__
 
 # import _response_functions to load gen_response methods in SCF class
 from pyscf.scf import _response_functions
 # import pyscf.grad.rhf to activate nuc_grad_method method
 from pyscf.grad import rhf
+
+# _partial_hess_2e takes the two-electron blocks from hess_jk_energy when atmlst holds every atom
+JK_ENERGY = getattr(__config__, 'hessian_rhf_jk_energy', True)
+# The screening threshold of hess_jk_energy (that of the _VHFOpt of _make_vhfopt). 0 computes every shell
+# quartet whose densities are not zero, as the loops of _partial_hess_2e do: _make_vhfopt finds no int2e_ip1ip2
+# etc. in libcvhf (they are int2e_ip1ip2_sph etc.), so their integrals are not screened.
+JK_ENERGY_TOL = getattr(__config__, 'hessian_rhf_jk_energy_tol', 1e-14)
+# The memory (MB) hess_jk_energy's chunk buffers may take; fixed, so that the results do not depend on the memory
+# available
+JK_ENERGY_BUF = 128
 
 
 def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
@@ -185,6 +196,12 @@ def _partial_hess_2e(mol, dm_j, dms_k, k_fac, atmlst, with_j=True, with_k=True,
     nset = len(dms_k)
     if not with_j and nset == 0:
         return ej, ek
+    by_ti = sorted(atmlst) == list(range(mol.natm))
+    if JK_ENERGY and by_ti:
+        with mol.with_range_coulomb(omega):
+            ej, ek = hess_jk_energy(mol, dm_j if with_j else None, dms_k, k_fac, verbose=log)
+        log.timer_debug1('two-electron blocks (hess_jk_energy)', *t1)
+        return ej[atmlst][:,atmlst], ek[atmlst][:,atmlst]
     nj = int(with_j)
     if omega is None:
         ipip1_opt = _make_vhfopt(mol, dm_j, 'ipip1', 'int2e_ipip1ipip2')
@@ -193,7 +210,6 @@ def _partial_hess_2e(mol, dm_j, dms_k, k_fac, atmlst, with_j=True, with_k=True,
     else:
         ipip1_opt = ip1ip2_opt = ipvip1_opt = None
     aoslices = mol.aoslice_by_atom()
-    by_ti = sorted(atmlst) == list(range(mol.natm))
 
     with mol.with_range_coulomb(omega):
         if not by_ti:
@@ -268,6 +284,72 @@ def _partial_hess_2e(mol, dm_j, dms_k, k_fac, atmlst, with_j=True, with_k=True,
         for i0 in range(natm):
             ej[i0, i0] = -ej[i0].sum(axis=0)
             ek[i0, i0] = -ek[i0].sum(axis=0)
+    return ej, ek
+
+def hess_jk_energy(mol, dm_j, dms_k, k_fac, tol=None, stats=None, verbose=None):
+    '''The ej, ek of _partial_hess_2e for every atom [natm,natm,3,3]: the second derivatives of
+        E_J = 1/2 sum_pqrs (pq|rs) Dj_pq Dj_rs,   E_K = k_fac/4 sum_n sum_pqrs (pq|rs) Dk[n]_pr Dk[n]_qs
+    at fixed densities, contracted with the densities inside the integral loop: no J/K matrices are
+    built, each s8 orbit of shell quartets is visited once, and translational invariance spares
+    integrals of the orbits whose centres share atoms (lib/vhf/hess_jk_energy.c). dm_j None: no E_J;
+    dms_k empty: no E_K. The densities must be symmetric. The operator is the current one of mol
+    (mol.with_range_coulomb).
+
+    tol: the screening threshold (JK_ENERGY_TOL); every shell quartet of the integrals of
+    CVHFip1ip2_prescreen and CVHFipvip1_prescreen at this threshold is computed. stats, a list, receives
+    the counts of the orbits computed, of their integral evaluations, of the cross-atom centre pairs the
+    loops of _partial_hess_2e would evaluate for them, and of the orbits through qcint's batched
+    integrals.
+    '''
+    log = logger.new_logger(mol, verbose)
+    if tol is None:
+        tol = JK_ENERGY_TOL
+    libcvhf = _vhf.libcvhf
+    natm = mol.natm
+    nbas = mol.nbas
+    ej = numpy.zeros((natm, natm, 3, 3))
+    ek = numpy.zeros((natm, natm, 3, 3))
+    dms = [] if dm_j is None else [dm_j]
+    dms = numpy.asarray(dms + list(dms_k), order='C', dtype=numpy.double)
+    if len(dms) == 0:
+        return ej, ek
+    dmj = dms[0] if dm_j is not None else None
+    dmk = dms[len(dms)-len(dms_k):]
+    nk = len(dmk)
+
+    ao_loc = mol.ao_loc_nr()
+    c_atm = mol._atm.ctypes
+    c_bas = mol._bas.ctypes
+    c_env = mol._env.ctypes
+    q_cond = numpy.empty((3, nbas, nbas))
+    with mol.with_integral_screen(max(tol, 1e-150)**2):
+        for q, fqcond, intor in ((q_cond[0], 'CVHFnr_int2e_pp_q_cond', 'int2e_ip1ip2'),
+                                 (q_cond[1], 'CVHFnr_int2e_pppp_q_cond', 'int2e_ipvip1ipvip2'),
+                                 (q_cond[2], 'CVHFnr_int2e_q_cond', 'int2e')):
+            getattr(libcvhf, fqcond)(
+                getattr(libcvhf, mol._add_suffix(intor)), lib.c_null_ptr(), q.ctypes,
+                ao_loc.ctypes, c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
+    dm_cond = numpy.empty((nbas, nbas))
+    libcvhf.CVHFnr_dm_cond1(dm_cond.ctypes, dms.ctypes, ctypes.c_int(len(dms)), ao_loc.ctypes,
+                            c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
+
+    intors = [mol._add_suffix('int2e_'+key) for key in ('ipip1', 'ipvip1', 'ip1ip2')]
+    cintopts = [_vhf.make_cintopt(mol._atm, mol._bas, mol._env, intor) for intor in intors]
+    c_intors = (ctypes.c_void_p*3)(*[ctypes.cast(getattr(libcvhf, intor), ctypes.c_void_p).value
+                                     for intor in intors])
+    c_cintopts = (ctypes.c_void_p*3)(*[opt.value for opt in cintopts])
+    c_stats = numpy.zeros(4)
+    libcvhf.CVHFhess_jk_energy(
+        ej.ctypes if dmj is not None else lib.c_null_ptr(), ek.ctypes if nk else lib.c_null_ptr(),
+        c_intors, c_cintopts, q_cond.ctypes, dm_cond.ctypes, ctypes.c_double(tol),
+        lib.c_null_ptr() if dmj is None else dmj.ctypes, dmk.ctypes, ctypes.c_int(nk),
+        ctypes.c_double(k_fac), ctypes.c_size_t(int(JK_ENERGY_BUF * 1e6 / 8)), c_stats.ctypes,
+        ctypes.c_int(1 if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+        c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
+    log.debug1('hess_jk_energy: %d shell quartet orbits, %d integral evaluations '
+               '(%d cross-atom centre pairs), %d orbits batched', *c_stats)
+    if stats is not None:
+        stats.extend(c_stats)
     return ej, ek
 
 def _make_vhfopt(mol, dms, key, vhf_intor):

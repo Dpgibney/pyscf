@@ -268,6 +268,42 @@ class KnownValues(unittest.TestCase):
             self.assertTrue(abs(a).max() > 1e-2)
             self.assertAlmostEqual(abs(a - b).max(), 0, 9)
 
+    def test_hess_jk_energy(self):
+        # The two-electron blocks contracted with the densities inside the integral loop
+        # (hess_jk_energy) against the loops over atoms of _partial_hess_2e: RHF, spin densities, J or
+        # K alone, long- and short-range K, cartesian functions, atoms out of order, with and without
+        # the screening, batched integrals and not
+        from pyscf.scf import _vhf
+        from pyscf.hessian import rhf as rhf_hess
+        for cart in (False, True):
+            mol1 = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587; He .2 .1 2.4',
+                         basis={'default': 'def2-tzvp', 'He': 'cc-pvdz'}, cart=cart, verbose=0)
+            dm = scf.RHF(mol1).run().make_rdm1()
+            a = numpy.random.RandomState(4).rand(mol1.nao, mol1.nao) * .05
+            dma, dmb = dm * .5 + a + a.T, dm * .5 - a - a.T
+            natm = mol1.natm
+            for dm_j, dms_k, k_fac, omega in ((dm, [dm], 1, None),
+                                              (dma + dmb, [dma, dmb], 2, None),
+                                              (dm, [], 1, None),
+                                              (None, [dm], 1, .3),
+                                              (None, [dm], 1, -.3)):
+                with_j = dm_j is not None
+                with_k = len(dms_k) > 0
+                for atmlst in (range(natm), [2, 0, 3, 1]):
+                    with lib.temporary_env(rhf_hess, JK_ENERGY=False):
+                        ref = rhf_hess._partial_hess_2e(mol1, dm_j, dms_k, k_fac, atmlst,
+                                                        with_j=with_j, with_k=with_k, omega=omega)
+                    for tol, batch in ((0, True), (1e-14, True), (0, False)):
+                        with lib.temporary_env(rhf_hess, JK_ENERGY_TOL=tol), \
+                                lib.temporary_env(_vhf, INT2E_BATCH=batch):
+                            ej, ek = rhf_hess._partial_hess_2e(mol1, dm_j, dms_k, k_fac, atmlst,
+                                                               with_j=with_j, with_k=with_k,
+                                                               omega=omega)
+                        self.assertTrue(abs(ref[0]).max() > 1e-2 or not with_j)
+                        self.assertTrue(abs(ref[1]).max() > 1e-2 or not with_k)
+                        self.assertAlmostEqual(abs(ej - ref[0]).max(), 0, 11)
+                        self.assertAlmostEqual(abs(ek - ref[1]).max(), 0, 11)
+
 
 if __name__ == "__main__":
     print("Full Tests for RHF Hessian")

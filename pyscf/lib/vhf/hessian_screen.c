@@ -306,7 +306,9 @@ void CVHFnr_int2e_pppp_q_cond(int (*intor)(), CINTOpt *cintopt, double *q_cond,
                 dj = ao_loc[ish+1] - ao_loc[ish];
                 di = MAX(di, dj);
         }
-        double *buf = malloc(sizeof(double) * 256 * (size_t)di*di*di*di);
+        // int2e_ipip1ipip2 and int2e_ipvip1ipvip2 have 81 components, (ab|cd) at
+        // ((a*3+b)*3+c)*3+d: (ab|ab) at 10*(a*3+b)
+        double *buf = malloc(sizeof(double) * 81 * (size_t)di*di*di*di);
         double *bufxx = buf;
         double *bufxy, *bufxz, *bufyx, *bufyy, *bufyz, *bufzx, *bufzy, *bufzz;
 #pragma omp for schedule(dynamic, 4)
@@ -321,14 +323,14 @@ void CVHFnr_int2e_pppp_q_cond(int (*intor)(), CINTOpt *cintopt, double *q_cond,
                 shls[3] = jsh;
                 qtmp = 1e-100;
                 iijj = di * dj * di * dj;
-                bufxy = buf + ( 1*16+ 1)*iijj;
-                bufxz = buf + ( 2*16+ 2)*iijj;
-                bufyx = buf + ( 4*16+ 4)*iijj;
-                bufyy = buf + ( 5*16+ 5)*iijj;
-                bufyz = buf + ( 6*16+ 6)*iijj;
-                bufzx = buf + ( 8*16+ 8)*iijj;
-                bufzy = buf + ( 9*16+ 9)*iijj;
-                bufzz = buf + (10*16+10)*iijj;
+                bufxy = buf + 10*1*iijj;
+                bufxz = buf + 10*2*iijj;
+                bufyx = buf + 10*3*iijj;
+                bufyy = buf + 10*4*iijj;
+                bufyz = buf + 10*5*iijj;
+                bufzx = buf + 10*6*iijj;
+                bufzy = buf + 10*7*iijj;
+                bufzz = buf + 10*8*iijj;
                 if (0 != (*intor)(buf, NULL, shls, atm, natm, bas, nbas, env,
                                   cintopt, cache)) {
                         for (i = 0; i < di; i++) {
