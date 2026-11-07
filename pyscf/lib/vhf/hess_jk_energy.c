@@ -653,7 +653,7 @@ typedef struct {
         int lanes;
         int nt;                 // shell types
         int *stype;
-        double *bout;           // lanes * 9 * the largest block
+        double *bout;           // lanes * 9 * the largest block (at least 2: the sums of _dot)
         double *bcache;
         double *gams;           // lanes * nh * the largest block
         double *gperm;          // the same, in the order of an evaluation
@@ -958,7 +958,9 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
         HJKBatch bt = {NULL, 0, lanes, nt, stype, NULL, NULL, NULL, NULL, 0, use_dot};
         if (lanes) {
                 bt.q = calloc(HJK_QCAP, sizeof(HJKQueue));
-                bt.bout = malloc(sizeof(double) * di4 * 9 * lanes);
+                // a block of 9 x nf integrals per quartet, or 9 x nh sums (_dot): nh (2) is more
+                // than nf when every shell is an s shell
+                bt.bout = malloc(sizeof(double) * MAX(di4, 2) * 9 * lanes);
                 bt.bcache = malloc(sizeof(double) * int2e_hess_sph_batch_cache_size());
                 bt.gams = malloc(sizeof(double) * di4 * nh * lanes);
                 bt.gperm = malloc(sizeof(double) * di4 * nh * lanes);
