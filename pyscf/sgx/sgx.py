@@ -293,17 +293,29 @@ class _SGXHF:
         with_df = self.with_df
         level_scf = with_df.grids_level_f
         e_scf = self.e_tot
-        with_df.build(level=level)
-        self._nsteps_direct = 0
-        vhf = self.get_veff(self.mol, dm)
-        e_tot = self.energy_tot(dm, vhf=vhf)
+        # what follows (gradients, properties) keeps the SCF's grid and data, and those of
+        # the range-separated copies
+        keys = ('grids', '_opt', '_pjs_data', '_overlap_correction_matrix', '_sgx_block_cond')
+        rsh = dict(with_df._rsh_df) if with_df._rsh_df else {}
+        saved = [(obj, {k: getattr(obj, k) for k in keys}) for obj in [with_df] + list(rsh.values())]
+        try:
+            with_df.build(level=level)
+            self._nsteps_direct = 0
+            vhf = self.get_veff(self.mol, dm)
+            e_tot = self.energy_tot(dm, vhf=vhf)
+            npoints = with_df.grids.weights.size
+        finally:
+            for obj, state in saved:
+                for k, v in state.items():
+                    setattr(obj, k, v)
+            if with_df._rsh_df:
+                for key in list(with_df._rsh_df):
+                    if key not in rsh:
+                        del with_df._rsh_df[key]
+            self._nsteps_direct = 0
         logger.info(self, 'SGX energy on grid level %d (%d points): %.15g (on level %d: %.15g, '
-                    'change %.3g)', level, with_df.grids.weights.size, e_tot, level_scf, e_scf,
-                    e_tot - e_scf)
+                    'change %.3g)', level, npoints, e_tot, level_scf, e_scf, e_tot - e_scf)
         logger.timer(self, 'SGX energy on the larger grid', *t0)
-        # the SCF's grid again, for what follows (gradients, properties)
-        with_df.build(level=level_scf)
-        self._nsteps_direct = 0
         return e_tot
 
     def to_gpu(self):

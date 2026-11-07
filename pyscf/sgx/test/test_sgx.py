@@ -136,6 +136,18 @@ class KnownValues(unittest.TestCase):
         # the exact SCF gives -76.3581494902
         self.assertAlmostEqual(e, -76.3582451667, 7)
 
+    def test_rijcosx_grad(self):
+        # the step on the larger grid leaves the SCF's grid and data to the gradients
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
+        mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+        mf.kernel()
+        g = mf.nuc_grad_method().kernel()
+        mf1 = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+        mf1.with_df.grids_level_energy = None
+        mf1.kernel()
+        g1 = mf1.nuc_grad_method().kernel()
+        self.assertAlmostEqual(abs(g - g1).max(), 0, 8)
+
     def test_sgx_jk_blocks(self):
         # SGX J and K in several blocks of the grid (a small max_memory) as in one
         mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='ccpvdz', verbose=0)
