@@ -377,6 +377,11 @@ int int2e_ip1_sph_batch(double *out, int nq, int *shls, int *atm, int natm, int 
 int int2e_ip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
 int int2e_sph_batch_lanes(void) __attribute__((weak));
 size_t int2e_sph_batch_cache_size(void) __attribute__((weak));
+// The same integrals contracted with ng arrays of each quartet inside qcint's kernels:
+// out[(q*ng+n)*3+c] = sum_f int[q][c][f] gam[(q*ng+n)*nf+f]
+int int2e_ip1_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm, int *bas,
+                            int nbas, double *env, const double *gam, int ng, double *cache)
+        __attribute__((weak));
 
 #define EJK_MAX_LANES   OE_MAX_LANES
 #define EJK_QCAP        1024    // hash table entries per thread, a power of 2
@@ -387,6 +392,7 @@ typedef struct {
         int lanes;
         int nt;                 // shell types
         int *stype;
+        int dot;                // the integrals contracted with Gamma inside qcint's kernels
         size_t di4;
         size_t cache_size;
         double norbit;
@@ -401,6 +407,7 @@ typedef struct {
         double *bout;           // lanes * 3 * the largest block
         double *bcache;
         double *gams;           // lanes * the largest block
+        double *gperm;          // the same, in the order of a centre (_dot)
         double norbit;
         double neval;
         double npass;
@@ -418,6 +425,7 @@ static void *_thread_init(void *ctx)
                 th->bout = malloc(sizeof(double) * di4 * 3 * cl->lanes);
                 th->bcache = malloc(sizeof(double) * int2e_sph_batch_cache_size());
                 th->gams = malloc(sizeof(double) * di4 * cl->lanes);
+                th->gperm = malloc(sizeof(double) * di4 * cl->lanes);
         }
         return th;
 }
@@ -434,6 +442,7 @@ static void _thread_done(void *ctx, void *pth)
                 free(th->bout);
                 free(th->bcache);
                 free(th->gams);
+                free(th->gperm);
         }
         free(th);
 }
@@ -499,6 +508,24 @@ static void _eval_batch(void *ctx, void *pth, double *de, void *orbits, int nq)
                 for (q = 0; q < nq; q++) {
                         memcpy(shls + 4 * q, os[q].sh[c], sizeof(int) * 4);
                 }
+                if (cl->dot) {
+                        // Gamma in the order of the centre's integral (c = 0..3 are the
+                        // first four orders of orbit_engine.h), contracted in qcint
+                        const double *gc = th->gams;
+                        if (c != OE_IJKL) {
+                                for (q = 0; q < nq; q++) {
+                                        CVHFoe_permute(th->gperm + nf * q, th->gams + nf * q, c,
+                                                       di, dj, dk, dl);
+                                }
+                                gc = th->gperm;
+                        }
+                        int2e_ip1_sph_batch_dot(th->bout, nq, shls, e->atm, e->natm, e->bas,
+                                                e->nbas, e->env, gc, 1, th->bcache);
+                        for (q = 0; q < nq; q++) {
+                                memcpy(g[q][c], th->bout + 3 * q, sizeof(double) * 3);
+                        }
+                        continue;
+                }
                 int2e_ip1_sph_batch(th->bout, nq, shls, e->atm, e->natm, e->bas, e->nbas,
                                     e->env, NULL, th->bcache);
                 for (q = 0; q < nq; q++) {
@@ -521,7 +548,9 @@ static void _eval_batch(void *ctx, void *pth, double *de, void *orbits, int nq)
  * stats, if not NULL, receives the counts of orbits that pass the screening,
  * of integral evaluations, and of the evaluations of the s2kl driver.
  * int2e_batch: int2e_ip1_sph evaluates several orbits at once where qcint offers
- * that (the queues of orbit_engine.h); CVHFgrad_jk_energy takes it on.
+ * that (the queues of orbit_engine.h), contracted with Gamma in qcint's kernels
+ * where it offers that (int2e_ip1_sph_batch_dot); 2: the batched integrals
+ * contracted here. CVHFgrad_jk_energy takes 1.
  */
 void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
                              CVHFOpt *vhfopt, double *dmj, double *dmk, int nk,
@@ -564,7 +593,7 @@ void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
         size_t di = GTOmax_shell_dim(ao_loc, shls_slice, 1);
         size_t cache_size = GTOmax_cache_size(intor, shls_slice, 4,
                                               atm, natm, bas, nbas, env);
-        EJKClient cl = {&envs, 0, 0, NULL, di * di * di * di, cache_size, 0, 0, 0};
+        EJKClient cl = {&envs, 0, 0, NULL, 0, di * di * di * di, cache_size, 0, 0, 0};
 
         // the queues of orbits for int2e_ip1_sph_batch, by shell type (l, nprim)
         if (int2e_batch && int2e_ip1_sph_batch != NULL && intor == int2e_ip1_sph &&
@@ -589,6 +618,9 @@ void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
                         cl.stype[s] = t;
                 }
         }
+        // int2e_ip1_sph_batch_dot: qcint contracts the batched integrals with Gamma (int2e_batch 2
+        // keeps the contraction here, for tests)
+        cl.dot = cl.lanes && int2e_batch == 1 && int2e_ip1_sph_batch_dot != NULL;
 
         OEDriver d = {&cl, nbas, qpair, MIN(1., 2 * dmax), .5 * cutoff, (size_t)natm * 3,
                 EJK_NCHUNK, EJK_CHUNK_BUF, cl.lanes, EJK_QCAP, sizeof(EJKOrbit),
