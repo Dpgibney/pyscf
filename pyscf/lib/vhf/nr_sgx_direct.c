@@ -1275,6 +1275,80 @@ int SGXscreen_shells_simple(CSGXOpt *sgxopt, int jmax, int ish,
         return num_sj_shells;
 }
 
+/*
+ * Screening by shell pair and batch with fixed thresholds (pair_tol in SGXData):
+ * the pair (I,J) is evaluated on a batch if
+ *      A_IJ (f_I F_J + F_I f_J) > etol
+ * or, with vtol, if A_IJ max(f_I, f_J) > vtol[ibatch], where
+ *      A_IJ = rbar_IJ m_bI m_bJ,
+ * SGX's position-dependent bound of the ESP integrals on the batch
+ * (bound_algo "sample_pos"), f_I the weighted norm of the F contracted on the
+ * batch and F_I that of the full density's (full_f_bi; F = f when it is not
+ * given). The first is an estimate of the pair's share of the exchange energy,
+ * or of its change in an incremental build, the second of its share of the
+ * potential G. SGXscreen_grid and SGXscreen_shells_sorted instead split a
+ * total tolerance over all batches and shells.
+ * shl_info: f_I and F_I (nbas each), then the batch's vtol.
+ */
+void SGXscreen_grid_pair(CSGXOpt *sgxopt, double *f_ug, const int ibatch,
+                         const int n_dm, const int nish, void *shl_info,
+                         void *buf)
+{
+        int nbas = sgxopt->nbas;
+        double *fbar_i = (double*) shl_info;
+        double *ffbar_i = fbar_i + nbas;
+        double *wt = sgxopt->wt + ibatch * SGX_BLKSIZE;
+        int dg = MAX(0, MIN(SGX_BLKSIZE, sgxopt->ngrids - ibatch * SGX_BLKSIZE));
+        const size_t Ngrids = sgxopt->ngrids;
+        double *mbar_ii = sgxopt->mbar_bi + ibatch * nbas;
+        int *ao_loc = sgxopt->ao_loc;
+        int ish;
+        for (ish = 0; ish < nish; ish++) {
+                fbar_i[ish] = _shl_mat_elem_wt(
+                        f_ug, wt, ao_loc[ish], ao_loc[ish+1], 0, dg,
+                        n_dm, Ngrids, ao_loc[nbas] * Ngrids) * mbar_ii[ish];
+        }
+        if (sgxopt->full_f_bi == NULL) {
+                for (ish = 0; ish < nish; ish++) {
+                        ffbar_i[ish] = fbar_i[ish];
+                }
+        } else {
+                for (ish = 0; ish < nish; ish++) {
+                        ffbar_i[ish] = sgxopt->full_f_bi[ibatch * nbas + ish]
+                                       * mbar_ii[ish];
+                }
+        }
+        ffbar_i[nbas] = sgxopt->vtol == NULL ? 1e300 : sgxopt->vtol[ibatch];
+}
+
+int SGXscreen_shells_pair(CSGXOpt *sgxopt, int jmax, int ish,
+                          int nish, int ish0, int jsh0, void *shl_info,
+                          void *buf, int *shl_inds)
+{
+        size_t nbas = sgxopt->nbas;
+        double *rbar_i = sgxopt->rbar_ij + ish * nbas;
+        double *fbar_i = (double*) shl_info;
+        double *ffbar_i = fbar_i + nbas;
+        const double etol = sgxopt->etol;
+        const double dv = ffbar_i[nbas];
+        const double fi = fbar_i[ish];
+        const double ffi = ffbar_i[ish];
+        int jsh;
+        int n = 0;
+        for (jsh = 0; jsh < jmax; jsh++) {
+                if (!_simple_prescreen(ish + ish0, jsh + jsh0, sgxopt)) {
+                        continue;
+                }
+                double r = rbar_i[jsh];
+                if (r * (fi * ffbar_i[jsh] + ffi * fbar_i[jsh]) > etol ||
+                    r * MAX(fi, fbar_i[jsh]) > dv) {
+                        shl_inds[n] = jsh;
+                        n++;
+                }
+        }
+        return n;
+}
+
 int SGXscreen_shells_sorted(CSGXOpt *sgxopt, int jmax, int ish,
                             int nish, int ish0, int jsh0, void *shl_info,
                             void *buf, int *shl_inds)

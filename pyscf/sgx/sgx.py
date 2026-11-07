@@ -109,6 +109,29 @@ def sgx_fit(mf, auxbasis=None, with_df=None, pjs=False):
     return lib.set_class(dfmf, (_SGXHF, mf.__class__))
 
 
+def rijcosx(mf, auxbasis='def2-universal-jfit', with_df=None):
+    '''RI-J and seminumerical K set up as ORCA's RIJCOSX: J fitted in a Coulomb
+    fitting basis (def2-universal-jfit, ORCA's def2/J, by default), K by SGX with
+    P-junction screening on grid level 0 in the first cycles and 1 after the
+    switch (ORCA's GRIDX1 and GRIDX2), and the energy of the converged density
+    with K once more on level 2 (GRIDX3). The shell pairs of K are screened by
+    batch (sgx_tol_pair 1e-9), which moves the energy by about that much.
+
+    Examples:
+
+    >>> mol = gto.M(atom='O 0 0 0; H 0 .757 .587; H 0 -.757 .587', basis='def2-tzvp')
+    >>> mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+    >>> mf.kernel()
+    '''
+    mf = sgx_fit(mf, auxbasis=auxbasis, with_df=with_df, pjs=True)
+    sgx = mf.with_df
+    sgx.grids_level_i = 0
+    sgx.grids_level_f = 1
+    sgx.grids_level_energy = 2
+    sgx.sgx_tol_pair = 1e-9
+    return mf
+
+
 # A tag to label the derived SCF class
 class _SGXHF:
 
@@ -141,8 +164,16 @@ class _SGXHF:
     def build(self, mol=None, **kwargs):
         self._nsteps_direct = 0
         self._in_scf = False
+        self._sgx_ehist = []
         self.with_df.build(level=self.with_df.grids_level_i)
         return super().build(mol, **kwargs)
+
+    def energy_tot(self, dm=None, h1e=None, vhf=None):
+        e_tot = super().energy_tot(dm, h1e, vhf)
+        # for the threshold of the pair screening of the next incremental build
+        ehist = getattr(self, '_sgx_ehist', [])
+        self._sgx_ehist = ehist[-1:] + [e_tot]
+        return e_tot
 
     def reset(self, mol=None):
         self._nsteps_direct = 0
@@ -177,8 +208,20 @@ class _SGXHF:
             self._nsteps_direct = 0
             self._in_scf = False
 
-        vj, vk = with_df.get_jk(dm, hermi, vhfopt, with_j, with_k,
-                                self.direct_scf_tol, omega)
+        # The pair screening (sgx_tol_pair) of an incremental build drops parts of the change of
+        # K, which shift the energy at first order while the SCF's energy changes at second order
+        # near convergence: its threshold is at most a hundredth of the last change of the energy,
+        # so that it does not stall the convergence.
+        with_df._pair_tol_now = None
+        ehist = getattr(self, '_sgx_ehist', [])
+        if (with_df.sgx_tol_pair is not None and with_df._full_dm is not None
+                and len(ehist) == 2):
+            with_df._pair_tol_now = min(with_df.sgx_tol_pair, .01 * abs(ehist[1] - ehist[0]))
+        try:
+            vj, vk = with_df.get_jk(dm, hermi, vhfopt, with_j, with_k,
+                                    self.direct_scf_tol, omega)
+        finally:
+            with_df._pair_tol_now = None
         self._nsteps_direct += 1
         if self.rebuild_nsteps > 0 and self._nsteps_direct >= self.rebuild_nsteps:
             self._nsteps_direct = 0
@@ -231,6 +274,37 @@ class _SGXHF:
 
     def post_kernel(self, envs):
         self._in_scf = False
+        self._sgx_last = (envs.get('dm'), envs.get('vhf'), envs.get('scf_conv'))
+
+    def scf(self, dm0=None, **kwargs):
+        self._sgx_last = None
+        e_tot = super().scf(dm0, **kwargs)
+        level = self.with_df.grids_level_energy
+        if level is not None and self._sgx_last is not None and self._sgx_last[0] is not None:
+            e_tot = self.e_tot = self._sgx_energy_on_grid(level, *self._sgx_last[:2])
+        self._sgx_last = None
+        return e_tot
+
+    kernel = lib.alias(scf, alias_name='kernel')
+
+    def _sgx_energy_on_grid(self, level, dm, vhf):
+        '''The energy of dm with K on SGX grid level, J and XC as in the SCF'''
+        t0 = (logger.process_clock(), logger.perf_counter())
+        with_df = self.with_df
+        level_scf = with_df.grids_level_f
+        e_scf = self.e_tot
+        with_df.build(level=level)
+        self._nsteps_direct = 0
+        vhf = self.get_veff(self.mol, dm)
+        e_tot = self.energy_tot(dm, vhf=vhf)
+        logger.info(self, 'SGX energy on grid level %d (%d points): %.15g (on level %d: %.15g, '
+                    'change %.3g)', level, with_df.grids.weights.size, e_tot, level_scf, e_scf,
+                    e_tot - e_scf)
+        logger.timer(self, 'SGX energy on the larger grid', *t0)
+        # the SCF's grid again, for what follows (gradients, properties)
+        with_df.build(level=level_scf)
+        self._nsteps_direct = 0
+        return e_tot
 
     def to_gpu(self):
         raise NotImplementedError
@@ -268,6 +342,7 @@ class _SGXHF:
 
 
 scf.hf.SCF.COSX = sgx_fit
+scf.hf.SCF.RIJCOSX = rijcosx
 mcscf.casci.CASBase.COSX = sgx_fit
 
 
@@ -326,6 +401,23 @@ class SGX(lib.StreamObject):
         bound_algo : str
             Bound algo determines how the three-center integral upper bounds
             are estimated. Default is "sample_pos".
+        sgx_tol_pair : float or None
+            If set, each shell pair is screened on each batch of grid
+            points by itself: it is evaluated if the estimate of its
+            share of the exchange energy (or of its change in an
+            incremental build) exceeds sgx_tol_pair, or, if
+            sgx_tol_potential is set, its share of the potential exceeds
+            that. sgx_tol_energy and sgx_tol_potential otherwise split a
+            total tolerance over all batches and shells, which the
+            estimates (upper bounds) far exceed, so that few pairs are
+            skipped. Requires bound_algo "sample_pos". Default None.
+
+        grids_level_energy : int or None
+            If set, the energy of the converged density is evaluated once
+            more with K on the SGX grid of this level, which is larger than
+            that of the SCF, without changing the orbitals (as ORCA's RIJCOSX
+            recomputes the exchange energy on GRIDX3). The orbitals, and the
+            gradients, stay those of the SCF grid. Default None.
 
     If (sgx_tol_energy, sgx_tol_potential) is
         (float/"auto", float/"auto"): Bound energy and potential error;
@@ -375,7 +467,8 @@ class SGX(lib.StreamObject):
         'mol', 'grids_thrd', 'grids_level_i', 'grids_level_f',
         'grids_switch_thrd', 'dfj', 'direct_j', 'debug', 'grids',
         'blockdim', 'auxmol', 'sgx_tol_potential',
-        'sgx_tol_energy', 'use_opt_grids', 'fit_ovlp', 'bound_algo'
+        'sgx_tol_energy', 'use_opt_grids', 'fit_ovlp', 'bound_algo',
+        'sgx_tol_pair', 'grids_level_energy'
     }
 
     def __init__(self, mol, auxbasis=None):
@@ -398,6 +491,8 @@ class SGX(lib.StreamObject):
         self.sgx_tol_energy = "auto"
         self.sgx_tol_potential = "auto"
         self.bound_algo = "sample_pos"
+        self.sgx_tol_pair = None
+        self.grids_level_energy = None
 
         # Do not set these. They are set by the SGX algorithm.
         self.grids = None
@@ -418,6 +513,7 @@ class SGX(lib.StreamObject):
         self._sgx_block_cond = None
         self._full_dm = None
         self._pjs_data = None
+        self._pair_tol_now = None
 
     @property
     def auxbasis(self):
@@ -437,6 +533,10 @@ class SGX(lib.StreamObject):
         log.info('grids_level_f = %s', self.grids_level_f)
         log.info('grids_thrd = %s', self.grids_thrd)
         log.info('grids_switch_thrd = %s', self.grids_switch_thrd)
+        if self.grids_level_energy is not None:
+            log.info('grids_level_energy = %s', self.grids_level_energy)
+        if self.sgx_tol_pair is not None:
+            log.info('sgx_tol_pair = %s', self.sgx_tol_pair)
         log.info('dfj = %s', self.dfj)
         log.info('auxbasis = %s', self.auxbasis)
         return self
@@ -479,6 +579,7 @@ class SGX(lib.StreamObject):
             hermi=1,
             bound_algo=self.bound_algo,
             sgxopt=self._opt,
+            pair_tol=self.sgx_tol_pair,
         )
         self._pjs_data.build()
 

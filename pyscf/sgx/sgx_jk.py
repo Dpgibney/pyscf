@@ -247,7 +247,7 @@ class SGXData:
                  max_memory=2000, hermi=0,
                  bound_algo="sample_pos",
                  sgxopt=None, etol=None, vtol=None,
-                 direct_scf_tol=0.0):
+                 direct_scf_tol=0.0, pair_tol=None):
         """
         bound_algo can be
             "ovlp": Screen integrals based on overlap of
@@ -263,6 +263,14 @@ class SGXData:
                 short-range hybrids.
         For each bound algo, screening can be done based
         on energy, potential, or both
+        pair_tol: if not None, the K driver screens each shell pair on each
+            batch of grid points by itself (bound_algo "sample_pos" only):
+            the pair is evaluated if the estimate of its share of the exchange
+            energy (or of its change, for an incremental build) on the batch
+            exceeds pair_tol, or, with vtol, if the estimate of its share of
+            the potential exceeds vtol. etol and vtol otherwise split a total
+            tolerance over all batches and shells. etol and vtol still screen
+            the density and potential matrices on the grid as before.
         """
         self.mol = mol
         self.grids = grids
@@ -282,6 +290,9 @@ class SGXData:
         self._screen_energy = etol is not None
         self._vtol = vtol
         self._screen_potential = vtol is not None
+        self._pair_tol = pair_tol
+        if pair_tol is not None and bound_algo != "sample_pos":
+            raise ValueError("pair_tol needs bound_algo 'sample_pos'")
         self._nquad = 200
         self._nrad = 32
         self._rcmul = 2.0
@@ -297,7 +308,8 @@ class SGXData:
 
     @property
     def use_dm_screening(self):
-        return self._screen_energy or self._screen_potential
+        return (self._screen_energy or self._screen_potential
+                or self._pair_tol is not None)
 
     def reset(self):
         self._ovlp_proj = numpy.identity(self.mol.nao_nr())
@@ -356,7 +368,14 @@ class SGXData:
         else:
             self._this.rbar_ij = None
         self._this.mbar_bi = None
-        if self._screen_energy or self._screen_potential:
+        if self._pair_tol is not None:
+            # shl_info: f_I and F_I for every shell, then the batch's vtol
+            self._this.etol = self._pair_tol
+            bsb = 0
+            sisb = (2 * self.mol.nbas + 1) * ctypes.sizeof(ctypes.c_double)
+            grid_screen = "SGXscreen_grid_pair"
+            shl_screen = "SGXscreen_shells_pair"
+        elif self._screen_energy or self._screen_potential:
             # buf can contain the following:
             # For batch screening step
             #   Nothing for no dm screening
@@ -416,7 +435,7 @@ class SGXData:
         self._wt = weights
         self._this.ngrids = weights.size
         self._this.wt = _arr2c(weights)
-        if self._screen_potential or self._screen_energy:
+        if self._screen_potential or (self._screen_energy and self._pair_tol is None):
             self._this.vtol = _arr2c(self._vtol_arr[b0:])
         else:
             self._this.vtol = None
@@ -985,8 +1004,8 @@ def get_jk_favork(sgx, dm, hermi=1, with_j=True, with_k=True,
         blksize = max(1, blksize // SGX_BLKSIZE) * SGX_BLKSIZE
     else:
         # We need to store ao, wao, and fg, gv -> 2 + 2 * nset sets of size nao
-        blksize = min(ngrids, max(SGX_BLKSIZE,
-                      int(max_memory*1e6/8/(2 + 2 * nset))))
+        blksize = int(max_memory*1e6/8/((2 + 2 * nset) * nao))
+        blksize = min(ngrids, max(1, blksize // SGX_BLKSIZE) * SGX_BLKSIZE)
     tnuc = 0, 0
     for i0, i1 in lib.prange(0, ngrids, blksize):
         coords = grids.coords[i0:i1]
@@ -1089,6 +1108,9 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
         full_dm_ij = None
 
     batch_k = _gen_k_direct(mol, 's2', direct_scf_tol, sgx._pjs_data)
+    if sgxdat._pair_tol is not None:
+        tol_now = getattr(sgx, '_pair_tol_now', None)
+        sgxdat._this.etol = sgxdat._pair_tol if tol_now is None else tol_now
 
     # With the whole grid in one block, the AO values are the same in every K build. They are kept in
     # _pjs_data, which _build_pjs makes anew when the grids or the molecule change.
@@ -1178,9 +1200,10 @@ def get_jk_favorj(sgx, dm, hermi=1, with_j=True, with_k=True,
         blksize = min(ngrids, max(4, int(min(sblk, max_memory*1e6/8/nao**2))))
         blksize = max(1, blksize // SGX_BLKSIZE) * SGX_BLKSIZE
     else:
-        # We need to store ao, wao, and fg, gv -> 2 + 2 * nset sets of size nao
-        blksize = min(ngrids, max(SGX_BLKSIZE,
-                      int(max_memory*1e6/8/((2 + 2 * nset) * nao))))
+        # We need to store ao, wao, and fg, gv -> 2 + 2 * nset sets of size nao; the blocks
+        # start on the AO screening blocks (BLKSIZE), as non0tab is indexed by them
+        blksize = int(max_memory*1e6/8/((2 + 2 * nset) * nao))
+        blksize = min(ngrids, max(1, blksize // SGX_BLKSIZE) * SGX_BLKSIZE)
     if sgx.fit_ovlp:
         # depends on the grids and the basis only; sgx.build() and reset() clear it
         proj = sgx._overlap_correction_matrix

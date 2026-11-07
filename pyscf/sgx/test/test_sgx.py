@@ -96,6 +96,58 @@ class KnownValues(unittest.TestCase):
         energy2 = mf.kernel()
         self.assertAlmostEqual(energy, energy2, 9)
 
+    def test_sgx_tol_pair(self):
+        # the screening of shell pairs by batch (sgx_tol_pair): the energy of the unscreened K
+        # within about the threshold, in about as many cycles
+        mol = gto.M(atom='''O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587
+                            O 3 0 0; H 3 -0.757 0.587; H 3 0.757 0.587''',
+                    basis='def2-svp', verbose=0)
+        mf0 = sgx.sgx_fit(dft.RKS(mol, xc='b3lyp'), pjs=True)
+        mf0.with_df.sgx_tol_energy = None
+        mf0.with_df.sgx_tol_potential = None
+        e0 = mf0.kernel()
+        mf1 = sgx.sgx_fit(dft.RKS(mol, xc='b3lyp'), pjs=True)
+        mf1.with_df.sgx_tol_energy = None
+        mf1.with_df.sgx_tol_potential = None
+        mf1.with_df.sgx_tol_pair = 1e-8
+        e1 = mf1.kernel()
+        self.assertAlmostEqual(e1, e0, 7)
+        self.assertLessEqual(mf1.cycles, mf0.cycles + 2)
+
+    def test_rijcosx(self):
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
+        mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+        self.assertEqual(mf.with_df.auxbasis, 'def2-universal-jfit')
+        self.assertTrue(mf.with_df.dfj and mf.with_df.optk)
+        self.assertEqual((mf.with_df.grids_level_i, mf.with_df.grids_level_f), (0, 1))
+        self.assertEqual(mf.with_df.sgx_tol_pair, 1e-9)
+        e = mf.kernel()
+        # the energy of the converged density with K on level 2, the SCF's grid kept
+        self.assertEqual(mf.with_df.grids_level_f, 1)
+        dm = mf.make_rdm1()
+        mf.with_df.build(level=2)
+        mf._nsteps_direct = 0
+        e2 = mf.energy_tot(dm, vhf=mf.get_veff(mol, dm))
+        self.assertAlmostEqual(e, e2, 9)
+        mf.with_df.grids_level_energy = None
+        mf.with_df.build(level=0)
+        e1 = mf.kernel()
+        self.assertTrue(abs(e - e1) > 1e-7)
+        # the exact SCF gives -76.3581494902
+        self.assertAlmostEqual(e, -76.3582451667, 7)
+
+    def test_sgx_jk_blocks(self):
+        # SGX J and K in several blocks of the grid (a small max_memory) as in one
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='ccpvdz', verbose=0)
+        mf = sgx.sgx_fit(scf.RHF(mol))
+        mf.with_df.grids_level_f = 1
+        e0 = mf.kernel()
+        mf = sgx.sgx_fit(scf.RHF(mol))
+        mf.with_df.grids_level_f = 1
+        mf.with_df.max_memory = 1
+        e1 = mf.kernel()
+        self.assertAlmostEqual(e1, e0, 10)
+
 if __name__ == "__main__":
     print("Full Tests for SGX")
     unittest.main()
