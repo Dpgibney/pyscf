@@ -272,7 +272,8 @@ class KnownValues(unittest.TestCase):
         # The two-electron blocks contracted with the densities inside the integral loop
         # (hess_jk_energy) against the loops over atoms of _partial_hess_2e: RHF, spin densities, J or
         # K alone, long- and short-range K, cartesian functions, atoms out of order, with and without
-        # the screening, batched integrals and not
+        # the screening, batched integrals contracted in qcint's kernels (with a qcint that has them),
+        # here, and integrals not batched
         from pyscf.scf import _vhf
         from pyscf.hessian import rhf as rhf_hess
         for cart in (False, True):
@@ -293,8 +294,9 @@ class KnownValues(unittest.TestCase):
                     with lib.temporary_env(rhf_hess, JK_ENERGY=False):
                         ref = rhf_hess._partial_hess_2e(mol1, dm_j, dms_k, k_fac, atmlst,
                                                         with_j=with_j, with_k=with_k, omega=omega)
-                    for tol, batch in ((0, True), (1e-14, True), (0, False)):
-                        with lib.temporary_env(rhf_hess, JK_ENERGY_TOL=tol), \
+                    for tol, batch, dot in ((0, True, True), (1e-14, True, True), (0, True, False),
+                                            (0, False, False)):
+                        with lib.temporary_env(rhf_hess, JK_ENERGY_TOL=tol, JK_ENERGY_DOT=dot), \
                                 lib.temporary_env(_vhf, INT2E_BATCH=batch):
                             ej, ek = rhf_hess._partial_hess_2e(mol1, dm_j, dms_k, k_fac, atmlst,
                                                                with_j=with_j, with_k=with_k,

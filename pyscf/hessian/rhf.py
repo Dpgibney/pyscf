@@ -45,6 +45,9 @@ JK_ENERGY_TOL = getattr(__config__, 'hessian_rhf_jk_energy_tol', 1e-14)
 # The memory (MB) hess_jk_energy's chunk buffers may take; fixed, so that the results do not depend on the memory
 # available
 JK_ENERGY_BUF = 128
+# hess_jk_energy's batched integrals contracted with the densities inside qcint's kernels where it offers that
+# (int2e_*_sph_batch_dot); False keeps the contraction in hess_jk_energy
+JK_ENERGY_DOT = getattr(__config__, 'hessian_rhf_jk_energy_dot', True)
 # The screening threshold of make_h1's int2e_ip1 J/K (_make_h1_vhfopt); 0 computes every quartet, as without a
 # vhfopt
 MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-14)
@@ -347,7 +350,7 @@ def hess_jk_energy(mol, dm_j, dms_k, k_fac, tol=None, stats=None, verbose=None):
         c_intors, c_cintopts, q_cond.ctypes, dm_cond.ctypes, ctypes.c_double(tol),
         lib.c_null_ptr() if dmj is None else dmj.ctypes, dmk.ctypes, ctypes.c_int(nk),
         ctypes.c_double(k_fac), ctypes.c_size_t(int(JK_ENERGY_BUF * 1e6 / 8)), c_stats.ctypes,
-        ctypes.c_int(1 if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+        ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
         c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
     log.debug1('hess_jk_energy: %d shell quartet orbits, %d integral evaluations '
                '(%d cross-atom centre pairs), %d orbits batched', *c_stats)

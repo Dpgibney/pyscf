@@ -626,6 +626,17 @@ int int2e_ip1ip2_sph_batch(double *out, int nq, int *shls, int *atm, int natm, i
 int int2e_ipip1_sph_batch_ok(int *shls, int *bas, double *env) __attribute__((weak));
 int int2e_sph_batch_lanes(void) __attribute__((weak));
 size_t int2e_hess_sph_batch_cache_size(void) __attribute__((weak));
+// The same integrals contracted with ng arrays of each quartet inside qcint's kernels:
+// out[(q*ng+n)*9+c] = sum_f int[q][c][f] gam[(q*ng+n)*nf+f]
+int int2e_ipip1_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm, int *bas,
+                              int nbas, double *env, const double *gam, int ng, double *cache)
+        __attribute__((weak));
+int int2e_ipvip1_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm, int *bas,
+                               int nbas, double *env, const double *gam, int ng, double *cache)
+        __attribute__((weak));
+int int2e_ip1ip2_sph_batch_dot(double *out, int nq, int *shls, int *atm, int natm, int *bas,
+                               int nbas, double *env, const double *gam, int ng, double *cache)
+        __attribute__((weak));
 
 #define HJK_MAX_LANES   8
 #define HJK_QCAP        4096    // hash table entries per thread, a power of 2
@@ -647,6 +658,7 @@ typedef struct {
         double *gams;           // lanes * nh * the largest block
         double *gperm;          // the same, in the order of an evaluation
         double nbatched;        // orbits through the batched integrals
+        int dot;                // the integrals contracted with the Gammas inside qcint's kernels
 } HJKBatch;
 
 static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJKEnvs *e,
@@ -662,6 +674,8 @@ static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJK
         }
         int (*fbatch[3])() = {int2e_ipip1_sph_batch, int2e_ipvip1_sph_batch,
                               int2e_ip1ip2_sph_batch};
+        int (*fdot[3])() = {int2e_ipip1_sph_batch_dot, int2e_ipvip1_sph_batch_dot,
+                            int2e_ip1ip2_sph_batch_dot};
         HJKPlan *pl = e->plans + Q->o[0].code;
         bt->nbatched += Q->n;
         int dims[4];
@@ -701,8 +715,20 @@ static void _flush_orbits(double *h, size_t ntri, HJKQueue *Q, HJKBatch *bt, HJK
                         if (!(pl->mask >> ev & 1) || _eval_order[ev] != ord) {
                                 continue;
                         }
-                        (*fbatch[_eval_intor[ev]])(bt->bout, Q->n, shls, e->atm, e->natm,
-                                                   e->bas, e->nbas, e->env, NULL, bt->bcache);
+                        int k = _eval_intor[ev];
+                        if (bt->dot) {
+                                (*fdot[k])(bt->bout, Q->n, shls, e->atm, e->natm, e->bas,
+                                           e->nbas, e->env, g, nh, bt->bcache);
+                                for (q = 0; q < Q->n; q++) {
+                                        for (n = 0; n < nh; n++) {
+                                                memcpy(m[q][n][ev], bt->bout + (q * nh + n) * 9,
+                                                       sizeof(double) * 9);
+                                        }
+                                }
+                                continue;
+                        }
+                        (*fbatch[k])(bt->bout, Q->n, shls, e->atm, e->natm,
+                                     e->bas, e->nbas, e->env, NULL, bt->bcache);
                         for (q = 0; q < Q->n; q++) {
                                 _contract(mt, bt->bout + 9 * nf * q, g + ng * q, nh, nf);
                                 for (n = 0; n < nh; n++) {
@@ -770,7 +796,9 @@ static void _queue_orbit(double *h, size_t ntri, HJKOrbit *o, HJKBatch *bt, HJKE
  * stats, if not NULL, receives the counts of orbits computed, of their
  * integral evaluations, of their cross-atom centre pairs, and of the orbits
  * through the batched integrals.
- * int2e_batch: several orbits at once where qcint offers that (HJKQueue).
+ * int2e_batch: several orbits at once where qcint offers that (HJKQueue), their
+ * integrals contracted with the Gammas in qcint's kernels where it offers that
+ * (int2e_*_sph_batch_dot); 2: the batched integrals contracted here.
  */
 void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cintopts,
                         double *q_cond, double *dm_cond, double cutoff,
@@ -905,6 +933,10 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
                         stype[s] = t;
                 }
         }
+        // int2e_*_sph_batch_dot: qcint contracts the batched integrals with the Gammas (int2e_batch 2
+        // keeps the contraction here, for tests)
+        const int use_dot = lanes && int2e_batch == 1 && int2e_ipip1_sph_batch_dot != NULL &&
+                int2e_ipvip1_sph_batch_dot != NULL && int2e_ip1ip2_sph_batch_dot != NULL;
         // cross-atom centre pairs of each pattern
         int ncross_of[HJK_NCODE];
         for (k = 0; k < HJK_NCODE; k++) {
@@ -923,7 +955,7 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
         double *gam = buf + di4 * 9;
         double *gperm = gam + di4 * nh;
         double *cache = gperm + di4 * nh;
-        HJKBatch bt = {NULL, 0, lanes, nt, stype, NULL, NULL, NULL, NULL, 0};
+        HJKBatch bt = {NULL, 0, lanes, nt, stype, NULL, NULL, NULL, NULL, 0, use_dot};
         if (lanes) {
                 bt.q = calloc(HJK_QCAP, sizeof(HJKQueue));
                 bt.bout = malloc(sizeof(double) * di4 * 9 * lanes);
