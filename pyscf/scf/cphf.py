@@ -22,6 +22,7 @@ Restricted coupled perturbed Hartree-Fock solver
 
 
 import numpy
+import scipy.linalg
 from pyscf import lib
 from pyscf.lib import logger
 
@@ -209,6 +210,163 @@ def solve_withs1(fvind, mo_energy, mo_occ, h1, s1,
 
     # mo_e1 has the same symmetry as the first order Fock matrix (hermitian or
     # anti-hermitian). mo_e1 = v1mo - s1*lib.direct_sum('i+j->ij',e_i,e_i)
+    mo_e1 = hs[:,occidx,:]
+    mo_e1 += mo1[:,occidx] * (e_i[:,None] - e_i)
+
+    if h1.ndim == 3:
+        return mo1, mo_e1
+    else:
+        assert h1.ndim == 2
+        return mo1[0], mo_e1[0]
+
+def _orthonormal_rows(t, vs, drop):
+    '''Orthonormal rows spanning the part of the rows of t orthogonal to the
+    rows of the blocks vs, without the directions whose norm is below drop.
+    t is overwritten.'''
+    for _ in range(2):
+        for v in vs:
+            t -= lib.dot(lib.dot(t, v.T), v)
+    q, r = scipy.linalg.qr(t.T, mode='economic', pivoting=True)[:2]
+    q = q[:,abs(r.diagonal()) > drop].T
+    # the rows are combinations of t's, by large coefficients for near-dependent t
+    for v in vs:
+        q -= lib.dot(lib.dot(q, v.T), v)
+    return q
+
+def _combine_blocks(c, blocks):
+    '''sum_k c[k,r] vectors[k] of the vectors in the list of blocks [nk,...]'''
+    out = 0
+    p0 = 0
+    for b in blocks:
+        p1 = p0 + len(b)
+        out = out + lib.dot(c[p0:p1].T, b)
+        p0 = p1
+    return out
+
+def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
+                   verbose=logger.WARN, level_shift=0):
+    '''The equations of solve_withs1 for real orbitals and perturbations, solved
+    until the true residual of every perturbation is below tol.
+
+    The virtual block of the solution is x0 + V c, x0 the uncoupled solution
+    and V one space of trial vectors for all perturbations. With the operator
+    M = (e_a - e_i) + fvind on the virtual block, which is symmetric, the
+    coefficients solve V^T M V c = V^T r0 for r0 the residual of x0, in the
+    plain dot product, and the virtual block then gets the last update of
+    solve_withs1, from the response of the solution (a combination of the
+    responses already computed). The error of a Hessian built from this
+    solution goes about as the square of the residuals (measured: tol 1e-3
+    about 1e-6, tol 1e-4 about 1e-8), so a loose tol is enough for it; quantities
+    linear in the solution would need a tighter one.
+
+    A cycle adds the preconditioned residuals of the perturbations that are
+    not converged, made orthonormal against V and among themselves. Unlike
+    lib.krylov, which stops on the sizes of Krylov vectors that shrink by orders
+    of magnitude, the stop and the choice of vectors look at the residuals, and
+    fvind always gets densities of about unit size: thresholds of its
+    integrals (direct SCF, the seminumerical K of SGX) are absolute, and
+    would otherwise mean less and less in the later cycles.
+
+    Kwargs:
+        tol : float
+            Upper limit of the norm of the preconditioned residual,
+            r / (e_a - e_i), of each perturbation
+        max_cycle : int
+            Max. number of cycles of trial vectors
+        level_shift : float
+            Added to (e_a - e_i) in the preconditioner
+
+    Returns:
+        First order orbital coefficients (in MO basis) and first order orbital
+        energy matrix
+    '''
+    assert not (numpy.iscomplexobj(h1) or numpy.iscomplexobj(s1))
+    log = logger.new_logger(verbose=verbose)
+    t0 = (logger.process_clock(), logger.perf_counter())
+
+    occidx = mo_occ > 0
+    viridx = mo_occ == 0
+    e_i = mo_energy[occidx]
+    e_a = mo_energy[viridx]
+    e_ai = e_a[:,None] - e_i
+    nvir, nocc = e_ai.shape
+    nmo = nocc + nvir
+    ndim = nvir * nocc
+    diag = e_ai.ravel()
+    precond = diag + level_shift
+
+    s1 = s1.reshape(-1,nmo,nocc)
+    hs = h1.reshape(-1,nmo,nocc) - s1*e_i
+    nset = hs.shape[0]
+
+    mo1 = numpy.empty_like(hs)
+    mo1[:,viridx] = -hs[:,viridx] / e_ai
+    mo1[:,occidx] = -s1[:,occidx] * .5
+    v1 = fvind(mo1).reshape(nset,nmo,nocc)
+    # -(e_ai x0 + fvind(x0) + hs) on the virtual block
+    r0 = -v1[:,viridx].reshape(nset,ndim)
+
+    vs = []  # the trial vectors V, a block per cycle
+    mvs = []  # M V
+    voo = []  # the occupied rows of fvind(V), for the first order energies
+    vtmv = numpy.zeros((0,0))
+    vtr0 = numpy.zeros((0,nset))
+    c = vtr0
+    r = r0
+    drop = max(tol*1e-2, 1e-13)
+    for cycle in range(max_cycle+1):
+        rnorm = numpy.linalg.norm(r / precond, axis=1)
+        active = rnorm > tol
+        log.debug('CPHF cycle %d: max residual %g, %d of %d perturbations left',
+                  cycle, rnorm.max(initial=0), active.sum(), nset)
+        if not active.any():
+            break
+        if cycle == max_cycle:
+            raise RuntimeError('CPHF solver failed to converge.')
+
+        x1 = _orthonormal_rows(r[active] / precond, vs, drop)
+        nq = len(x1)
+        if nq == 0:
+            log.warn('CPHF stopped with no new trial vector; residual %g '
+                     'above tol %g', rnorm.max(), tol)
+            break
+        trial = numpy.zeros((nq,nmo,nocc))
+        trial[:,viridx] = x1.reshape(nq,nvir,nocc)
+        w = fvind(trial).reshape(nq,nmo,nocc)
+        trial = None
+        mx1 = w[:,viridx].reshape(nq,ndim) + x1 * diag
+        voo.append(w[:,occidx].reshape(nq,nocc*nocc))
+        w = None
+        vs.append(x1)
+        mvs.append(mx1)
+
+        nd = vtmv.shape[0]
+        vtmv1 = numpy.empty((nd+nq,nd+nq))
+        vtmv1[:nd,:nd] = vtmv
+        p0 = 0
+        for v, mv in zip(vs, mvs):
+            p1 = p0 + len(v)
+            vtmv1[p0:p1,nd:] = lib.dot(v, mx1.T)
+            vtmv1[nd:,p0:p1] = lib.dot(x1, mv.T)
+            p0 = p1
+        vtmv = vtmv1
+        vtr0 = numpy.vstack((vtr0, lib.dot(x1, r0.T)))
+        c = numpy.linalg.solve(vtmv, vtr0)
+        r = r0 - _combine_blocks(c, mvs)
+
+    nvec = vtmv.shape[0]
+    log.info('CPHF: %d cycles, %d trial vectors, max residual %.3g',
+             cycle, nvec, numpy.linalg.norm(r / precond, axis=1).max(initial=0))
+    if vs:
+        xv = _combine_blocks(c, vs)
+        mo1[:,viridx] += xv.reshape(nset,nvir,nocc)
+        # fvind(mo1), from the responses of x0 and of the trial vectors
+        v1[:,viridx] += (_combine_blocks(c, mvs) - xv * diag).reshape(nset,nvir,nocc)
+        v1[:,occidx] += _combine_blocks(c, voo).reshape(nset,nocc,nocc)
+    log.timer('CPHF solver', *t0)
+
+    hs += v1
+    mo1[:,viridx] = hs[:,viridx] / (e_i - e_a[:,None])
     mo_e1 = hs[:,occidx,:]
     mo_e1 += mo1[:,occidx] * (e_i[:,None] - e_i)
 

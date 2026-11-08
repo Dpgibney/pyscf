@@ -366,6 +366,8 @@ class Hessian(rhf_hess.HessianBase):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
+        if self.sgx_response or self.cphf_residual_tol is not None:
+            raise NotImplementedError('sgx_response and cphf_residual_tol for UHF and UKS')
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
                          max_cycle=self.max_cycle, level_shift=self.level_shift)

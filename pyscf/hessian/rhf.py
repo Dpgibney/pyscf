@@ -52,6 +52,9 @@ JK_ENERGY_DOT = getattr(__config__, 'hessian_rhf_jk_energy_dot', True)
 # The screening threshold of make_h1's int2e_ip1 J/K (_make_h1_vhfopt); 0 computes every quartet, as without a
 # vhfopt
 MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-14)
+# cphf.solve_residual's tol under HessianBase.sgx_response. cphf.solve is not used with SGX's K: its Krylov vectors
+# shrink below what SGX's absolute thresholds resolve (propane: 42 response calls instead of 5, or stopping short)
+SGX_RESPONSE_RESIDUAL_TOL = 1e-4
 
 
 def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
@@ -493,13 +496,16 @@ def _get_jk(mol, intor, comp, aosym, script_dms,
 
 def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
               fx=None, atmlst=None, max_memory=4000, verbose=None,
-              max_cycle=50, level_shift=0):
+              max_cycle=50, level_shift=0, residual_tol=None):
     '''Solve the first order equation
 
     Kwargs:
         fx : function(dm_mo) => v1_mo
             A function to generate the induced potential.
             See also the function gen_vind.
+        residual_tol : float
+            If set, solve with cphf.solve_residual to this tolerance, otherwise
+            with cphf.solve to mf.conv_tol_cpscf
     '''
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
@@ -536,10 +542,15 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
 
         h1vo = numpy.vstack(h1vo)
         s1vo = numpy.vstack(s1vo)
-        tol = mf.conv_tol_cpscf * (ia1 - ia0)
-        mo1, e1 = cphf.solve(fx, mo_energy, mo_occ, h1vo, s1vo,
-                             max_cycle=max_cycle, level_shift=level_shift, tol=tol,
-                             verbose=log)
+        if residual_tol is None:
+            tol = mf.conv_tol_cpscf * (ia1 - ia0)
+            mo1, e1 = cphf.solve(fx, mo_energy, mo_occ, h1vo, s1vo,
+                                 max_cycle=max_cycle, level_shift=level_shift, tol=tol,
+                                 verbose=log)
+        else:
+            mo1, e1 = cphf.solve_residual(fx, mo_energy, mo_occ, h1vo, s1vo,
+                                          max_cycle=max_cycle, tol=residual_tol,
+                                          verbose=log, level_shift=level_shift)
         mo1 = numpy.einsum('pq,xqi->xpi', mo_coeff, mo1).reshape(-1,3,nao,nocc)
         e1 = e1.reshape(-1,3,nocc,nocc)
 
@@ -656,6 +667,27 @@ def gen_hop(hobj, mo_energy=None, mo_coeff=None, mo_occ=None, verbose=None):
     return h_op, hdiag
 
 
+def _sgx_response_scf(mf, level):
+    '''A copy of the SCF object mf whose J and K, and so those of its response
+    function, are direct SCF's J and SGX's K on grid level level, the shell
+    pairs of K screened by batch as in mf.RIJCOSX(). The orbitals, the XC grids
+    and everything else are mf's.'''
+    if getattr(mf, 'with_df', None) is not None:
+        raise NotImplementedError('sgx_response with a density-fitted SCF')
+    from pyscf.sgx.sgx import rijcosx
+    mf_sgx = rijcosx(mf)
+    sgx = mf_sgx.with_df
+    sgx.dfj = False
+    sgx.direct_j = True
+    sgx.grids_level_i = sgx.grids_level_f = level
+    sgx.build(level=level)
+    # the state of an SCF that this copy does not run
+    mf_sgx._nsteps_direct = 0
+    mf_sgx._in_scf = False
+    logger.info(mf, 'CPHF response with direct J and SGX K on grid level %d, '
+                '%d points', level, sgx.grids.weights.size)
+    return mf_sgx
+
 @contextlib.contextmanager
 def _without_semi_direct(mf, nset):
     '''Release the semi-direct ERIs of the SCF's J/K (SCF.semi_direct), and
@@ -686,9 +718,19 @@ class HessianBase(lib.StreamObject):
     # A small level_shift ~ 0.1 is often helpful to decrease 2 - 3 iterations
     # while the error of cphf solver may be increased by one magnitude.
     level_shift = 0
+    # Approximate the J and K of the CPHF response, only those: direct SCF's J and
+    # SGX's K on grid level sgx_response_level (1 is more accurate, K costs twice
+    # as much). The SCF, the derivative integrals and the XC and VV10 responses
+    # stay exact. Restricted references without density fitting only.
+    sgx_response = False
+    sgx_response_level = 0
+    # None: cphf.solve to mf.conv_tol_cpscf, unless sgx_response, which needs
+    # SGX_RESPONSE_RESIDUAL_TOL. A number: cphf.solve_residual with that tol
+    cphf_residual_tol = None
 
     _keys = {
-        'mol', 'base', 'atmlst', 'de', 'max_cycle', 'level_shift'
+        'mol', 'base', 'atmlst', 'de', 'max_cycle', 'level_shift',
+        'sgx_response', 'sgx_response_level', 'cphf_residual_tol'
     }
 
     def __init__(self, scf_method):
@@ -780,9 +822,17 @@ class HessianBase(lib.StreamObject):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
+        residual_tol = self.cphf_residual_tol
+        if self.sgx_response:
+            if residual_tol is None:
+                residual_tol = SGX_RESPONSE_RESIDUAL_TOL
+            if fx is None:
+                fx = gen_vind(_sgx_response_scf(self.base, self.sgx_response_level),
+                              mo_coeff, mo_occ)
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
-                         max_cycle=self.max_cycle, level_shift=self.level_shift)
+                         max_cycle=self.max_cycle, level_shift=self.level_shift,
+                         residual_tol=residual_tol)
 
     def hess_nuc(self, mol=None, atmlst=None):
         if mol is None: mol = self.mol

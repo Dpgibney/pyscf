@@ -678,9 +678,14 @@ class SGX(lib.StreamObject):
         if with_j and (self.dfj or self.direct_j):
             if self.dfj:
                 vj = df_jk.get_j(self, dm, hermi, direct_scf_tol)
-            else:
+            elif vhfopt is None:
                 vj, _ = _vhf.direct(dm, self.mol._atm, self.mol._bas, self.mol._env,
-                                    vhfopt, hermi, self.mol.cart, True, False)
+                                    None, hermi, self.mol.cart, True, False)
+            else:
+                # the screening for J alone, as in SCF.get_jk
+                with lib.temporary_env(vhfopt, prescreen='CVHFnrs8_vj_prescreen'):
+                    vj, _ = _vhf.direct(dm, self.mol._atm, self.mol._bas, self.mol._env,
+                                        vhfopt, hermi, self.mol.cart, True, False)
             if with_k:
                 if self.optk:
                     vk = sgx_jk.get_k_only(self, dm, hermi, direct_scf_tol)
