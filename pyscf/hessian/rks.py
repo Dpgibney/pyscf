@@ -118,7 +118,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     max_memory = max(2000, mf.max_memory*.9-mem_now)
     h1ao = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
     if mf.do_nlc():
-        h1ao += _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+        _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=h1ao)
 
     aoslices = mol.aoslice_by_atom()
     vhfopt = rhf_hess._make_h1_vhfopt(mol, dm0, 'jk' if hybrid else 'j')
@@ -1527,7 +1527,7 @@ def get_dweight_dA(mol, grids):
 
     return dweight_dA
 
-def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
+def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None):
     """
         Equation notation follows:
         Liang J, Feng X, Liu X, Head-Gordon M. Analytical harmonic vibrational frequencies with
@@ -1538,6 +1538,8 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         3*natm perturbed potentials (the kernel terms of drho/dA and dgamma/dA, the derivatives of the
         weights and the grid response of E, U and W) in one pass over the grid, and the derivatives of the
         AO products with the ground-state potential, for the AOs of atom A and for the points of atom A.
+        With out (natm,3,nao,nao) of symmetric matrices, h1 is added to it and it is returned, without an
+        array of h1's own.
     """
     # Note (Henry Wang 20250428):
     # We observed that in several very simple systems, for example H2O2, H2CO, C2H4,
@@ -1624,7 +1626,12 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 
     # h1 holds half of each matrix: the result is h1 + h1^T. The potentials of a block take d(nabla rho)/dA,
     # evaluated again from the AO values of the block rather than kept for all points.
-    h1 = numpy.zeros((natm,3,nao,nao))
+    if out is not None and out.flags.c_contiguous and out.dtype == numpy.double:
+        # half of out, to which the symmetrization at the end adds h1 + h1^T
+        h1 = out
+        h1 *= .5
+    else:
+        h1 = numpy.zeros((natm,3,nao,nao))
     h1_sets = h1.reshape(natm*3,nao,nao)
     wf_gamma = weights * f_gamma
     shls_slice = (0, mol.nbas)
@@ -1668,6 +1675,9 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         on_atom = numpy.arange(ia0, ia1)[:,numpy.newaxis,numpy.newaxis] == atm_idx
         _vv10_dot_terms(ni, mol, grids, on_atom * wv, 'grad', h1[ia0:ia1], max_memory, fused)
     lib.hermi_sum(h1_sets, axes=(0,2,1), inplace=True)
+    if out is not None and h1 is not out:
+        out += h1
+        return out
     return h1
 
 def get_vnlc_resp(mf, mol, mo_coeff, mo_occ, dm1s, max_memory, out=None):

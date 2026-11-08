@@ -102,7 +102,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     max_memory = max(2000, mf.max_memory*.9-mem_now)
     h1ao = rks_hess._get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
     if mf.do_nlc():
-        h1ao += rks_hess._get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+        rks_hess._get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=h1ao)
 
     for ia, h1, vj1, vk1 in df_rhf_hess._gen_jk(
             hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose, with_k=hybrid):
