@@ -451,6 +451,39 @@ class KnownValues(unittest.TestCase):
             for a, b in zip(ref, xc_terms()):
                 self.assertAlmostEqual(abs(a - b).max(), 0, 12)
 
+    def test_fused_nlc(self):
+        # VV10 (nr_nlc_vxc, and the gradient's grad.rks.get_nlc_vxc) with the AO
+        # values computed in the kernels, which keep no radial parts on the NLC
+        # grids, against the block_loop path: bit for bit from a dm, to rounding
+        # from orbitals
+        from pyscf.grad import rks as rks_grad
+        numpy.random.seed(7)
+        nao = mol.nao_nr()
+        grids = dft.gen_grid.Grids(mol)
+        grids.atom_grid = {'H': (20, 50)}
+        grids.build(with_non0tab=True)
+        mo = numpy.linalg.qr(numpy.random.random((nao,nao)))[0]
+        occ = numpy.zeros(nao)
+        occ[:6] = 2
+        dm = numpy.einsum('pi,i,qi->pq', mo, occ, mo)
+        dm_mo = lib.tag_array(dm, mo_coeff=mo, mo_occ=occ)
+        ni = numint.NumInt()
+        self.assertIsNotNone(numint._fused_xc(ni, mol, grids, nao, 'GGA', 2000, (dm,),
+                                              radial_cache=False))
+        def nlc_results():
+            return (ni.nr_nlc_vxc(mol, grids, 'wb97m_v', dm),
+                    ni.nr_nlc_vxc(mol, grids, 'wb97m_v', dm_mo),
+                    rks_grad.get_nlc_vxc(ni, mol, grids, 'wb97m_v', dm_mo)[1])
+        with lib.temporary_env(numint, FUSED_XC=False):
+            ref = nlc_results()
+        out = nlc_results()
+        self.assertIsNone(grids._fused_ao_data.radial)
+        for a, b in zip(ref[0], out[0]):
+            self.assertTrue(numpy.array_equal(a, b))
+        for a, b in zip(ref[1] + ref[2:], out[1] + out[2:]):
+            a = numpy.asarray(a)
+            self.assertAlmostEqual(abs(a - b).max() / max(abs(a).max(), 1), 0, 13)
+
     def test_rks_vxc(self):
         numpy.random.seed(10)
         nao = mol.nao_nr()

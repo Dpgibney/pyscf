@@ -213,15 +213,32 @@ def get_nlc_vxc(ni, mol, grids, xc_code, dm, relativity=0, hermi=1,
         raise NotImplementedError('Additive NLC')
     nlc_pars, fac = nlc_coefs[0]
     ao_deriv = 2
-    vvrho = []
-    for ao, mask, weight, coords \
-            in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
-        vvrho.append(make_rho(0, ao[:4], mask, 'GGA'))
-    rho = numpy.hstack(vvrho)
+    # As numint.nr_nlc_vxc: the fused kernels, without the AO blocks of
+    # block_loop and without the radial parts cached on the NLC grids
+    fused = numint._fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (dm,),
+                             radial_cache=False)
+    if fused is not None:
+        make_rho = fused.rho_evaluator(ni, [dm], hermi, 'GGA')
+        rho = numpy.hstack([make_rho(ip0, ip1)[0][0] for ip0, ip1 in fused.blocks])
+    else:
+        vvrho = []
+        for ao, mask, weight, coords \
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            vvrho.append(make_rho(0, ao[:4], mask, 'GGA'))
+        rho = numpy.hstack(vvrho)
 
     vxc = numint._vv10nlc(rho, grids.coords, rho, grids.weights,
                           grids.coords, nlc_pars)[1]
     vv_vxc = xc_deriv.transform_vxc(rho, vxc, 'GGA', spin=0)
+
+    if fused is not None:
+        terms = numint._xc_grad_terms('GGA')
+        for ip0, ip1 in fused.blocks:
+            wv = vv_vxc[:,ip0:ip1] * grids.weights[ip0:ip1]
+            wv[0] *= .5
+            fused.dot_terms(ip0, ip1, wv[numpy.newaxis], terms, vmat[numpy.newaxis])
+        # - sign because nabla_X = -nabla_x
+        return None, -vmat
 
     p1 = 0
     for ao, mask, weight, coords \

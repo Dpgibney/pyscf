@@ -1547,12 +1547,14 @@ def _xc_hess_diag_terms(xctype):
     return _pack_terms(kets, bras, 3)
 
 def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None,
-              match_block_loop=True):
+              match_block_loop=True, radial_cache=True):
     '''A _FusedXC for the blocks NumInt.block_loop would give the callers of
     _sparse_reader_kw, if the fused kernels can take them all: FUSED_XC,
     NumInt's own functions and real density matrices (_sparse_reader_kw),
     spherical GTOs, and with match_block_loop the sparse path on every block
     (the kernels give the results of the sparse ones). Otherwise None.
+    Without radial_cache, the radial parts of the AO values are not kept on
+    the grids (_grid_ao_data) unless they are already.
     '''
     if (not FUSED_XC or xctype not in _FUSED_XCTYPE or mol.cart or
             not _sparse_reader_kw(ni, *dms_list)):
@@ -1573,7 +1575,7 @@ def _fused_xc(ni, mol, grids, nao, xctype, max_memory, dms_list, blksize=None,
     if (match_block_loop and nao <= SWITCH_SIZE and
             not all(_sparse_enough(screen_index[ip0//BLKSIZE:]) for ip0, ip1 in blocks)):
         return None
-    data = _grid_ao_data(mol, grids, deriv, max_memory)
+    data = _grid_ao_data(mol, grids, deriv, max_memory if radial_cache else 0)
     return _FusedXC(mol, grids, nao, data, blocks, max_memory)
 
 def _fused_xc_mo(ni, mol, grids, xctype, max_memory, spin=0):
@@ -2289,11 +2291,20 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dm, relativity=0, hermi=1,
     nbins = NBINS * 2 - int(NBINS * numpy.log(cutoff) / numpy.log(grids.cutoff))
 
     ao_deriv = 1
-    vvrho = []
-    for ao, mask, weight, coords \
-            in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
-        vvrho.append(make_rho(0, ao, mask, 'GGA'))
-    rho = numpy.hstack(vvrho)
+    # The fused kernels compute the AO values in place: the AO blocks of
+    # block_loop, sized by max_memory, are not made. The radial parts are not
+    # cached on the NLC grids: two passes per call save little time with them.
+    fused = _fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (dm,),
+                      radial_cache=False)
+    if fused is not None:
+        make_rho = fused.rho_evaluator(ni, [dm], hermi, 'GGA')
+        rho = numpy.hstack([make_rho(ip0, ip1)[0][0] for ip0, ip1 in fused.blocks])
+    else:
+        vvrho = []
+        for ao, mask, weight, coords \
+                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory=max_memory):
+            vvrho.append(make_rho(0, ao, mask, 'GGA'))
+        rho = numpy.hstack(vvrho)
 
     exc = 0
     vxc = 0
@@ -2307,6 +2318,13 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dm, relativity=0, hermi=1,
     nelec = den.sum()
     excsum = numpy.dot(den, exc)
     vv_vxc = xc_deriv.transform_vxc(rho, vxc, 'GGA', spin=0)
+
+    if fused is not None:
+        vmat = numpy.zeros((1,nao,nao))
+        for ip0, ip1 in fused.blocks:
+            wv = vv_vxc[:,ip0:ip1] * grids.weights[ip0:ip1]
+            fused._dot_wv(ip0, ip1, wv[numpy.newaxis], 'GGA', hermi, vmat, None)
+        return nelec, excsum, fused._vmat('GGA', vmat, None)[0]
 
     pair_mask = mol.get_overlap_cond() < -numpy.log(ni.cutoff)
     aow = None
