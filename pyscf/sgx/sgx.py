@@ -175,6 +175,11 @@ class _SGXHF:
         self._sgx_ehist = ehist[-1:] + [e_tot]
         return e_tot
 
+    def _sgx_near_convergence(self):
+        '''Whether the last change of the energy is under 1000 conv_tol'''
+        ehist = getattr(self, '_sgx_ehist', [])
+        return len(ehist) == 2 and abs(ehist[1] - ehist[0]) < 1e3 * self.conv_tol
+
     def reset(self, mol=None):
         self._nsteps_direct = 0
         self._in_scf = False
@@ -261,6 +266,12 @@ class _SGXHF:
                     self._grids_reset = True
                     will_reset = True
                 elif self._nsteps_direct == 0:
+                    will_reset = True
+                elif sgx.sgx_tol_pair is not None and self._sgx_near_convergence():
+                    # The pair screening of an incremental build moves the energy by an
+                    # amount that differs from build to build (n-C20H42/def2-TZVP wB97M-V:
+                    # ~3e-8 Eh), so near convergence every build is a full one, whose
+                    # screening error is the same each cycle.
                     will_reset = True
                 if will_reset:
                     sgx._full_dm = None
