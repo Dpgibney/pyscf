@@ -1670,28 +1670,37 @@ def get_vnlc_resp1(mf, mol, dm0, dm1s, max_memory):
     mask = vv.mask
     fused = numint._fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (dm1s,), radial_cache=False)
 
-    # Per dm1: rho and nabla rho, then the potential, on all points, and the trial densities and
-    # kernels on the points of the mask
-    nbytes = (8 * vv.ngrids_full + 8 * vv.ngrids) * 8
-    batch = max(1, min(n_dm1, int(max_memory * .5e6 / nbytes)))
+    # The pair kernel (f_t) evaluates every pair of points once per call, so a call takes as many dm1s
+    # as their trial densities, kernels and nabla rho on the points of the mask (7 ngrids per dm1)
+    # allow; their rho and nabla rho, then their potentials, on all points (4 ngrids_full per dm1) go
+    # through the fused kernels in batches of at least 32 dm1s
+    nbytes_kept = 7 * vv.ngrids * 8
+    nbytes_full = 4 * vv.ngrids_full * 8
+    mem = max_memory * .6e6
+    batch = max(1, min(n_dm1, 32, int(mem / (nbytes_kept + nbytes_full))))
+    group = max(batch, min(n_dm1, int((mem - batch * nbytes_full) / nbytes_kept)))
     vmat = numpy.zeros((n_dm1, nao, nao))
-    for k0, k1 in lib.prange(0, n_dm1, batch):
-        rho1 = _vv10_rho(ni, mol, grids, dm1s[k0:k1], 0, max_memory, fused)
-        rho_t = rho1[:,0,mask]
-        nabla_rho_t = rho1[:,1:4,mask]
-        rho1 = None
+    for g0, g1 in lib.prange(0, n_dm1, group):
+        nabla_rho_t = numpy.empty((g1-g0, 3, vv.ngrids))
+        rho_t = numpy.empty((g1-g0, vv.ngrids))
+        for k0, k1 in lib.prange(g0, g1, batch):
+            rho1 = _vv10_rho(ni, mol, grids, dm1s[k0:k1], 0, max_memory, fused)
+            rho_t[k0-g0:k1-g0] = rho1[:,0,mask]
+            nabla_rho_t[k0-g0:k1-g0] = rho1[:,1:4,mask]
+            rho1 = None
         # The factor of 2 before the gamma_j^t term in equation (22)
         gamma_t = 2 * numpy.einsum('ig,tig->tg', vv.nabla_rho, nabla_rho_t)
         f_rho_t, f_gamma_t = vv.f_t(rho_t, gamma_t)
         rho_t = gamma_t = None
 
-        wv = numpy.zeros((k1-k0, 4, vv.ngrids_full))
-        wv[:,0,mask] = f_rho_t * vv.weights
-        wv[:,1:4,mask] = (vv.nabla_rho * f_gamma_t[:,numpy.newaxis] + nabla_rho_t * vv.f_gamma) \
-                * (2 * vv.weights)
+        for k0, k1 in lib.prange(0, g1-g0, batch):
+            wv = numpy.zeros((k1-k0, 4, vv.ngrids_full))
+            wv[:,0,mask] = f_rho_t[k0:k1] * vv.weights
+            wv[:,1:4,mask] = (vv.nabla_rho * f_gamma_t[k0:k1,numpy.newaxis]
+                              + nabla_rho_t[k0:k1] * vv.f_gamma) * (2 * vv.weights)
+            _vv10_vmat_(ni, mol, grids, wv, vmat[g0+k0:g0+k1], max_memory, fused)
+            wv = None
         f_rho_t = f_gamma_t = nabla_rho_t = None
-        _vv10_vmat_(ni, mol, grids, wv, vmat[k0:k1], max_memory, fused)
-        wv = None
     lib.hermi_sum(vmat, axes=(0,2,1), inplace=True)
 
     if output_in_2d:
