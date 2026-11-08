@@ -80,48 +80,57 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
             logger.warn(mf, "NLC contribution in gen_response is NOT included")
 
         triplet = singlet is not None and not singlet
+
+        def acc(v1, v, own=True):
+            '''v1 + v, in place in v1; for v1=None, v itself if own (no other
+            result shares its memory), else a copy'''
+            if v1 is None:
+                return v if own else v.copy()
+            v1 += v
+            return v1
+
         if not triplet:
-            def vind_jk(dm1, v1):
-                '''v1 += the Coulomb and exchange response of dm1. Each J or K
-                stack is scaled in place and added to v1 before the next one is
-                made, so that at most two are alive beside dm1 and v1.'''
+            def vind_jk(dm1, v1=None):
+                '''The Coulomb and exchange response of dm1 added to v1, or in
+                the memory of J for v1=None. Each J or K stack is scaled in place
+                and added before the next one is made, so that at most two are
+                alive beside dm1 and v1.'''
                 if hybrid:
-                    if omega == 0:
+                    if omega == 0 or (alpha != 0 and hyb != 0):
+                        # full-range J and K (and long-range K below)
                         vj, vk = mf.get_jk(mol, dm1, hermi)
                         vk *= -.5 * hyb
-                    elif alpha == 0: # LR=0, only SR exchange
-                        vj = mf.get_j(mol, dm1, hermi)
+                        own = not numpy.may_share_memory(vj, vk)
                         if hermi != 2:
-                            v1 += vj
+                            v1 = acc(v1, vj, own)
                         vj = None
-                        vk = mf.get_k(mol, dm1, hermi, omega=-omega)
-                        vk *= -.5 * hyb
-                    elif hyb == 0: # SR=0, only LR exchange
-                        vj = mf.get_j(mol, dm1, hermi)
+                        v1 = acc(v1, vk, own)
+                    else:
                         if hermi != 2:
-                            v1 += vj
-                        vj = None
-                        vk = mf.get_k(mol, dm1, hermi, omega=omega)
-                        vk *= -.5 * alpha
-                    else: # SR and LR exchange with different ratios
-                        vj, vk = mf.get_jk(mol, dm1, hermi)
-                        vk *= -.5 * hyb
-                    if vj is not None and hermi != 2:
-                        v1 += vj
-                    vj = None
-                    v1 += vk
+                            v1 = acc(v1, mf.get_j(mol, dm1, hermi))
+                        if alpha == 0: # LR=0, only SR exchange
+                            vk = mf.get_k(mol, dm1, hermi, omega=-omega)
+                            vk *= -.5 * hyb
+                        else: # SR=0, only LR exchange
+                            vk = mf.get_k(mol, dm1, hermi, omega=omega)
+                            vk *= -.5 * alpha
+                        v1 = acc(v1, vk)
                     vk = None
                     if omega != 0 and alpha != 0 and hyb != 0:
+                        # SR and LR exchange with different ratios
                         vk = mf.get_k(mol, dm1, hermi, omega=omega)
                         vk *= -.5 * (alpha-hyb)
-                        v1 += vk
+                        v1 = acc(v1, vk)
                 elif hermi != 2:
-                    v1 += mf.get_j(mol, dm1, hermi=hermi)
+                    v1 = acc(v1, mf.get_j(mol, dm1, hermi=hermi))
+                if v1 is None:
+                    v1 = numpy.zeros_like(dm1)
                 return v1
         else:
-            def vind_jk(dm1, v1):
-                '''v1 += the exchange response of dm1 (triplets have no Coulomb
-                response), each K stack added to v1 before the next one is made'''
+            def vind_jk(dm1, v1=None):
+                '''The exchange response of dm1 (triplets have no Coulomb
+                response) added to v1, or in the memory of K for v1=None, each K
+                stack added before the next one is made'''
                 if hybrid:
                     if omega == 0:
                         vk = mf.get_k(mol, dm1, hermi)
@@ -135,12 +144,14 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                     else: # SR and LR exchange with different ratios
                         vk = mf.get_k(mol, dm1, hermi)
                         vk *= -.5 * hyb
-                    v1 += vk
+                    v1 = acc(v1, vk)
                     vk = None
                     if omega != 0 and alpha != 0 and hyb != 0:
                         vk = mf.get_k(mol, dm1, hermi, omega=omega)
                         vk *= -.5 * (alpha-hyb)
-                        v1 += vk
+                        v1 = acc(v1, vk)
+                if v1 is None:
+                    v1 = numpy.zeros_like(dm1)
                 return v1
 
         def vind_nlc(dm1, v1):
@@ -168,10 +179,12 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
 
         def vind(dm1):
             if hermi == 2:
-                v1 = numpy.zeros_like(dm1)
-            else:
-                v1 = vind_nlc(dm1, vind_xc(dm1))
-            return vind_jk(dm1, v1)
+                return vind_jk(dm1)
+            # J and K first, in memory of their own that the XC and VV10
+            # responses are then added to
+            v1 = vind_nlc(dm1, vind_jk(dm1))
+            v1 += vind_xc(dm1)
+            return v1
 
         # The XC response of dms whose symmetric parts are a[k] Q^T + Q a[k]^T,
         # as in CPHF (a = mo_coeff x, Q = mocc) and TDDFT (TDA: a = orbv z^T,
@@ -204,7 +217,7 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                         else:
                             fxc_mo = fxc[0,:,0] - fxc[0,:,1]
                     fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w)
-                    v1 = vind_jk(dm1, vind_nlc(dm1, numpy.zeros_like(dm1)))
+                    v1 = vind_nlc(dm1, vind_jk(dm1))
                 else:
                     v1 = vind(dm1)
                 return v1, w
@@ -230,10 +243,17 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
         if (singlet is None or singlet) and hermi != 2:
             def vind(dm1):
                 vj, vk = mf.get_jk(mol, dm1, hermi=hermi)
-                return vj - .5 * vk
+                if numpy.may_share_memory(vj, vk):
+                    return vj - .5 * vk
+                # vj - .5 * vk in the memory of vj
+                vk *= -.5
+                vj += vk
+                return vj
         else:
             def vind(dm1):
-                return -.5 * mf.get_k(mol, dm1, hermi=hermi)
+                vk = mf.get_k(mol, dm1, hermi=hermi)
+                vk *= -.5
+                return vk
 
     return vind
 

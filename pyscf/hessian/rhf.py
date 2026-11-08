@@ -20,6 +20,7 @@
 Non-relativistic RHF analytical Hessian
 '''
 
+import contextlib
 from functools import reduce
 import ctypes
 
@@ -655,6 +656,27 @@ def gen_hop(hobj, mo_energy=None, mo_coeff=None, mo_occ=None, verbose=None):
     return h_op, hdiag
 
 
+@contextlib.contextmanager
+def _without_semi_direct(mf, nset):
+    '''Release the semi-direct ERIs of the SCF's J/K (SCF.semi_direct), and
+    keep get_jk from storing them again for the duration, if the arrays of nset
+    perturbations that the Hessian keeps (H1 and the CPHF's density matrices and
+    responses, about five matrices each) do not fit under mf.max_memory beside
+    them. Its derivative integrals are other ones, and the many-density J/K of
+    the CPHF (_vhf._direct_s8_batch) does not read them; only its calls for few
+    dms do. The next SCF stores them again.'''
+    nao = mf.mol.nao
+    need = 5 * nset * nao**2 * 8e-6
+    if (not getattr(mf, 'semi_direct', False) or
+            lib.current_memory()[0] + need <= mf.max_memory):
+        yield
+        return
+    for vhfopt in getattr(mf, '_opt', {}).values():
+        if vhfopt is not None:
+            vhfopt.__dict__.pop('semi_direct_eri', None)
+    with lib.temporary_env(mf, semi_direct=False):
+        yield
+
 class HessianBase(lib.StreamObject):
     '''Non-relativistic restricted Hartree-Fock hessian'''
 
@@ -778,7 +800,10 @@ class HessianBase(lib.StreamObject):
         else:
             self.atmlst = atmlst
 
-        de = self.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
+        # 3 perturbations of each atom, for each spin of UHF
+        nset = 3 * len(atmlst) * (2 if numpy.ndim(mo_occ) == 2 else 1)
+        with _without_semi_direct(self.base, nset):
+            de = self.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
         self.de = de + self.hess_nuc(self.mol, atmlst=atmlst)
         if self.base.do_disp():
             self.de += self.get_dispersion()

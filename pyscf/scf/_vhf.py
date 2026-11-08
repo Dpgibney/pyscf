@@ -511,6 +511,18 @@ INCORE_BATCH_MIN = 1
 INCORE_FUSED_MAX = 6
 INCORE_FUSED_J_MAX = 3
 
+def _symmetric(dms, tol=1e-13):
+    '''abs(dms - dms.transpose(0,2,1)).max() <= tol * max(abs(dms).max(), 1),
+    taken a few dms at a time rather than with temporaries of all of them'''
+    n_dm, nao = dms.shape[:2]
+    step = max(1, (1 << 22) // max(nao * nao, 1))
+    dmax = amax = 0
+    for p0 in range(0, n_dm, step):
+        dm = dms[p0:p0+step]
+        dmax = max(dmax, abs(dm - dm.transpose(0,2,1)).max())
+        amax = max(amax, abs(dm).max())
+    return dmax <= tol * max(amax, 1)
+
 def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
     '''J and K of all dms from s8 ERIs, see nr_incore_batch.c'''
     n_dm, nao = dms.shape[:2]
@@ -518,8 +530,7 @@ def _incore_s8_batch(eri, dms, hermi, with_j, with_k):
     # With hermi=1 the per-dm kernel returns the lower triangle of K for any
     # dm. The symmetric formulations equal it only for symmetric dms, so other
     # dms take the general one and its lower triangle.
-    sym_k = with_k and hermi == 1 and (
-        abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
+    sym_k = with_k and hermi == 1 and _symmetric(dms)
     if (n_dm <= INCORE_FUSED_MAX and sym_k) or (n_dm <= INCORE_FUSED_J_MAX and not with_k):
         # J and K of each dm in one pass over the ERIs
         null = lib.c_null_ptr()
@@ -613,8 +624,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
         cvhfopt = ctypes.byref(cvhfopt)
     # As for incore(): with hermi=1 the per-dm kernels return the lower
     # triangle of K for any dm; the symmetric formulation needs symmetric dms.
-    sym_k = with_k and hermi == 1 and (
-        abs(dms - dms.transpose(0,2,1)).max() <= 1e-13 * max(abs(dms).max(), 1))
+    sym_k = with_k and hermi == 1 and _symmetric(dms)
 
     # Each thread accumulates nao*nao*n doubles for J and for K. With JK_GEMM, 13
     # dms or more (16 with the padding) keep the dms, D + D^T and the sums once,
@@ -653,12 +663,15 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
             c_atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_atm.shape[0]),
             c_bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(c_bas.shape[0]),
             c_env.ctypes.data_as(ctypes.c_void_p))
+        dm = dm_sum = None
         if with_j:
             vj[p0:p1] = (vjb + vjb.transpose(1,0,2)).transpose(2,0,1)[:p1-p0]
+            vjb = None
         if with_k:
             if sym_k:
                 vkb = vkb + vkb.transpose(1,0,2)
             vk[p0:p1] = vkb.transpose(2,0,1)[:p1-p0]
+            vkb = None
     if sd_eri is not None:
         sd_eri.used = True
     if with_k and hermi != 0 and not sym_k:
