@@ -16,7 +16,7 @@
 #
 
 import unittest
-from pyscf import gto
+from pyscf import gto, lib
 from pyscf import scf, dft
 from pyscf.sgx import sgx
 
@@ -147,6 +147,26 @@ class KnownValues(unittest.TestCase):
         mf1.kernel()
         g1 = mf1.nuc_grad_method().kernel()
         self.assertAlmostEqual(abs(g - g1).max(), 0, 8)
+
+    def test_rijcosx_rsh(self):
+        # a range-separated hybrid: the long-range K on the RSH copy of the SGX object, with the
+        # build's state (full density, pair threshold), and no long-range J
+        from pyscf.df import df_jk
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
+        omegas = []
+        get_j = df_jk.get_j
+        def get_j_spy(dfobj, dm, *args, **kwargs):
+            omegas.append(dfobj.mol.omega)
+            return get_j(dfobj, dm, *args, **kwargs)
+        with lib.temporary_env(df_jk, get_j=get_j_spy):
+            mf = dft.RKS(mol, xc='wb97x').RIJCOSX()
+            e = mf.kernel()
+        self.assertTrue(mf.converged)
+        self.assertTrue(len(omegas) > 0 and all(w == 0 for w in omegas))
+        mf1 = dft.RKS(mol, xc='wb97x').RIJCOSX()
+        mf1.with_df.sgx_tol_pair = None
+        e1 = mf1.kernel()
+        self.assertAlmostEqual(e, e1, 7)
 
     def test_sgx_jk_blocks(self):
         # SGX J and K in several blocks of the grid (a small max_memory) as in one

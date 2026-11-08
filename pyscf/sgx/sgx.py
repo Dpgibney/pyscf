@@ -630,9 +630,17 @@ class SGX(lib.StreamObject):
                 self._rsh_df[key] = rsh_df
                 logger.info(self, 'Create RSH-SGX object %s for omega=%s', rsh_df, omega)
 
-            with rsh_df.mol.with_range_coulomb(omega):
-                return rsh_df.get_jk(dm, hermi, with_j, with_k,
-                                     direct_scf_tol)
+            # the build's state lives on this object, for the call: the full density of an
+            # incremental build (for the energy screening) and the threshold of the pair screening
+            rsh_df._full_dm = self._full_dm
+            rsh_df._pair_tol_now = self._pair_tol_now
+            try:
+                with rsh_df.mol.with_range_coulomb(omega):
+                    return rsh_df.get_jk(dm, hermi, vhfopt, with_j=with_j, with_k=with_k,
+                                         direct_scf_tol=direct_scf_tol)
+            finally:
+                rsh_df._full_dm = None
+                rsh_df._pair_tol_now = None
 
         if with_j and (self.dfj or self.direct_j):
             if self.dfj:
