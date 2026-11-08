@@ -294,6 +294,42 @@ class PJunctionScreening(unittest.TestCase):
         sgx_jk.SWITCH_SIZE = switch
 
 
+class ManyDensities(unittest.TestCase):
+    def test_get_k_only_many(self):
+        # K of 12 dms at once (SGXnr_direct_k_many) against one dm at a time,
+        # with the pair screening of RIJCOSX and with none, symmetric and not
+        mol = gto.M(atom=WATER_CLUSTER, basis='def2-svp', verbose=0)
+        numpy.random.seed(2)
+        nao = mol.nao
+        dms = numpy.random.rand(12, nao, nao) - .5
+        dms_sym = dms + dms.transpose(0,2,1)
+        mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+        sgx_obj = mf.with_df
+        sgx_obj.build(level=1)
+        mf._nsteps_direct = 0
+        mf._in_scf = False
+        for pair_tol in (1e-9, None):
+            sgx_obj.sgx_tol_pair = pair_tol
+            sgx_obj.sgx_tol_energy = None if pair_tol is None else sgx_obj.sgx_tol_energy
+            sgx_obj.sgx_tol_potential = None if pair_tol is None else sgx_obj.sgx_tol_potential
+            sgx_obj.reset()
+            sgx_obj.build(level=1)
+            for d, hermi in ((dms_sym, 1), (dms, 0)):
+                nmin = sgx_jk.SGX_MANY_DM_MIN
+                try:
+                    # SGXnr_direct_k_drv on all dms (the same screening) and
+                    # on one at a time
+                    sgx_jk.SGX_MANY_DM_MIN = 10**9
+                    ref = sgx_obj.get_jk(d, hermi, with_j=False)[1]
+                    ref1 = numpy.asarray([sgx_obj.get_jk(x, hermi, with_j=False)[1] for x in d])
+                    sgx_jk.SGX_MANY_DM_MIN = 1
+                    vk = sgx_obj.get_jk(d, hermi, with_j=False)[1]
+                finally:
+                    sgx_jk.SGX_MANY_DM_MIN = nmin
+                self.assertEqual(vk.shape, d.shape)
+                self.assertAlmostEqual(abs(vk - ref).max() / abs(ref).max(), 0, 13)
+                self.assertAlmostEqual(abs(vk - ref1).max() / abs(ref).max(), 0, 9)
+
 if __name__ == "__main__":
     print("Full Tests for sgx_jk")
     unittest.main()

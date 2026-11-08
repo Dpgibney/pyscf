@@ -1110,6 +1110,124 @@ def _same_dm(a, b):
     return a.shape == b.shape and numpy.array_equal(a, b)
 
 
+# Densities from which get_k_only takes them all at once (_get_k_only_many):
+# the integrals of each batch of points once for all, F = X D and K = X^T w G
+# as matrix products over all densities
+SGX_MANY_DM_MIN = 8
+
+def _get_k_only_many(sgx, dms, hermi, direct_scf_tol):
+    '''get_k_only for many density matrices (nset, nao, nao): for each block of
+    points, F[g,j,x] = sum_i X_i(g) (P dm_x)_ij and K'[i,j,x] += sum_g X_i(g)
+    w_g G[g,j,x] by matrix products over all densities, and G[g,i,x] = sum_j
+    A_ij(g) F[g,j,x] by SGXnr_direct_k_many, which evaluates the integrals of a
+    batch's shell pairs (screened as get_k_only's) once for all densities. The
+    densities' grid-point screening (dm_mask, get_g_threshold) is not applied.
+    None if the screening of sgx's data is not one SGXnr_direct_k_many takes.'''
+    mol = sgx.mol
+    grids = sgx.grids
+    sgxdat = sgx._pjs_data
+    if not (sgxdat._pair_tol is not None or
+            not (sgxdat._screen_energy or sgxdat._screen_potential)):
+        return None
+    if dms.dtype != numpy.double:
+        return None
+    nset, nao = dms.shape[:2]
+    # SGXnr_direct_k_many takes the densities 8 at a time
+    nset_pad = (nset + 7) // 8 * 8
+    ngrids = grids.weights.size
+    loop_data = sgxdat.get_loop_data(nset=nset_pad, with_pair_mask=False)
+    nbins, screen_index, pair_mask, ao_loc, blksize = loop_data
+    ao_loc = numpy.asarray(ao_loc, dtype=numpy.int32)
+    proj = sgxdat._overlap_correction_matrix
+    # (P dm_x)_ij as dmT[i,j,x], and K' in the same layout
+    dmT = numpy.zeros((nao, nao, nset_pad))
+    dmT[:,:,:nset] = lib.einsum('ki,xij->kjx', proj, dms)
+    dmT = dmT.reshape(nao, nao * nset_pad)
+    vkT = numpy.zeros((nao, nao * nset_pad))
+
+    full_dm_ij = None
+    if sgxdat.use_dm_screening and sgx._full_dm is not None:
+        full_dm = sgx._full_dm
+        if full_dm.ndim == 3:
+            full_dm = full_dm.sum(axis=0)
+        full_dm_ij = numpy.zeros((mol.nbas, mol.nbas))
+        sgxdat._make_shl_mat(full_dm, full_dm_ij, ao_loc, ao_loc)
+    if sgxdat._pair_tol is not None:
+        tol_now = getattr(sgx, '_pair_tol_now', None)
+        sgxdat._this.etol = sgxdat._pair_tol if tol_now is None else tol_now
+    sgxdat.direct_scf_tol = direct_scf_tol
+    cintor = _vhf._fpointer(sgxdat._intor)
+    cintopt = sgxdat._cintopt
+    atm, bas = mol._atm, mol._bas
+    drv = _vhf.libcvhf.SGXnr_direct_k_many
+    t_ao = t_f = t_drv = t_k = 0
+    for i0, i1 in lib.prange(0, ngrids, blksize):
+        assert i0 % SGX_BLKSIZE == 0
+        coords = grids.coords[i0:i1]
+        weights = grids.weights[i0:i1]
+        mask = screen_index[i0 // BLKSIZE:]
+        t1 = time.perf_counter()
+        ao = ao_full = mol.eval_gto('GTOval', coords, non0tab=mask)
+        # the AOs with values on the block's points (eval_gto zeroes the rest)
+        nblk = (i1 - i0 + BLKSIZE - 1) // BLKSIZE
+        shl_on = numpy.nonzero(mask[:nblk].max(axis=0))[0]
+        if shl_on.size < mol.nbas:
+            ao_on = numpy.hstack([numpy.arange(ao_loc[i], ao_loc[i+1]) for i in shl_on])
+            ao = numpy.asarray(ao[:,ao_on], order='C')
+        else:
+            ao_on = None
+        t2 = time.perf_counter()
+        if ao_on is None:
+            fg = lib.dot(ao, dmT)
+        else:
+            fg = lib.dot(ao, dmT[ao_on])
+        t3 = time.perf_counter()
+        full_fsgx_bi = None
+        if full_dm_ij is not None:
+            full_fni_bi = sgxdat.reduce_ao_to_shl_mat(ao_full, ao_loc, weights)
+            full_fni_bi = lib.dot(full_fni_bi, full_dm_ij)
+            full_fsgx_bi = sgxdat.reduce_mask_ni2sgx(full_fni_bi)
+        gv = numpy.zeros_like(fg)
+        env = numpy.append(mol._env, coords.ravel())
+        env[gto.NGRIDS] = i1 - i0
+        env[gto.PTR_GRIDS] = mol._env.size
+        sgxdat.set_block(i0 // SGX_BLKSIZE, weights, full_fsgx_bi)
+        try:
+            err = drv(cintor, fg.ctypes.data_as(ctypes.c_void_p),
+                      gv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nset_pad),
+                      ctypes.c_int(SGX_BLKSIZE), ao_loc.ctypes.data_as(ctypes.c_void_p),
+                      cintopt, ctypes.byref(sgxdat._this),
+                      atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
+                      bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
+                      env.ctypes.data_as(ctypes.c_void_p))
+        finally:
+            sgxdat.unset_block()
+        assert err == 0
+        fg = ao_full = None
+        t4 = time.perf_counter()
+        gv *= weights[:,None]
+        if ao_on is None:
+            vkT = lib.dot(ao.T, gv, c=vkT, beta=1)
+        else:
+            vkT[ao_on] += lib.dot(ao.T, gv)
+        gv = ao = None
+        t5 = time.perf_counter()
+        t_ao += t2 - t1
+        t_f += t3 - t2
+        t_drv += t4 - t3
+        t_k += t5 - t4
+    logger.debug1(sgx, 'sgX K of %d dms (wall): AO values %.2f s, F = X D %.2f s, '
+                  'G = A F %.2f s, K = X^T w G %.2f s', nset, t_ao, t_f, t_drv, t_k)
+    vk = vkT.reshape(nao, nao, nset_pad)[:,:,:nset].transpose(2,0,1)
+    vkT = None
+    if sgxdat.sym_ovlp:
+        vk = lib.einsum('ik,xij->xkj', proj, vk)
+    else:
+        vk = numpy.ascontiguousarray(vk)
+    if hermi == 1:
+        vk = (vk + vk.transpose(0,2,1))*.5
+    return vk
+
 def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
     if sgx.debug:
         raise NotImplementedError("debug mode for accelerated K matrix")
@@ -1136,6 +1254,11 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
     ):
         sgx._build_pjs(direct_scf_tol)
     sgxdat = sgx._pjs_data
+    if nset >= SGX_MANY_DM_MIN:
+        vk = _get_k_only_many(sgx, dms, hermi, direct_scf_tol)
+        if vk is not None:
+            logger.timer(mol, "vk", *t0)
+            return vk.reshape(dm_shape)
     loop_data = sgx._pjs_data.get_loop_data(nset=nset, with_pair_mask=True)
     nbins, screen_index, pair_mask, ao_loc, blksize = loop_data
     proj = sgx._pjs_data._overlap_correction_matrix

@@ -17,13 +17,16 @@ add_library(cvhf SHARED
   optimizer.c nr_direct_dot.c
   time_rev.c r_direct_o1.c rkb_screen.c
   r_direct_dot.c rah_direct_dot.c rha_direct_dot.c
-  hessian_screen.c nr_sgx_direct.c nr_sr_vhf.c grad_jk_energy.c hess_jk_energy.c
+  hessian_screen.c nr_sgx_direct.c nr_sgx_many.c nr_sr_vhf.c grad_jk_energy.c hess_jk_energy.c
   orbit_engine.c rij_engine.c)
 add_dependencies(cvhf cgto np_helper)
 if(NUMINT_KERNEL_FLAGS)
   set_source_files_properties(nr_sgx_direct.c rij_engine.c
     PROPERTIES COMPILE_OPTIONS "${NUMINT_KERNEL_FLAGS}")
 endif()
+# The register accumulators of the many-density SGX K need the loops over
+# their fixed sizes unrolled (-O3); its kernels pick AVX2/FMA at run time.
+set_source_files_properties(nr_sgx_many.c PROPERTIES COMPILE_OPTIONS "-O3")
 
 set_target_properties(cvhf PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
