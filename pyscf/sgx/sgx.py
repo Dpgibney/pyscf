@@ -22,6 +22,7 @@ Pseudo-spectral methods (COSX, PS, SN-K)
 
 import numpy
 import contextlib
+import weakref
 import threading
 from pyscf import lib
 from pyscf import gto
@@ -581,15 +582,32 @@ class SGX(lib.StreamObject):
         self._opt = _make_opt(self.mol)
         self._pjs_data = None
 
-        # In the RSH-integral temporary treatment, recursively rebuild SGX
-        # objects in _rsh_df.
+        # In the RSH-integral temporary treatment, the SGX objects in _rsh_df
+        # take this grid (the same points for every operator).
         if self._rsh_df:
             for v in self._rsh_df.values():
-                v.build(level)
+                v._share_grid_of(self)
         return self
+
+    def _share_grid_of(self, parent):
+        '''Take parent's grid and its optimizer (the overlap's shell-pair
+        bounds and int1e_grids' optimizer, used at omega = 0 only, so the same
+        for every operator). The P-junction data are made again on that grid
+        with this object's integral bounds, the grid's parts from parent's.'''
+        self.grids = parent.grids
+        self._opt = parent._opt
+        self._pjs_data = None
+        self._overlap_correction_matrix = None
+        self._sgx_block_cond = None
+        self._grids_parent = weakref.ref(parent)
 
     def _build_pjs(self, direct_scf_tol):
         assert self._opt is not None
+        share = None
+        ref = getattr(self, '_grids_parent', None)
+        parent = ref() if ref is not None else None
+        if parent is not None and parent.grids is self.grids:
+            share = parent._pjs_data
         self._pjs_data = sgx_jk.SGXData(
             self.mol,
             self.grids,
@@ -603,6 +621,7 @@ class SGX(lib.StreamObject):
             bound_algo=self.bound_algo,
             sgxopt=self._opt,
             pair_tol=self.sgx_tol_pair,
+            share=share,
         )
         self._pjs_data.build()
 
@@ -637,9 +656,12 @@ class SGX(lib.StreamObject):
                 # Not all attributes need to be reset. Resetting _vjopt
                 # because it is used by get_j method of regular DF object.
                 rsh_df._vjopt = None
-                rsh_df._overlap_correction_matrix = None
+                # this grid, P-junction data of its own operator
+                rsh_df._share_grid_of(self)
                 self._rsh_df[key] = rsh_df
                 logger.info(self, 'Create RSH-SGX object %s for omega=%s', rsh_df, omega)
+            if rsh_df.grids is not self.grids:
+                rsh_df._share_grid_of(self)
 
             # the build's state lives on this object, for the call: the full density of an
             # incremental build (for the energy screening) and the threshold of the pair screening

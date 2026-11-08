@@ -163,6 +163,15 @@ class KnownValues(unittest.TestCase):
             e = mf.kernel()
         self.assertTrue(mf.converged)
         self.assertTrue(len(omegas) > 0 and all(w == 0 for w in omegas))
+        # the long-range copy takes the full-range object's grid and the grid's data
+        sdf = mf.with_df
+        (rsh,) = sdf._rsh_df.values()
+        self.assertTrue(rsh.grids is sdf.grids)
+        self.assertTrue(rsh._pjs_data._share is sdf._pjs_data)
+        self.assertTrue(rsh._pjs_data._overlap_correction_matrix
+                        is sdf._pjs_data._overlap_correction_matrix)
+        self.assertTrue(getattr(rsh._pjs_data, '_ao_on_grids', None) is None)
+        self.assertTrue(getattr(sdf._pjs_data, '_ao_on_grids', None) is not None)
         mf1 = dft.RKS(mol, xc='wb97x').RIJCOSX()
         mf1.with_df.sgx_tol_pair = None
         e1 = mf1.kernel()

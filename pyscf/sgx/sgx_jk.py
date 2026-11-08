@@ -247,7 +247,7 @@ class SGXData:
                  max_memory=2000, hermi=0,
                  bound_algo="sample_pos",
                  sgxopt=None, etol=None, vtol=None,
-                 direct_scf_tol=0.0, pair_tol=None):
+                 direct_scf_tol=0.0, pair_tol=None, share=None):
         """
         bound_algo can be
             "ovlp": Screen integrals based on overlap of
@@ -271,6 +271,13 @@ class SGXData:
             the potential exceeds vtol. etol and vtol otherwise split a total
             tolerance over all batches and shells. etol and vtol still screen
             the density and potential matrices on the grid as before.
+        share: the SGXData of another operator on the same grid (the
+            full-range one for the long-range copy of a range-separated
+            hybrid). The parts that depend on the grid and the basis only
+            are taken from it: the overlap-fitting projection, the AO norms
+            of the density screening, the AO values on the grid and, in
+            get_k_only, the density on the grid of the same density matrix.
+            The integral bounds stay this object's.
         """
         self.mol = mol
         self.grids = grids
@@ -291,6 +298,7 @@ class SGXData:
         self._vtol = vtol
         self._screen_potential = vtol is not None
         self._pair_tol = pair_tol
+        self._share = share
         if pair_tol is not None and bound_algo != "sample_pos":
             raise ValueError("pair_tol needs bound_algo 'sample_pos'")
         self._nquad = 200
@@ -849,11 +857,47 @@ class SGXData:
             self._etol_per_sgx_block = 1e10
             self._etol_per_ni_block = 1e10
 
+    def _shares_grid_parts(self, share):
+        return (share is not None and share.grids is self.grids and share.mol is self.mol
+                and share.fit_ovlp == self.fit_ovlp and share.sym_ovlp == self.sym_ovlp
+                and getattr(share, '_overlap_correction_matrix', None) is not None
+                and (not self.use_dm_screening
+                     or (share.use_dm_screening and share._screen_potential == self._screen_potential
+                         and getattr(share, '_sbar_ij', None) is not None)))
+
+    def _take_dm_screen(self, share):
+        '''The AO norms of _build_dm_screen from share, the tolerances this object's'''
+        grids = self.grids
+        nblk = (grids.weights.size + SGX_BLKSIZE - 1) // SGX_BLKSIZE
+        nblk_ni = (grids.weights.size + BLKSIZE - 1) // BLKSIZE
+        self._sbar_ij = share._sbar_ij
+        self._smax_i = share._smax_i
+        self._xni_b = share._xni_b
+        if self._screen_potential:
+            self._xsgx_b = share._xsgx_b
+            self._vtol_arr = self._vtol * self._xsgx_b
+        else:
+            self._vtol_arr = numpy.empty(nblk)
+            self._vtol_arr[:] = numpy.inf
+        if self._screen_energy:
+            self._etol_per_sgx_block = self._etol / nblk
+            self._etol_per_ni_block = self._etol / nblk_ni
+        else:
+            self._etol_per_sgx_block = 1e10
+            self._etol_per_ni_block = 1e10
+
     def build(self):
         self._build_integral_bounds()
-        self._ovlp_proj = self._build_ovlp_fit()
-        if self.use_dm_screening:
-            self._build_dm_screen()
+        share = self._share
+        if self._shares_grid_parts(share):
+            self._overlap_correction_matrix = share._overlap_correction_matrix
+            if self.use_dm_screening:
+                self._take_dm_screen(share)
+        else:
+            self._share = None
+            self._ovlp_proj = self._build_ovlp_fit()
+            if self.use_dm_screening:
+                self._build_dm_screen()
         self._setup_opt()
 
     def get_dm_threshold_matrix(self, dm, full_dm_ij=None):
@@ -1059,6 +1103,13 @@ def get_jk_favork(sgx, dm, hermi=1, with_j=True, with_k=True,
     return vj.reshape(dm_shape), vk.reshape(dm_shape)
 
 
+def _same_dm(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    b = numpy.asarray(b)
+    return a.shape == b.shape and numpy.array_equal(a, b)
+
+
 def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
     if sgx.debug:
         raise NotImplementedError("debug mode for accelerated K matrix")
@@ -1113,10 +1164,27 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
         sgxdat._this.etol = sgxdat._pair_tol if tol_now is None else tol_now
 
     # With the whole grid in one block, the AO values are the same in every K build. They are kept in
-    # _pjs_data, which _build_pjs makes anew when the grids or the molecule change.
+    # _pjs_data, which _build_pjs makes anew when the grids or the molecule change; the long-range copy
+    # of a range-separated hybrid reads those of the full-range object's data on the same grid (share).
+    share = getattr(sgxdat, '_share', None)
+    if share is not None and share.grids is not grids:
+        share = None
+    owner = sgxdat if share is None else share
     single_block = blksize >= ngrids
     if not single_block:
-        sgxdat._ao_on_grids = None
+        owner._ao_on_grids = None
+        owner._f_on_grids = None
+    # The density on the grid F = D X of the full-range build of the same density matrix just before
+    # (rks.get_veff takes the long-range K of a range-separated hybrid right after the full-range one).
+    # It is kept only while there is a long-range copy to take it, which then drops it.
+    reuse = None
+    if share is not None:
+        kept = getattr(share, '_f_on_grids', None)
+        share._f_on_grids = None
+        if (single_block and kept is not None and kept[0].shape == dms.shape
+                and numpy.array_equal(kept[0], dms) and _same_dm(kept[1], sgx._full_dm)):
+            reuse = kept
+    keep_f = single_block and share is None and bool(getattr(sgx, '_rsh_df', None))
     ao = None
     fg = None
     for i0, i1 in lib.prange(0, ngrids, blksize):
@@ -1124,21 +1192,28 @@ def get_k_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
         coords = grids.coords[i0:i1]
         weights = grids.weights[i0:i1]
         mask = screen_index[i0 // BLKSIZE :]
-        if single_block and getattr(sgxdat, '_ao_on_grids', None) is not None:
-            ao = sgxdat._ao_on_grids
+        if single_block and getattr(owner, '_ao_on_grids', None) is not None:
+            ao = owner._ao_on_grids
         else:
             ao = mol.eval_gto('GTOval', coords, non0tab=mask, out=ao)
             if single_block:
-                sgxdat._ao_on_grids = ao
-        if full_dm_ij is None:
-            full_fni_bi = None
-            full_fsgx_bi = None
+                owner._ao_on_grids = ao
+        if reuse is not None:
+            fg, full_fni_bi, full_fsgx_bi = reuse[2:]
         else:
-            full_fni_bi = sgx._pjs_data.reduce_ao_to_shl_mat(ao, ao_loc, weights)
-            full_fni_bi = lib.dot(full_fni_bi, full_dm_ij)
-            assert full_fni_bi.flags.c_contiguous
-            full_fsgx_bi = sgx._pjs_data.reduce_mask_ni2sgx(full_fni_bi)
-        fg = _sgxdot_ao_dm_sparse(ao, proj_dm, mask, dm_mask, ao_loc, out=fg)
+            if full_dm_ij is None:
+                full_fni_bi = None
+                full_fsgx_bi = None
+            else:
+                full_fni_bi = sgx._pjs_data.reduce_ao_to_shl_mat(ao, ao_loc, weights)
+                full_fni_bi = lib.dot(full_fni_bi, full_dm_ij)
+                assert full_fni_bi.flags.c_contiguous
+                full_fsgx_bi = sgx._pjs_data.reduce_mask_ni2sgx(full_fni_bi)
+            fg = _sgxdot_ao_dm_sparse(ao, proj_dm, mask, dm_mask, ao_loc, out=fg)
+            if keep_f:
+                full_dm = sgx._full_dm
+                sgxdat._f_on_grids = (dms.copy(), None if full_dm is None else numpy.array(full_dm),
+                                      fg, full_fni_bi, full_fsgx_bi)
         tnuc = tnuc[0] - logger.process_clock(), tnuc[1] - logger.perf_counter()
         gv = batch_k(mol, coords, fg, weights, i0 // SGX_BLKSIZE, full_fsgx_bi)
         tnuc = tnuc[0] + logger.process_clock(), tnuc[1] + logger.perf_counter()
