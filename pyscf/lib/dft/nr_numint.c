@@ -956,6 +956,15 @@ void VXC_vv10nlc_hessian_eval_omega_derivative(double* __restrict__ domega_drho,
     }
 }
 
+/* The pair sums of the VV10 Hessian (eval_f_t, eval_EUW_with_weight1) evaluate each pair of grid points once,
+ * in blocks of VV10_BI x VV10_BJ points, and apply a block to all the trial densities (or weight derivatives)
+ * of the call in dgemm. Each thread owns VV10_BI rows of the output. */
+#define VV10_BI 128
+#define VV10_BJ 256
+
+/* f_rho_t[t,i] = sum_j w_j (f_rho_rho_ij rho_t[t,j] + f_rho_gamma_ij gamma_t[t,j]) + the local terms at i, and
+ * f_gamma_t[t,i] alike (Liang, Feng, Liu, Head-Gordon, JCP 158, 204109 (2023)), for the ntrial trial densities
+ * rho_t, gamma_t [ntrial,ngrids]. The four pair kernels of a block, weighted by w_j, go to K[4][bj][bi]. */
 void VXC_vv10nlc_hessian_eval_f_t(double* __restrict__ f_rho_t, double* __restrict__ f_gamma_t,
                                   const double* __restrict__ grid_coord, const double* __restrict__ grid_weight,
                                   const double* __restrict__ rho, const double* __restrict__ omega, const double* __restrict__ kappa,
@@ -965,246 +974,326 @@ void VXC_vv10nlc_hessian_eval_f_t(double* __restrict__ f_rho_t, double* __restri
                                   const double* __restrict__ rho_t, const double* __restrict__ gamma_t,
                                   const int ngrids, const int ntrial)
 {
-    const int n_trial_per_thread = 6;
+    if (ngrids <= 0 || ntrial <= 0) {
+        return;
+    }
+    const char TRANS_N = 'N';
+    const double D1 = 1;
+    const int ld = ngrids;
+    const int nt = ntrial;
+    const size_t nblk = VV10_BI * VV10_BJ;
 
-    #pragma omp parallel for schedule(static) collapse(2)
-    for (int i = 0; i < ngrids; i++) {
-        for (int i_trial_start = 0; i_trial_start < ntrial; i_trial_start += n_trial_per_thread) {
-            const double omega_i = omega[i];
-            const double kappa_i = kappa[i];
-            const double3 r_i = { grid_coord[i * 3 + 0], grid_coord[i * 3 + 1], grid_coord[i * 3 + 2] };
+#pragma omp parallel
+{
+    double *K = malloc(sizeof(double) * (4 * nblk + 9 * VV10_BI));
+    double *Krr = K;
+    double *Krg = Krr + nblk;
+    double *Kgr = Krg + nblk;
+    double *Kgg = Kgr + nblk;
+    double *xi = Kgg + nblk;
+    double *yi = xi + VV10_BI;
+    double *zi = yi + VV10_BI;
+    double *omega_i = zi + VV10_BI;
+    double *kappa_i = omega_i + VV10_BI;
+    double *rho_i = kappa_i + VV10_BI;
+    double *domega_drho_i = rho_i + VV10_BI;
+    double *dkappa_drho_i = domega_drho_i + VV10_BI;
+    double *rho_domega_dgamma_i = dkappa_drho_i + VV10_BI;
 
-            const double rho_i = rho[i];
-            const double domega_drho_i = domega_drho[i];
-            const double domega_dgamma_i = domega_dgamma[i];
-            const double dkappa_drho_i = dkappa_drho[i];
-
-            double f_rho_t_i[n_trial_per_thread];
-            double f_gamma_t_i[n_trial_per_thread];
-            #pragma GCC ivdep
-            for (int i_trial = 0; i_trial < n_trial_per_thread; i_trial++) {
-                f_rho_t_i  [i_trial] = 0;
-                f_gamma_t_i[i_trial] = 0;
+#pragma omp for schedule(dynamic, 1)
+    for (int i0 = 0; i0 < ngrids; i0 += VV10_BI) {
+        const int bi = MIN(VV10_BI, ngrids - i0);
+        for (int ii = 0; ii < bi; ii++) {
+            const int i = i0 + ii;
+            xi[ii] = grid_coord[i * 3 + 0];
+            yi[ii] = grid_coord[i * 3 + 1];
+            zi[ii] = grid_coord[i * 3 + 2];
+            omega_i[ii] = omega[i];
+            kappa_i[ii] = kappa[i];
+            rho_i[ii] = rho[i];
+            domega_drho_i[ii] = domega_drho[i];
+            dkappa_drho_i[ii] = dkappa_drho[i];
+            rho_domega_dgamma_i[ii] = rho[i] * domega_dgamma[i];
+        }
+        for (int t = 0; t < nt; t++) {
+            for (int ii = 0; ii < bi; ii++) {
+                f_rho_t  [(size_t)t * ld + i0 + ii] = 0;
+                f_gamma_t[(size_t)t * ld + i0 + ii] = 0;
             }
+        }
 
-            for (int j = 0; j < ngrids; j++) {
+        for (int j0 = 0; j0 < ngrids; j0 += VV10_BJ) {
+            const int bj = MIN(VV10_BJ, ngrids - j0);
+            for (int jj = 0; jj < bj; jj++) {
+                const int j = j0 + jj;
+                const double xj = grid_coord[j * 3 + 0];
+                const double yj = grid_coord[j * 3 + 1];
+                const double zj = grid_coord[j * 3 + 2];
                 const double omega_j = omega[j];
                 const double kappa_j = kappa[j];
-                const double3 r_j = { grid_coord[j * 3 + 0], grid_coord[j * 3 + 1], grid_coord[j * 3 + 2] };
                 const double rho_j = rho[j];
-
                 const double domega_drho_j = domega_drho[j];
-                const double domega_dgamma_j = domega_dgamma[j];
                 const double dkappa_drho_j = dkappa_drho[j];
-
-                const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
-                const double g_ij = omega_i * r_ij2 + kappa_i;
-                const double g_ji = omega_j * r_ij2 + kappa_j;
-                const double g_ij_1 = 1 / g_ij;
-                const double g_ji_1 = 1 / g_ji;
-                const double g_sum_1 = 1 / (g_ij + g_ji);
-                const double Phi_ij = -1.5 * g_ij_1 * g_ji_1 * g_sum_1;
-
-                const double rho_dgdrho_i = rho_i * (r_ij2 * domega_drho_i + dkappa_drho_i);
-                const double rho_dgdrho_j = rho_j * (r_ij2 * domega_drho_j + dkappa_drho_j);
-                const double d2Phi_dgij_dgji_over_Phi = 2 * (g_sum_1 * g_sum_1 + g_ij_1 * g_ji_1);
-
-                const double f_rho_rho_ij = Phi_ij * (rho_dgdrho_i * rho_dgdrho_j * d2Phi_dgij_dgji_over_Phi
-                                                    - rho_dgdrho_i * (g_sum_1 + g_ij_1)
-                                                    - rho_dgdrho_j * (g_sum_1 + g_ji_1) + 1);
-                const double f_gamma_rho_ij = rho_i * domega_dgamma_i * r_ij2 * Phi_ij * (rho_dgdrho_j * d2Phi_dgij_dgji_over_Phi - (g_sum_1 + g_ij_1));
-                const double f_rho_gamma_ij = rho_j * domega_dgamma_j * r_ij2 * Phi_ij * (rho_dgdrho_i * d2Phi_dgij_dgji_over_Phi - (g_sum_1 + g_ji_1));
-                const double f_gamma_gamma_ij = rho_i * rho_j * domega_dgamma_i * domega_dgamma_j * r_ij2 * r_ij2 * Phi_ij * d2Phi_dgij_dgji_over_Phi;
-
+                const double rho_domega_dgamma_j = rho_j * domega_dgamma[j];
                 const double weight_j = grid_weight[j];
+                double *krr = Krr + jj * bi;
+                double *krg = Krg + jj * bi;
+                double *kgr = Kgr + jj * bi;
+                double *kgg = Kgg + jj * bi;
+#pragma omp simd
+                for (int ii = 0; ii < bi; ii++) {
+                    const double dx = xi[ii] - xj;
+                    const double dy = yi[ii] - yj;
+                    const double dz = zi[ii] - zj;
+                    const double r_ij2 = dx * dx + dy * dy + dz * dz;
+                    const double g_ij = omega_i[ii] * r_ij2 + kappa_i[ii];
+                    const double g_ji = omega_j * r_ij2 + kappa_j;
+                    const double g_ij_1 = 1 / g_ij;
+                    const double g_ji_1 = 1 / g_ji;
+                    const double g_sum_1 = 1 / (g_ij + g_ji);
+                    const double Phi_ij = -1.5 * g_ij_1 * g_ji_1 * g_sum_1;
 
-                #pragma GCC ivdep
-                for (int i_trial = 0; i_trial < n_trial_per_thread; i_trial++) {
-                    if (i_trial + i_trial_start >= ntrial) continue;
-                    const double   rho_t_j =   rho_t[(i_trial + i_trial_start) * ngrids + j];
-                    const double gamma_t_j = gamma_t[(i_trial + i_trial_start) * ngrids + j];
-                    f_rho_t_i  [i_trial] += weight_j * (  f_rho_rho_ij * rho_t_j +   f_rho_gamma_ij * gamma_t_j);
-                    f_gamma_t_i[i_trial] += weight_j * (f_gamma_rho_ij * rho_t_j + f_gamma_gamma_ij * gamma_t_j);
+                    const double rho_dgdrho_i = rho_i[ii] * (r_ij2 * domega_drho_i[ii] + dkappa_drho_i[ii]);
+                    const double rho_dgdrho_j = rho_j * (r_ij2 * domega_drho_j + dkappa_drho_j);
+                    const double d2Phi_dgij_dgji_over_Phi = 2 * (g_sum_1 * g_sum_1 + g_ij_1 * g_ji_1);
+                    const double wPhi = weight_j * Phi_ij;
+
+                    krr[ii] = wPhi * (rho_dgdrho_i * rho_dgdrho_j * d2Phi_dgij_dgji_over_Phi
+                                      - rho_dgdrho_i * (g_sum_1 + g_ij_1)
+                                      - rho_dgdrho_j * (g_sum_1 + g_ji_1) + 1);
+                    kgr[ii] = wPhi * rho_domega_dgamma_i[ii] * r_ij2 * (rho_dgdrho_j * d2Phi_dgij_dgji_over_Phi - (g_sum_1 + g_ij_1));
+                    krg[ii] = wPhi * rho_domega_dgamma_j * r_ij2 * (rho_dgdrho_i * d2Phi_dgij_dgji_over_Phi - (g_sum_1 + g_ji_1));
+                    kgg[ii] = wPhi * rho_domega_dgamma_i[ii] * rho_domega_dgamma_j * r_ij2 * r_ij2 * d2Phi_dgij_dgji_over_Phi;
                 }
             }
+            // f_rho_t^T[i,t] += K[i,j] rho_t^T[j,t]: the trial arrays as column-major [ngrids,ntrial]
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nt, &bj, &D1, Krr, &bi, rho_t   + j0, &ld, &D1, f_rho_t   + i0, &ld);
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nt, &bj, &D1, Krg, &bi, gamma_t + j0, &ld, &D1, f_rho_t   + i0, &ld);
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nt, &bj, &D1, Kgr, &bi, rho_t   + j0, &ld, &D1, f_gamma_t + i0, &ld);
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nt, &bj, &D1, Kgg, &bi, gamma_t + j0, &ld, &D1, f_gamma_t + i0, &ld);
+        }
 
+        for (int ii = 0; ii < bi; ii++) {
+            const int i = i0 + ii;
+            const double rho_i_ = rho[i];
             const double U_i = U[i];
             const double W_i = W[i];
             const double A_i = A[i];
             const double B_i = B[i];
             const double C_i = C[i];
+            const double domega_drho_i_ = domega_drho[i];
+            const double domega_dgamma_i = domega_dgamma[i];
+            const double dkappa_drho_i_ = dkappa_drho[i];
             const double d2omega_drho2_i = d2omega_drho2[i];
             const double d2omega_dgamma2_i = d2omega_dgamma2[i];
             const double d2omega_drho_dgamma_i = d2omega_drho_dgamma[i];
             const double d2kappa_drho2_i = d2kappa_drho2[i];
 
-            const double f_rho_rho_ii = 2 * domega_drho_i * W_i + 2 * dkappa_drho_i * U_i
-                                        + rho_i * (d2omega_drho2_i * W_i + d2kappa_drho2_i * U_i + dkappa_drho_i * dkappa_drho_i * A_i
-                                                + domega_drho_i * domega_drho_i * C_i + 2 * domega_drho_i * dkappa_drho_i * B_i);
-            const double f_gamma_rho_ii = domega_dgamma_i * W_i + rho_i * (d2omega_drho_dgamma_i * W_i
-                                                                        + domega_dgamma_i * (dkappa_drho_i * B_i + domega_drho_i * C_i));
+            const double f_rho_rho_ii = 2 * domega_drho_i_ * W_i + 2 * dkappa_drho_i_ * U_i
+                                        + rho_i_ * (d2omega_drho2_i * W_i + d2kappa_drho2_i * U_i + dkappa_drho_i_ * dkappa_drho_i_ * A_i
+                                                + domega_drho_i_ * domega_drho_i_ * C_i + 2 * domega_drho_i_ * dkappa_drho_i_ * B_i);
+            const double f_gamma_rho_ii = domega_dgamma_i * W_i + rho_i_ * (d2omega_drho_dgamma_i * W_i
+                                                                        + domega_dgamma_i * (dkappa_drho_i_ * B_i + domega_drho_i_ * C_i));
             const double f_rho_gamma_ii = f_gamma_rho_ii;
-            const double f_gamma_gamma_ii = rho_i * (d2omega_dgamma2_i * W_i + domega_dgamma_i * domega_dgamma_i * C_i);
+            const double f_gamma_gamma_ii = rho_i_ * (d2omega_dgamma2_i * W_i + domega_dgamma_i * domega_dgamma_i * C_i);
 
-            #pragma GCC ivdep
-            for (int i_trial = 0; i_trial < n_trial_per_thread; i_trial++) {
-                if (i_trial + i_trial_start >= ntrial) continue;
-                const double rho_t_i   =   rho_t[(i_trial + i_trial_start) * ngrids + i];
-                const double gamma_t_i = gamma_t[(i_trial + i_trial_start) * ngrids + i];
-                f_rho_t_i  [i_trial] += (  f_rho_rho_ii * rho_t_i +   f_rho_gamma_ii * gamma_t_i);
-                f_gamma_t_i[i_trial] += (f_gamma_rho_ii * rho_t_i + f_gamma_gamma_ii * gamma_t_i);
-
-                f_rho_t  [(i_trial + i_trial_start) * ngrids + i] = f_rho_t_i  [i_trial];
-                f_gamma_t[(i_trial + i_trial_start) * ngrids + i] = f_gamma_t_i[i_trial];
+            for (int t = 0; t < nt; t++) {
+                const double rho_t_i   =   rho_t[(size_t)t * ld + i];
+                const double gamma_t_i = gamma_t[(size_t)t * ld + i];
+                f_rho_t  [(size_t)t * ld + i] += (  f_rho_rho_ii * rho_t_i +   f_rho_gamma_ii * gamma_t_i);
+                f_gamma_t[(size_t)t * ld + i] += (f_gamma_rho_ii * rho_t_i + f_gamma_gamma_ii * gamma_t_i);
             }
         }
     }
+    free(K);
+}
 }
 
+/* The grid response of E, U and W: for each point i and atom B, the sum over the points j of the pairs with
+ * one point on B. One pass over j per i: each pair adds to its atoms' sums (acc[atom of j]); for the atom of i
+ * the sum is over all points outside it. */
 void VXC_vv10nlc_hessian_eval_EUW_grid_response(double* __restrict__ Egr, double* __restrict__ Ugr, double* __restrict__ Wgr,
                                                 const double* __restrict__ grid_coord, const double* __restrict__ grid_weight,
                                                 const double* __restrict__ rho, const double* __restrict__ omega, const double* __restrict__ kappa,
                                                 const int* __restrict__ grid_associated_atom,
                                                 const int ngrids, const int natoms)
 {
-    #pragma omp parallel for schedule(static) collapse(2)
+    if (ngrids <= 0 || natoms <= 0) {
+        return;
+    }
+    const size_t ng = ngrids;
+#pragma omp parallel
+{
+    double *acc = malloc(sizeof(double) * 9 * natoms);
+#pragma omp for schedule(dynamic, 64)
     for (int i = 0; i < ngrids; i++) {
-        for (int B_atom = 0; B_atom < natoms; B_atom++) {
-            const int i_associated_atom = grid_associated_atom[i];
-            if (i_associated_atom < 0) {
-                Egr[B_atom * 3 * ngrids + 0 * ngrids + i] = 0;
-                Egr[B_atom * 3 * ngrids + 1 * ngrids + i] = 0;
-                Egr[B_atom * 3 * ngrids + 2 * ngrids + i] = 0;
-                Ugr[B_atom * 3 * ngrids + 0 * ngrids + i] = 0;
-                Ugr[B_atom * 3 * ngrids + 1 * ngrids + i] = 0;
-                Ugr[B_atom * 3 * ngrids + 2 * ngrids + i] = 0;
-                Wgr[B_atom * 3 * ngrids + 0 * ngrids + i] = 0;
-                Wgr[B_atom * 3 * ngrids + 1 * ngrids + i] = 0;
-                Wgr[B_atom * 3 * ngrids + 2 * ngrids + i] = 0;
+        const int i_associated_atom = grid_associated_atom[i];
+        if (i_associated_atom < 0) {
+            for (int B_atom = 0; B_atom < natoms; B_atom++) {
+                for (int x = 0; x < 3; x++) {
+                    Egr[(B_atom * 3 + x) * ng + i] = 0;
+                    Ugr[(B_atom * 3 + x) * ng + i] = 0;
+                    Wgr[(B_atom * 3 + x) * ng + i] = 0;
+                }
+            }
+            continue;
+        }
+        for (int k = 0; k < 9 * natoms; k++) {
+            acc[k] = 0;
+        }
+
+        const double omega_i = omega[i];
+        const double kappa_i = kappa[i];
+        const double3 r_i = { grid_coord[i * 3 + 0], grid_coord[i * 3 + 1], grid_coord[i * 3 + 2] };
+
+        for (int j = 0; j < ngrids; j++) {
+            const int j_associated_atom = grid_associated_atom[j];
+            if (j_associated_atom < 0 || j_associated_atom == i_associated_atom)
                 continue;
+
+            const double omega_j = omega[j];
+            const double kappa_j = kappa[j];
+            const double3 r_j = { grid_coord[j * 3 + 0], grid_coord[j * 3 + 1], grid_coord[j * 3 + 2] };
+            const double weight_j = grid_weight[j];
+            const double rho_j = rho[j];
+
+            const double3 r_ji = { r_j.x - r_i.x, r_j.y - r_i.y, r_j.z - r_i.z };
+            const double r_ij2 = r_ji.x * r_ji.x + r_ji.y * r_ji.y + r_ji.z * r_ji.z;
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_ij_1 = 1 / g_ij;
+            const double g_ji_1 = 1 / g_ji;
+            const double g_sum_1 = 1 / (g_ij + g_ji);
+            const double Phi_ij = -1.5 * g_ij_1 * g_ji_1 * g_sum_1;
+
+            const double E_ij = weight_j * rho_j * Phi_ij;
+            const double dPhi_drj_over_Phi = omega_i * g_ij_1 + omega_j * g_ji_1 + (omega_i + omega_j) * g_sum_1;
+            const double d2Phi_dgij_drj_over_Phi = omega_i * g_ij_1 * g_ij_1 + (omega_i + omega_j) * g_sum_1 * g_sum_1;
+            const double dPhi_dgij_over_Phi = g_sum_1 + g_ij_1;
+
+            const double Egr_ij = E_ij * dPhi_drj_over_Phi;
+            const double Ugr_ij = E_ij * (dPhi_drj_over_Phi * dPhi_dgij_over_Phi + d2Phi_dgij_drj_over_Phi);
+            const double Wgr_ij = E_ij * (r_ij2 * (dPhi_drj_over_Phi * dPhi_dgij_over_Phi + d2Phi_dgij_drj_over_Phi) - dPhi_dgij_over_Phi);
+
+            double *a = acc + j_associated_atom * 9;
+            a[0] += Egr_ij * r_ji.x;
+            a[1] += Egr_ij * r_ji.y;
+            a[2] += Egr_ij * r_ji.z;
+            a[3] += Ugr_ij * r_ji.x;
+            a[4] += Ugr_ij * r_ji.y;
+            a[5] += Ugr_ij * r_ji.z;
+            a[6] += Wgr_ij * r_ji.x;
+            a[7] += Wgr_ij * r_ji.y;
+            a[8] += Wgr_ij * r_ji.z;
+        }
+
+        // acc[i_associated_atom] stays zero: its entries become minus the sum over the other atoms
+        double *own = acc + i_associated_atom * 9;
+        for (int B_atom = 0; B_atom < natoms; B_atom++) {
+            if (B_atom != i_associated_atom) {
+                for (int k = 0; k < 9; k++) {
+                    own[k] -= acc[B_atom * 9 + k];
+                }
             }
-            const bool i_in_B = (i_associated_atom == B_atom);
-
-            const double omega_i = omega[i];
-            const double kappa_i = kappa[i];
-            const double3 r_i = { grid_coord[i * 3 + 0], grid_coord[i * 3 + 1], grid_coord[i * 3 + 2] };
-
-            double3 Egr_i = { 0, 0, 0 };
-            double3 Ugr_i = { 0, 0, 0 };
-            double3 Wgr_i = { 0, 0, 0 };
-
-            for (int j = 0; j < ngrids; j++) {
-                const int j_associated_atom = grid_associated_atom[j];
-                if (j_associated_atom < 0)
-                    continue;
-                const int j_in_B = (j_associated_atom == B_atom);
-                if (!i_in_B && !j_in_B)
-                    continue;
-                if (i_in_B && j_in_B)
-                    continue;
-
-                const double omega_j = omega[j];
-                const double kappa_j = kappa[j];
-                const double3 r_j = { grid_coord[j * 3 + 0], grid_coord[j * 3 + 1], grid_coord[j * 3 + 2] };
-                const double weight_j = grid_weight[j];
-                const double rho_j = rho[j];
-
-                const double3 r_ji = { r_j.x - r_i.x, r_j.y - r_i.y, r_j.z - r_i.z };
-                const double r_ij2 = r_ji.x * r_ji.x + r_ji.y * r_ji.y + r_ji.z * r_ji.z;
-                const double g_ij = omega_i * r_ij2 + kappa_i;
-                const double g_ji = omega_j * r_ij2 + kappa_j;
-                const double g_ij_1 = 1 / g_ij;
-                const double g_ji_1 = 1 / g_ji;
-                const double g_sum_1 = 1 / (g_ij + g_ji);
-                const double Phi_ij = -1.5 * g_ij_1 * g_ji_1 * g_sum_1;
-
-                const double E_ij = weight_j * rho_j * Phi_ij;
-                const double dPhi_drj_over_Phi = omega_i * g_ij_1 + omega_j * g_ji_1 + (omega_i + omega_j) * g_sum_1;
-                const double d2Phi_dgij_drj_over_Phi = omega_i * g_ij_1 * g_ij_1 + (omega_i + omega_j) * g_sum_1 * g_sum_1;
-                const double dPhi_dgij_over_Phi = g_sum_1 + g_ij_1;
-
-                const double Egr_ij = E_ij * dPhi_drj_over_Phi;
-                const double Ugr_ij = E_ij * (dPhi_drj_over_Phi * dPhi_dgij_over_Phi + d2Phi_dgij_drj_over_Phi);
-                const double Wgr_ij = E_ij * (r_ij2 * (dPhi_drj_over_Phi * dPhi_dgij_over_Phi + d2Phi_dgij_drj_over_Phi) - dPhi_dgij_over_Phi);
-
-                Egr_i.x += Egr_ij * r_ji.x;
-                Egr_i.y += Egr_ij * r_ji.y;
-                Egr_i.z += Egr_ij * r_ji.z;
-                Ugr_i.x += Ugr_ij * r_ji.x;
-                Ugr_i.y += Ugr_ij * r_ji.y;
-                Ugr_i.z += Ugr_ij * r_ji.z;
-                Wgr_i.x += Wgr_ij * r_ji.x;
-                Wgr_i.y += Wgr_ij * r_ji.y;
-                Wgr_i.z += Wgr_ij * r_ji.z;
+        }
+        for (int B_atom = 0; B_atom < natoms; B_atom++) {
+            const double *a = acc + B_atom * 9;
+            for (int x = 0; x < 3; x++) {
+                Egr[(B_atom * 3 + x) * ng + i] = -2 * a[x];
+                Ugr[(B_atom * 3 + x) * ng + i] =  2 * a[3 + x];
+                Wgr[(B_atom * 3 + x) * ng + i] =  2 * a[6 + x];
             }
-
-            if (i_in_B) {
-                Egr_i.x *= -1;
-                Egr_i.y *= -1;
-                Egr_i.z *= -1;
-                Ugr_i.x *= -1;
-                Ugr_i.y *= -1;
-                Ugr_i.z *= -1;
-                Wgr_i.x *= -1;
-                Wgr_i.y *= -1;
-                Wgr_i.z *= -1;
-            }
-
-            Egr[B_atom * 3 * ngrids + 0 * ngrids + i] = -2 * Egr_i.x;
-            Egr[B_atom * 3 * ngrids + 1 * ngrids + i] = -2 * Egr_i.y;
-            Egr[B_atom * 3 * ngrids + 2 * ngrids + i] = -2 * Egr_i.z;
-            Ugr[B_atom * 3 * ngrids + 0 * ngrids + i] =  2 * Ugr_i.x;
-            Ugr[B_atom * 3 * ngrids + 1 * ngrids + i] =  2 * Ugr_i.y;
-            Ugr[B_atom * 3 * ngrids + 2 * ngrids + i] =  2 * Ugr_i.z;
-            Wgr[B_atom * 3 * ngrids + 0 * ngrids + i] =  2 * Wgr_i.x;
-            Wgr[B_atom * 3 * ngrids + 1 * ngrids + i] =  2 * Wgr_i.y;
-            Wgr[B_atom * 3 * ngrids + 2 * ngrids + i] =  2 * Wgr_i.z;
         }
     }
+    free(acc);
+}
 }
 
+/* Ew[d,i] = sum_j w1[d,j] E_ij, Uw[d,i] = -sum_j w1[d,j] U_ij, Ww[d,i] = -sum_j w1[d,j] W_ij for the weight
+ * derivatives w1 [nderivative,ngrids]: the three pair kernels of a block to K[3][bj][bi], then dgemm. */
 void VXC_vv10nlc_hessian_eval_EUW_with_weight1(double* __restrict__ Ew, double* __restrict__ Uw, double* __restrict__ Ww,
                                                const double* __restrict__ grid_coord, const double* __restrict__ grid_weight1,
                                                const double* __restrict__ rho, const double* __restrict__ omega, const double* __restrict__ kappa,
                                                const int ngrids, const int nderivative)
 {
-    #pragma omp parallel for schedule(static) collapse(2)
-    for (int i = 0; i < ngrids; i++) {
-        for (int i_derivative = 0; i_derivative < nderivative; i_derivative++) {
-            const double omega_i = omega[i];
-            const double kappa_i = kappa[i];
-            const double3 r_i = { grid_coord[i * 3 + 0], grid_coord[i * 3 + 1], grid_coord[i * 3 + 2] };
+    if (ngrids <= 0 || nderivative <= 0) {
+        return;
+    }
+    const char TRANS_N = 'N';
+    const double D1 = 1;
+    const double DM1 = -1;
+    const int ld = ngrids;
+    const int nd = nderivative;
+    const size_t nblk = VV10_BI * VV10_BJ;
 
-            double Ew_i = 0;
-            double Uw_i = 0;
-            double Ww_i = 0;
+#pragma omp parallel
+{
+    double *K = malloc(sizeof(double) * (3 * nblk + 5 * VV10_BI));
+    double *KE = K;
+    double *KU = KE + nblk;
+    double *KW = KU + nblk;
+    double *xi = KW + nblk;
+    double *yi = xi + VV10_BI;
+    double *zi = yi + VV10_BI;
+    double *omega_i = zi + VV10_BI;
+    double *kappa_i = omega_i + VV10_BI;
 
-            for (int j = 0; j < ngrids; j++) {
+#pragma omp for schedule(dynamic, 1)
+    for (int i0 = 0; i0 < ngrids; i0 += VV10_BI) {
+        const int bi = MIN(VV10_BI, ngrids - i0);
+        for (int ii = 0; ii < bi; ii++) {
+            const int i = i0 + ii;
+            xi[ii] = grid_coord[i * 3 + 0];
+            yi[ii] = grid_coord[i * 3 + 1];
+            zi[ii] = grid_coord[i * 3 + 2];
+            omega_i[ii] = omega[i];
+            kappa_i[ii] = kappa[i];
+        }
+        for (int d = 0; d < nd; d++) {
+            for (int ii = 0; ii < bi; ii++) {
+                Ew[(size_t)d * ld + i0 + ii] = 0;
+                Uw[(size_t)d * ld + i0 + ii] = 0;
+                Ww[(size_t)d * ld + i0 + ii] = 0;
+            }
+        }
+
+        for (int j0 = 0; j0 < ngrids; j0 += VV10_BJ) {
+            const int bj = MIN(VV10_BJ, ngrids - j0);
+            for (int jj = 0; jj < bj; jj++) {
+                const int j = j0 + jj;
+                const double xj = grid_coord[j * 3 + 0];
+                const double yj = grid_coord[j * 3 + 1];
+                const double zj = grid_coord[j * 3 + 2];
                 const double omega_j = omega[j];
                 const double kappa_j = kappa[j];
-                const double3 r_j = { grid_coord[j * 3 + 0], grid_coord[j * 3 + 1], grid_coord[j * 3 + 2] };
                 const double rho_j = rho[j];
+                double *kE = KE + jj * bi;
+                double *kU = KU + jj * bi;
+                double *kW = KW + jj * bi;
+#pragma omp simd
+                for (int ii = 0; ii < bi; ii++) {
+                    const double dx = xi[ii] - xj;
+                    const double dy = yi[ii] - yj;
+                    const double dz = zi[ii] - zj;
+                    const double r_ij2 = dx * dx + dy * dy + dz * dz;
+                    const double g_ij = omega_i[ii] * r_ij2 + kappa_i[ii];
+                    const double g_ji = omega_j * r_ij2 + kappa_j;
+                    const double g_ij_1 = 1 / g_ij;
+                    const double g_sum_1 = 1 / (g_ij + g_ji);
+                    const double Phi_ij = -1.5 / g_ji * g_ij_1 * g_sum_1;
 
-                const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
-                const double g_ij = omega_i * r_ij2 + kappa_i;
-                const double g_ji = omega_j * r_ij2 + kappa_j;
-                const double g_ij_1 = 1 / g_ij;
-                const double g_sum_1 = 1 / (g_ij + g_ji);
-                const double Phi_ij = -1.5 / g_ji * g_ij_1 * g_sum_1;
-
-                const double E_ij = rho_j * Phi_ij;
-                const double U_ij = E_ij * (g_sum_1 + g_ij_1);
-                const double W_ij = U_ij * r_ij2;
-
-                const double weight_j = grid_weight1[i_derivative * ngrids + j];
-                Ew_i += weight_j * E_ij;
-                Uw_i += weight_j * U_ij;
-                Ww_i += weight_j * W_ij;
+                    const double E_ij = rho_j * Phi_ij;
+                    const double U_ij = E_ij * (g_sum_1 + g_ij_1);
+                    kE[ii] = E_ij;
+                    kU[ii] = U_ij;
+                    kW[ii] = U_ij * r_ij2;
+                }
             }
-
-            Ew[i_derivative * ngrids + i] =  Ew_i;
-            Uw[i_derivative * ngrids + i] = -Uw_i;
-            Ww[i_derivative * ngrids + i] = -Ww_i;
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nd, &bj, &D1 , KE, &bi, grid_weight1 + j0, &ld, &D1, Ew + i0, &ld);
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nd, &bj, &DM1, KU, &bi, grid_weight1 + j0, &ld, &D1, Uw + i0, &ld);
+            dgemm_(&TRANS_N, &TRANS_N, &bi, &nd, &bj, &DM1, KW, &bi, grid_weight1 + j0, &ld, &D1, Ww + i0, &ld);
         }
     }
+    free(K);
+}
 }
