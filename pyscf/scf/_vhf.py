@@ -605,6 +605,15 @@ INT2E_BATCH = getattr(__config__, 'scf_vhf_int2e_batch', True)
 # integrals with all dms (nr_direct_batch.c, _direct_jk_gemm), 13 dms or more
 JK_GEMM = getattr(__config__, 'scf_vhf_jk_gemm', True)
 
+def _direct_jk_batch(n_dm, nao, with_j, with_k, sym_k):
+    '''The dms of one pass over the integrals in _direct_s8_batch'''
+    mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 2000) * .5e6
+    if JK_GEMM and n_dm >= 13:
+        per_dm = 8 * nao**2 * (1 + 2 * with_j + with_k * (1 + 2 * (not sym_k)))
+    else:
+        per_dm = 8 * nao**2 * (with_j + with_k) * lib.num_threads()
+    return max(1, int(mem_avail / per_dm))
+
 def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
                      cvhfopt=None, cintopt=None, sd_eri=None):
     '''J and K of all dms from s8 ERIs computed on the fly, or kept in sd_eri
@@ -631,12 +640,7 @@ def _direct_s8_batch(intor, dms, hermi, with_j, with_k, atm, bas, env,
     # by block pairs (and D^T and the sums of VK^T for non-symmetric K), and no
     # thread has sums of its own (nr_direct_batch.c). Batches of dms beyond the
     # memory available recompute the integrals.
-    mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 2000) * .5e6
-    if JK_GEMM and n_dm >= 13:
-        per_dm = 8 * nao**2 * (1 + 2 * with_j + with_k * (1 + 2 * (not sym_k)))
-    else:
-        per_dm = 8 * nao**2 * (with_j + with_k) * lib.num_threads()
-    batch = max(1, int(mem_avail / per_dm))
+    batch = _direct_jk_batch(n_dm, nao, with_j, with_k, sym_k)
     vj = numpy.empty((n_dm, nao, nao)) if with_j else None
     vk = numpy.empty((n_dm, nao, nao)) if with_k else None
     null = lib.c_null_ptr()

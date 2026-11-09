@@ -74,7 +74,8 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                                     max_memory, log)
 
     if h1ao is None:
-        h1ao = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        h1ao = _h1ao_out_of_core(hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log),
+                                 mf.max_memory, log)
         t1 = log.timer_debug1('making H1', *time0)
     if mo1 is None or mo_e1 is None:
         mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
@@ -92,6 +93,27 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
 
     log.timer('RHF hessian', *time0)
     return de2
+
+class _H1aoFile:
+    '''The matrices of make_h1 in a temporary file, h1ao[ia] reads an atom's'''
+    def __init__(self, h1ao):
+        self.file = lib.H5TmpFile()
+        for ia, h in enumerate(h1ao):
+            if h is not None:
+                self.file[str(ia)] = h
+
+    def __getitem__(self, ia):
+        return self.file[str(ia)][()]
+
+def _h1ao_out_of_core(h1ao, max_memory, log):
+    '''h1ao, or _H1aoFile(h1ao) when the CPHF would not fit beside it: its dms
+    and responses take a few times the memory of h1ao. It is read only twice,
+    once for the CPHF and once for the contraction after it.'''
+    size = sum(h.nbytes for h in h1ao if h is not None) / 1e6
+    if lib.current_memory()[0] + 3 * size < max_memory:
+        return h1ao
+    log.debug('H1 of %d MB in a temporary file', size)
+    return _H1aoFile(h1ao)
 
 def _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc, mo_eocc, s1a=None,
                    max_memory=4000):
@@ -573,13 +595,13 @@ def gen_vind(mf, mo_coeff, mo_occ):
     vind_mo = getattr(vresp, 'vind_mo', None)
     def fx(mo1):
         mo1 = mo1.reshape(-1,nmo,nocc)
+        if vind_mo is not None:
+            return vind_mo(None, mo1*2) # *2 for double occupancy
         nset = len(mo1)
         dm1 = numpy.empty((nset,nao,nao))
         for i, x in enumerate(mo1):
             dm = reduce(numpy.dot, (mo_coeff, x*2, mocc.T)) # *2 for double occupancy
             dm1[i] = dm + dm.T
-        if vind_mo is not None:
-            return vind_mo(dm1, mo1*2)
         v1 = vresp(dm1)
         v1vo = numpy.empty_like(mo1)
         for i, x in enumerate(v1):

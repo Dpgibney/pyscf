@@ -25,7 +25,20 @@ import numpy
 from functools import reduce
 from pyscf import lib
 from pyscf.lib import logger
-from pyscf.scf import hf, rohf, uhf, ghf, dhf
+from pyscf.scf import hf, rohf, uhf, ghf, dhf, _vhf
+
+def _cphf_chunk(mf, nset, nao, with_j, with_k):
+    '''The dms that a CPHF response holds at a time for a J/K call (with_j,
+    with_k) of direct SCF: as many as their dms and AO matrices (4 per dm) fit
+    in half of the memory left under max_memory, at least one batch of that
+    call, whose chunks then cost no extra pass over the integrals, and 16 dms
+    for its many-dm kernels. Density-fitted and SGX J/K are not made by passes
+    of that kind: all dms at once.'''
+    if getattr(mf, 'with_df', None):
+        return nset
+    left = (mf.max_memory - lib.current_memory()[0]) * .5e6
+    n = int(left / (4 * 8 * nao**2))
+    return min(nset, max(n, 16, _vhf._direct_jk_batch(nset, nao, with_j, with_k, True)))
 
 def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                       singlet=None, hermi=0, max_memory=None, with_nlc=True,
@@ -90,39 +103,51 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
             return v1
 
         if not triplet:
+            # full-range J and K in one call (and long-range K in another one)
+            jk_together = hybrid and (omega == 0 or (alpha != 0 and hyb != 0))
+            # J/K calls of the K alone
+            k_alone = hybrid and (not jk_together or
+                                  (omega != 0 and alpha != 0 and hyb != 0))
+
+            def vind_j(dm1, v1=None):
+                '''The response of the J/K call with J, the exchange of that call
+                included, added to v1, or in the memory of J for v1=None'''
+                if jk_together:
+                    vj, vk = mf.get_jk(mol, dm1, hermi)
+                    vk *= -.5 * hyb
+                    own = not numpy.may_share_memory(vj, vk)
+                    if hermi != 2:
+                        v1 = acc(v1, vj, own)
+                    vj = None
+                    v1 = acc(v1, vk, own)
+                elif hermi != 2:
+                    v1 = acc(v1, mf.get_j(mol, dm1, hermi=hermi))
+                return v1
+
+            def vind_k(dm1, v1=None):
+                '''The response of the J/K calls of the K alone added to v1'''
+                if hybrid and not jk_together:
+                    if alpha == 0: # LR=0, only SR exchange
+                        vk = mf.get_k(mol, dm1, hermi, omega=-omega)
+                        vk *= -.5 * hyb
+                    else: # SR=0, only LR exchange
+                        vk = mf.get_k(mol, dm1, hermi, omega=omega)
+                        vk *= -.5 * alpha
+                    v1 = acc(v1, vk)
+                    vk = None
+                if hybrid and omega != 0 and alpha != 0 and hyb != 0:
+                    # SR and LR exchange with different ratios
+                    vk = mf.get_k(mol, dm1, hermi, omega=omega)
+                    vk *= -.5 * (alpha-hyb)
+                    v1 = acc(v1, vk)
+                return v1
+
             def vind_jk(dm1, v1=None):
                 '''The Coulomb and exchange response of dm1 added to v1, or in
                 the memory of J for v1=None. Each J or K stack is scaled in place
                 and added before the next one is made, so that at most two are
                 alive beside dm1 and v1.'''
-                if hybrid:
-                    if omega == 0 or (alpha != 0 and hyb != 0):
-                        # full-range J and K (and long-range K below)
-                        vj, vk = mf.get_jk(mol, dm1, hermi)
-                        vk *= -.5 * hyb
-                        own = not numpy.may_share_memory(vj, vk)
-                        if hermi != 2:
-                            v1 = acc(v1, vj, own)
-                        vj = None
-                        v1 = acc(v1, vk, own)
-                    else:
-                        if hermi != 2:
-                            v1 = acc(v1, mf.get_j(mol, dm1, hermi))
-                        if alpha == 0: # LR=0, only SR exchange
-                            vk = mf.get_k(mol, dm1, hermi, omega=-omega)
-                            vk *= -.5 * hyb
-                        else: # SR=0, only LR exchange
-                            vk = mf.get_k(mol, dm1, hermi, omega=omega)
-                            vk *= -.5 * alpha
-                        v1 = acc(v1, vk)
-                    vk = None
-                    if omega != 0 and alpha != 0 and hyb != 0:
-                        # SR and LR exchange with different ratios
-                        vk = mf.get_k(mol, dm1, hermi, omega=omega)
-                        vk *= -.5 * (alpha-hyb)
-                        v1 = acc(v1, vk)
-                elif hermi != 2:
-                    v1 = acc(v1, mf.get_j(mol, dm1, hermi=hermi))
+                v1 = vind_k(dm1, vind_j(dm1, v1))
                 if v1 is None:
                     v1 = numpy.zeros_like(dm1)
                 return v1
@@ -200,27 +225,34 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
             fused = numint._fused_xc_mo(ni, mol, grids, xctype, max_memory)
         if fused is not None:
             fxc_mo = None
+            def xc_lowrank(a, P, Q):
+                '''w[k] = P^T v_xc[k] Q for the XC responses of the dms whose
+                symmetric parts are a[k] Q^T + Q a[k]^T, None where this path
+                is not the cheaper one'''
+                nonlocal fxc_mo
+                if not (a.dtype == P.dtype == Q.dtype == numpy.double and
+                        fused.lowrank_cheaper(xctype, a.shape[2], Q.shape[1], len(a))):
+                    return None
+                if fxc_mo is None:
+                    # the kernel that vind_xc contracts with
+                    if singlet is None:
+                        fxc_mo = fxc
+                    elif not triplet:
+                        fxc_mo = fxc[0,:,0] + fxc[0,:,1]
+                    else:
+                        fxc_mo = fxc[0,:,0] - fxc[0,:,1]
+                w = numpy.zeros((len(a), P.shape[1], Q.shape[1]))
+                fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w)
+                return w
+
             def vind_lowrank(dm1, a, P, Q):
                 '''(v1, w): vind(dm1) = v1 + v_xc, w[k] = P^T v_xc[k] Q or 0, for
                 dms dm1 whose symmetric parts are a[k] Q^T + Q a[k]^T'''
-                nonlocal fxc_mo
                 a = numpy.asarray(a)
-                w = numpy.zeros((len(a), P.shape[1], Q.shape[1]))
-                if (a.dtype == P.dtype == Q.dtype == numpy.double and
-                        fused.lowrank_cheaper(xctype, a.shape[2], Q.shape[1], len(a))):
-                    if fxc_mo is None:
-                        # the kernel that vind_xc contracts with
-                        if singlet is None:
-                            fxc_mo = fxc
-                        elif not triplet:
-                            fxc_mo = fxc[0,:,0] + fxc[0,:,1]
-                        else:
-                            fxc_mo = fxc[0,:,0] - fxc[0,:,1]
-                    fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w)
-                    v1 = vind_nlc(dm1, vind_jk(dm1))
-                else:
-                    v1 = vind(dm1)
-                return v1, w
+                w = xc_lowrank(a, P, Q)
+                if w is None:
+                    return vind(dm1), numpy.zeros((len(a), P.shape[1], Q.shape[1]))
+                return vind_nlc(dm1, vind_jk(dm1)), w
             vind.vind_lowrank = vind_lowrank
 
             # vind.vind_mo(dm1, x) returns mo_coeff^T vind(dm1) mocc for CPHF's
@@ -230,12 +262,46 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 nmo, nocc = mo_coeff.shape[1], mocc.shape[1]
                 def vind_mo(dm1, x):
                     '''mo_coeff^T vind(dm1) mocc for the symmetric dms
-                    dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc]'''
+                    dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc], made from x
+                    for dm1=None. The AO matrices of the dms and of their J, K
+                    and VV10 responses exist for a chunk of the dms at a time:
+                    the J/K call with J by chunks of its own, then the K-only
+                    calls and VV10 by chunks of the larger K-only batches, so
+                    that no J/K call makes more passes over the integrals. The
+                    XC response from the factors needs none of them.'''
                     x = numpy.asarray(x).reshape(-1,nmo,nocc)
+                    nset = len(x)
+                    nao = mo_coeff.shape[0]
                     a = lib.einsum('pa,kai->kpi', mo_coeff, x)
-                    v1, v1mo = vind_lowrank(dm1, a, mo_coeff, mocc)
-                    for i, v in enumerate(v1):
-                        v1mo[i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
+                    v1mo = xc_lowrank(a, mo_coeff, mocc)
+                    with_xc = v1mo is None
+                    if with_xc:
+                        v1mo = numpy.zeros((nset,nmo,nocc))
+
+                    def by_chunks(chunk, response):
+                        for p0, p1 in lib.prange(0, nset, chunk):
+                            if dm1 is None:
+                                d = numpy.matmul(a[p0:p1], mocc.T)
+                                d = d + d.transpose(0,2,1)
+                            else:
+                                d = dm1[p0:p1]
+                            v1 = response(d)
+                            d = None
+                            if v1 is not None:
+                                for i, v in enumerate(v1):
+                                    v1mo[p0+i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
+                            v1 = None
+
+                    def k_nlc_xc(d):
+                        v1 = vind_nlc(d, vind_k(d))
+                        if with_xc:
+                            vx = vind_xc(d)
+                            v1 = vx if v1 is None else v1 + vx
+                        return v1
+
+                    by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
+                    if k_alone or with_xc or (with_nlc and mf.do_nlc()):
+                        by_chunks(_cphf_chunk(mf, nset, nao, False, True), k_nlc_xc)
                     return v1mo
                 vind.vind_mo = vind_mo
 
