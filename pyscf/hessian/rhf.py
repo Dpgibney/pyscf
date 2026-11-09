@@ -496,7 +496,7 @@ def _get_jk(mol, intor, comp, aosym, script_dms,
 
 def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
               fx=None, atmlst=None, max_memory=4000, verbose=None,
-              max_cycle=50, level_shift=0, residual_tol=None):
+              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False):
     '''Solve the first order equation
 
     Kwargs:
@@ -506,6 +506,8 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
         residual_tol : float
             If set, solve with cphf.solve_residual to this tolerance, otherwise
             with cphf.solve to mf.conv_tol_cpscf
+        scale_trials : bool
+            scale_trials of cphf.solve_residual
     '''
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
@@ -550,7 +552,8 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
         else:
             mo1, e1 = cphf.solve_residual(fx, mo_energy, mo_occ, h1vo, s1vo,
                                           max_cycle=max_cycle, tol=residual_tol,
-                                          verbose=log, level_shift=level_shift)
+                                          verbose=log, level_shift=level_shift,
+                                          scale_trials=scale_trials)
         mo1 = numpy.einsum('pq,xqi->xpi', mo_coeff, mo1).reshape(-1,3,nao,nocc)
         e1 = e1.reshape(-1,3,nocc,nocc)
 
@@ -823,6 +826,11 @@ class HessianBase(lib.StreamObject):
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
         residual_tol = self.cphf_residual_tol
+        # Direct SCF's integrals skip more for the smaller trial vectors of the
+        # later cycles. SGX's K, with its absolute thresholds, needs them at
+        # unit size, and density fitting has no such screening to gain from.
+        scale_trials = (fx is None and not self.sgx_response
+                        and not getattr(self.base, 'with_df', None))
         if self.sgx_response:
             if residual_tol is None:
                 residual_tol = SGX_RESPONSE_RESIDUAL_TOL
@@ -832,7 +840,7 @@ class HessianBase(lib.StreamObject):
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
                          max_cycle=self.max_cycle, level_shift=self.level_shift,
-                         residual_tol=residual_tol)
+                         residual_tol=residual_tol, scale_trials=scale_trials)
 
     def hess_nuc(self, mol=None, atmlst=None):
         if mol is None: mol = self.mol

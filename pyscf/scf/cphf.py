@@ -281,10 +281,11 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
         level_shift : float
             Added to (e_a - e_i) in the preconditioner
         scale_trials : bool
-            Give fvind each trial vector at its size in the residuals, and
-            divide the response by that size. fvind is linear, so only what
-            the density screening of its integrals can skip changes: the
-            later cycles cost less. Needs a threshold of fvind well below tol
+            Give fvind each trial vector at its size in the residuals (not
+            below 1e-6), and divide the response by that size. fvind is
+            linear, so only what the density screening of its integrals can
+            skip changes: the later cycles cost less. Only for a fvind whose
+            absolute thresholds are far below 1e-6, such as direct SCF's
 
     Returns:
         First order orbital coefficients (in MO basis) and first order orbital
@@ -340,7 +341,7 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
             log.warn('CPHF stopped with no new trial vector; residual %g '
                      'above tol %g', rnorm.max(), tol)
             break
-        scale = sizes.reshape(nq,1,1) if scale_trials else 1.
+        scale = numpy.maximum(sizes, 1e-6).reshape(nq,1,1) if scale_trials else 1.
         trial = numpy.zeros((nq,nmo,nocc))
         trial[:,viridx] = x1.reshape(nq,nvir,nocc) * scale
         w = fvind(trial).reshape(nq,nmo,nocc) / scale

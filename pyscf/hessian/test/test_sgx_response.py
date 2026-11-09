@@ -107,6 +107,25 @@ class KnownValues(unittest.TestCase):
         self.assertLess(abs(mo_e1 - e1).max(), 1e-9)
         self.assertLess(norms[-1], 1e-2)
 
+    def test_scale_trials_exact_response_only(self):
+        used = []
+        solver = cphf.solve_residual
+        def record(*args, **kwargs):
+            used.append(kwargs['scale_trials'])
+            return solver(*args, **kwargs)
+        cphf.solve_residual = record
+        try:
+            hobj = mf.Hessian()
+            hobj.cphf_residual_tol = 1e-4
+            h = hobj.kernel()
+            hobj = mf.Hessian()
+            hobj.sgx_response = True
+            hobj.kernel()
+        finally:
+            cphf.solve_residual = solver
+        self.assertEqual(used, [True, False])
+        self.assertLess(abs(h - h_ref).max(), 1e-6)
+
     def test_residual_tol_against_stock(self):
         # cphf.solve stops short for DFT, here by 7.5e-6 from the converged Hessian
         self.assertLess(abs(mf.Hessian().kernel() - h_ref).max(), 3e-5)
