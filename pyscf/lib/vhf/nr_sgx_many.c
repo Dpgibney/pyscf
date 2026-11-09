@@ -34,6 +34,7 @@
 #include "cint.h"
 #include "gto/gto.h"
 #include "nr_sgx_direct.h"
+#include "fblas.h"
 
 #define MAX(I,J)        ((I) > (J) ? (I) : (J))
 #define MIN(I,J)        ((I) < (J) ? (I) : (J))
@@ -146,6 +147,24 @@ DEF_SGX_ROWS(, , MADD_PLAIN)
 #define AVX2_FMA __attribute__((target("avx2,fma")))
 DEF_SGX_ROWS(_avx2, AVX2_FMA, MADD_FMA)
 #endif
+
+/*
+ * c[g,:,:] = a b[g,:,:] for each point g: a (na,k), b (ng,k,n), c (ng,na,n), all in
+ * C order. The products over the densities of F and K from the factors of the
+ * densities (sgx_jk._get_k_only_many).
+ */
+void SGXdot_points(double *a, double *b, double *c, int na, int k, int n, int ng)
+{
+        const char TRANS_N = 'N';
+        const double D0 = 0;
+        const double D1 = 1;
+        int g;
+#pragma omp parallel for schedule(static)
+        for (g = 0; g < ng; g++) {
+                dgemm_(&TRANS_N, &TRANS_N, &n, &na, &k, &D1, b + (size_t)g * k * n, &n,
+                       a, &k, &D0, c + (size_t)g * na * n, &n);
+        }
+}
 
 /*
  * F, G: (ngrids,nao,nset) for the grid points env[PTR_GRIDS:] of the block

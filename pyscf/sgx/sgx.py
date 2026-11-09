@@ -642,38 +642,58 @@ class SGX(lib.StreamObject):
         self._sgx_block_cond = None
         return self
 
+    @contextlib.contextmanager
+    def _with_rsh_df(self, omega):
+        '''This object's copy for the range parameter omega, for the duration'''
+        # A temporary treatment for RSH integrals
+        key = '%.6f' % omega
+        if key in self._rsh_df:
+            rsh_df = self._rsh_df[key]
+        else:
+            rsh_df = self.copy()
+            rsh_df._rsh_df = None  # to avoid circular reference
+            # Not all attributes need to be reset. Resetting _vjopt
+            # because it is used by get_j method of regular DF object.
+            rsh_df._vjopt = None
+            # this grid, P-junction data of its own operator
+            rsh_df._share_grid_of(self)
+            self._rsh_df[key] = rsh_df
+            logger.info(self, 'Create RSH-SGX object %s for omega=%s', rsh_df, omega)
+        if rsh_df.grids is not self.grids:
+            rsh_df._share_grid_of(self)
+
+        # the build's state lives on this object, for the call: the full density of an
+        # incremental build (for the energy screening) and the threshold of the pair screening
+        rsh_df._full_dm = self._full_dm
+        rsh_df._pair_tol_now = self._pair_tol_now
+        try:
+            with rsh_df.mol.with_range_coulomb(omega):
+                yield rsh_df
+        finally:
+            rsh_df._full_dm = None
+            rsh_df._pair_tol_now = None
+
+    def get_k_mo(self, a, mocc, mo_coeff,
+                 direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
+                 omega=None):
+        '''mo_coeff^T K mocc [nset,nmo,nocc] for the K of get_jk (hermi=1) of the
+        symmetric density matrices a[x] mocc^T + mocc a[x]^T, a[nset,nao,nocc],
+        made without the AO matrices of the densities or of K (sgx_jk.get_k_mo).
+        None if K is not one that this path can make.'''
+        if not self.optk:
+            return None
+        if omega is not None:
+            with self._with_rsh_df(omega) as rsh_df:
+                return rsh_df.get_k_mo(a, mocc, mo_coeff, direct_scf_tol)
+        return sgx_jk.get_k_mo(self, a, mocc, mo_coeff, direct_scf_tol)
+
     def get_jk(self, dm, hermi=1, vhfopt=None, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
                omega=None):
         if omega is not None:
-            # A temporary treatment for RSH integrals
-            key = '%.6f' % omega
-            if key in self._rsh_df:
-                rsh_df = self._rsh_df[key]
-            else:
-                rsh_df = self.copy()
-                rsh_df._rsh_df = None  # to avoid circular reference
-                # Not all attributes need to be reset. Resetting _vjopt
-                # because it is used by get_j method of regular DF object.
-                rsh_df._vjopt = None
-                # this grid, P-junction data of its own operator
-                rsh_df._share_grid_of(self)
-                self._rsh_df[key] = rsh_df
-                logger.info(self, 'Create RSH-SGX object %s for omega=%s', rsh_df, omega)
-            if rsh_df.grids is not self.grids:
-                rsh_df._share_grid_of(self)
-
-            # the build's state lives on this object, for the call: the full density of an
-            # incremental build (for the energy screening) and the threshold of the pair screening
-            rsh_df._full_dm = self._full_dm
-            rsh_df._pair_tol_now = self._pair_tol_now
-            try:
-                with rsh_df.mol.with_range_coulomb(omega):
-                    return rsh_df.get_jk(dm, hermi, vhfopt, with_j=with_j, with_k=with_k,
-                                         direct_scf_tol=direct_scf_tol)
-            finally:
-                rsh_df._full_dm = None
-                rsh_df._pair_tol_now = None
+            with self._with_rsh_df(omega) as rsh_df:
+                return rsh_df.get_jk(dm, hermi, vhfopt, with_j=with_j, with_k=with_k,
+                                     direct_scf_tol=direct_scf_tol)
 
         if with_j and (self.dfj or self.direct_j):
             if self.dfj:

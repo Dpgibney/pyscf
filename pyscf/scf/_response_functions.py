@@ -27,15 +27,17 @@ from pyscf import lib
 from pyscf.lib import logger
 from pyscf.scf import hf, rohf, uhf, ghf, dhf, _vhf
 
-def _cphf_chunk(mf, nset, nao, with_j, with_k):
+def _cphf_chunk(mf, nset, nao, with_j, with_k, direct=None):
     '''The dms that a CPHF response holds at a time for a J/K call (with_j,
     with_k) of direct SCF: as many whole batches of that call as their dms and
     AO matrices (4 per dm) fit in half of the memory left under max_memory, at
     least one, so that a chunk costs no extra pass over the integrals, and 16
     dms for its many-dm kernels. The call sizes its batch with the chunk's dms
-    in RSS. Density-fitted and SGX J/K are not made by passes of that kind: all
-    dms at once.'''
-    if getattr(mf, 'with_df', None):
+    in RSS. direct: whether the call is made by such passes, by default if mf
+    is neither density-fitted nor SGX. Otherwise all dms at once.'''
+    if direct is None:
+        direct = not getattr(mf, 'with_df', None)
+    if not direct:
         return nset
     left = (mf.max_memory - lib.current_memory()[0]) * .5e6
     n = int(left / (4 * 8 * nao**2))
@@ -156,6 +158,32 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 if v1 is None:
                     v1 = numpy.zeros_like(dm1)
                 return v1
+
+            def k_mo_from_factors(a, mocc):
+                '''The exchange response in the MO basis, mo_coeff^T v_k mocc, of the
+                dms a[x] mocc^T + mocc a[x]^T, from SGX's K of many densities
+                (SGX.get_k_mo), which needs no AO matrix of any of them; None
+                if there is no such path for these dms.'''
+                with_df = getattr(mf, 'with_df', None)
+                if not hybrid or hermi != 1 or not hasattr(with_df, 'get_k_mo'):
+                    return None
+                # as vind_j and vind_k: (range parameter, coefficient)
+                if omega == 0:
+                    terms = ((None, -.5 * hyb),)
+                elif alpha == 0: # LR=0, only SR exchange
+                    terms = ((-omega, -.5 * hyb),)
+                elif hyb == 0: # SR=0, only LR exchange
+                    terms = ((omega, -.5 * alpha),)
+                else: # SR and LR exchange with different ratios
+                    terms = ((None, -.5 * hyb), (omega, -.5 * (alpha-hyb)))
+                vk = 0
+                for om, coeff in terms:
+                    v = with_df.get_k_mo(a, mocc, mo_coeff, mf.direct_scf_tol, om)
+                    if v is None:
+                        return None
+                    v *= coeff
+                    vk = vk + v
+                return vk
         else:
             def vind_jk(dm1, v1=None):
                 '''The exchange response of dm1 (triplets have no Coulomb
@@ -273,7 +301,9 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                     the J/K call with J by chunks of its own, then the K-only
                     calls and VV10 by chunks of the larger K-only batches, so
                     that no J/K call makes more passes over the integrals. The
-                    XC response from the factors needs none of them.'''
+                    XC response from the factors needs none of them, nor does
+                    SGX's K of many densities, whose integrals would be
+                    repeated for each chunk of its densities.'''
                     x = numpy.asarray(x).reshape(-1,nmo,nocc)
                     nset = len(x)
                     nao = mo_coeff.shape[0]
@@ -296,16 +326,29 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                                 v1mo[p0:p1] += numpy.matmul(mo_coeff.T, numpy.matmul(v1, mocc))
                             v1 = None
 
+                    vk_mo = k_mo_from_factors(a, mocc)
+                    k_done = vk_mo is not None
+                    if k_done:
+                        v1mo += vk_mo
+                        vk_mo = None
+
                     def k_nlc_xc(d):
-                        v1 = vind_nlc(d, vind_k(d))
+                        v1 = vind_nlc(d, None if k_done else vind_k(d))
                         if with_xc:
                             vx = vind_xc(d)
                             v1 = vx if v1 is None else v1 + vx
                         return v1
 
-                    by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
-                    if k_alone or with_xc or (with_nlc and mf.do_nlc()):
-                        by_chunks(_cphf_chunk(mf, nset, nao, False, True), k_nlc_xc)
+                    if k_done:
+                        sgx = mf.with_df
+                        by_chunks(_cphf_chunk(mf, nset, nao, True, False,
+                                              sgx.direct_j and not sgx.dfj),
+                                  lambda d: mf.get_j(mol, d, hermi=hermi))
+                    else:
+                        by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
+                    if (k_alone and not k_done) or with_xc or (with_nlc and mf.do_nlc()):
+                        by_chunks(_cphf_chunk(mf, nset, nao, False, True, k_done or None),
+                                  k_nlc_xc)
                     return v1mo
                 vind.vind_mo = vind_mo
 

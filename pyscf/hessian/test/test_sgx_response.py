@@ -16,9 +16,11 @@
 '''Hessian.sgx_response and Hessian.cphf_residual_tol, and the solver behind them'''
 
 import unittest
+from unittest import mock
 import numpy
-from pyscf import gto, scf, dft
-from pyscf.scf import cphf
+from pyscf import gto, scf, dft, lib
+from pyscf.scf import cphf, _response_functions
+from pyscf.sgx import sgx, sgx_jk
 
 
 def setUpModule():
@@ -146,6 +148,33 @@ class KnownValues(unittest.TestCase):
         self.assertLess(d0, 1e-3)
         self.assertGreater(d0, 1e-7)
         self.assertLess(d1, d0)
+
+    def test_sgx_response_k_from_factors(self):
+        # the K of the response from the factors of the dms in the MO basis, and direct J by
+        # chunks, against K and J of the dms: plain, range-separated (long- and short-range K
+        # as well), and only long-range or short-range exchange
+        for xc in ('b3lyp', 'wb97m-v', 'lrc-wpbe', 'hse06'):
+            mf1 = dft.RKS(mol, xc=xc)
+            mf1.conv_tol = 1e-11
+            if xc == 'wb97m-v':
+                mf1.nlcgrids.level = 1
+            mf1.kernel()
+            hobj = mf1.Hessian()
+            hobj.sgx_response = True
+            used = []
+            get_k_mo = sgx.SGX.get_k_mo
+            def count(self, *args, **kwargs):
+                v = get_k_mo(self, *args, **kwargs)
+                used.append(v is not None)
+                return v
+            with lib.temporary_env(sgx_jk, SGX_MANY_DM_MIN=1):
+                with mock.patch.object(sgx.SGX, 'get_k_mo', count), \
+                        mock.patch.object(_response_functions, '_cphf_chunk', lambda *a: 2):
+                    h = hobj.kernel()
+                with mock.patch.object(sgx.SGX, 'get_k_mo', lambda *a, **k: None):
+                    ref = hobj.kernel()
+            self.assertTrue(used and all(used), xc)
+            self.assertLess(abs(h - ref).max(), 1e-10, xc)
 
     def test_sgx_response_rhf(self):
         mf1 = scf.RHF(mol)

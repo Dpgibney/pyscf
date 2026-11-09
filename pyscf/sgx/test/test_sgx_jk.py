@@ -330,6 +330,43 @@ class ManyDensities(unittest.TestCase):
                 self.assertAlmostEqual(abs(vk - ref).max() / abs(ref).max(), 0, 13)
                 self.assertAlmostEqual(abs(vk - ref1).max() / abs(ref).max(), 0, 9)
 
+    def test_get_k_mo(self):
+        # K from the factors of the dms, in the MO basis, against K of the dms
+        mol = gto.M(atom=WATER_CLUSTER, basis='def2-svp', verbose=0)
+        numpy.random.seed(5)
+        nao = mol.nao
+        nocc = mol.nelectron // 2
+        mo_coeff = numpy.linalg.qr(numpy.random.rand(nao, nao))[0]
+        mocc = mo_coeff[:,:nocc]
+        a = numpy.random.rand(13, nao, nocc) - .5
+        d = numpy.matmul(a, mocc.T)
+        d = d + d.transpose(0,2,1)
+        mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+        sgx_obj = mf.with_df
+        for pair_tol, sym in ((1e-9, True), (1e-9, False), (None, True)):
+            sgx_obj.sgx_tol_pair = pair_tol
+            sgx_obj._symm_ovlp_fit = sym
+            if pair_tol is None:
+                sgx_obj.sgx_tol_energy = sgx_obj.sgx_tol_potential = None
+            sgx_obj.reset()
+            sgx_obj.build(level=1)
+            for omega in (None, .3, -.3):
+                nmin = sgx_jk.SGX_MANY_DM_MIN
+                try:
+                    sgx_jk.SGX_MANY_DM_MIN = 1
+                    ref = sgx_obj.get_jk(d, 1, with_j=False, omega=omega)[1]
+                    vk = sgx_obj.get_k_mo(a, mocc, mo_coeff, omega=omega)
+                finally:
+                    sgx_jk.SGX_MANY_DM_MIN = nmin
+                ref = numpy.matmul(mo_coeff.T, numpy.matmul(ref, mocc))
+                self.assertEqual(vk.shape, ref.shape)
+                self.assertLess(abs(vk - ref).max() / abs(ref).max(), 1e-12,
+                                (pair_tol, sym, omega))
+        # too few densities, not a K of get_k_only
+        self.assertIsNone(sgx_obj.get_k_mo(a[:7], mocc, mo_coeff))
+        with lib.temporary_env(sgx_obj, optk=False):
+            self.assertIsNone(sgx_obj.get_k_mo(a, mocc, mo_coeff))
+
 if __name__ == "__main__":
     print("Full Tests for sgx_jk")
     unittest.main()
