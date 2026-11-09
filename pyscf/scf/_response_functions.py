@@ -29,16 +29,21 @@ from pyscf.scf import hf, rohf, uhf, ghf, dhf, _vhf
 
 def _cphf_chunk(mf, nset, nao, with_j, with_k):
     '''The dms that a CPHF response holds at a time for a J/K call (with_j,
-    with_k) of direct SCF: as many as their dms and AO matrices (4 per dm) fit
-    in half of the memory left under max_memory, at least one batch of that
-    call, whose chunks then cost no extra pass over the integrals, and 16 dms
-    for its many-dm kernels. Density-fitted and SGX J/K are not made by passes
-    of that kind: all dms at once.'''
+    with_k) of direct SCF: as many whole batches of that call as their dms and
+    AO matrices (4 per dm) fit in half of the memory left under max_memory, at
+    least one, so that a chunk costs no extra pass over the integrals, and 16
+    dms for its many-dm kernels. The call sizes its batch with the chunk's dms
+    in RSS. Density-fitted and SGX J/K are not made by passes of that kind: all
+    dms at once.'''
     if getattr(mf, 'with_df', None):
         return nset
     left = (mf.max_memory - lib.current_memory()[0]) * .5e6
     n = int(left / (4 * 8 * nao**2))
-    return min(nset, max(n, 16, _vhf._direct_jk_batch(nset, nao, with_j, with_k, True)))
+    batch = _vhf._direct_jk_batch(nset, nao, with_j, with_k, True)
+    nbatch = max(1, n // batch)
+    batch = _vhf._direct_jk_batch(nset, nao, with_j, with_k, True,
+                                  nbatch * batch * 8 * nao**2 / 1e6)
+    return min(nset, max(nbatch * batch, 16))
 
 def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                       singlet=None, hermi=0, max_memory=None, with_nlc=True,
@@ -288,8 +293,7 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                             v1 = response(d)
                             d = None
                             if v1 is not None:
-                                for i, v in enumerate(v1):
-                                    v1mo[p0+i] += reduce(numpy.dot, (mo_coeff.T, v, mocc))
+                                v1mo[p0:p1] += numpy.matmul(mo_coeff.T, numpy.matmul(v1, mocc))
                             v1 = None
 
                     def k_nlc_xc(d):

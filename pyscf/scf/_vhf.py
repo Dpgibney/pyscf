@@ -605,9 +605,10 @@ INT2E_BATCH = getattr(__config__, 'scf_vhf_int2e_batch', True)
 # integrals with all dms (nr_direct_batch.c, _direct_jk_gemm), 13 dms or more
 JK_GEMM = getattr(__config__, 'scf_vhf_jk_gemm', True)
 
-def _direct_jk_batch(n_dm, nao, with_j, with_k, sym_k):
-    '''The dms of one pass over the integrals in _direct_s8_batch'''
-    mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 2000) * .5e6
+def _direct_jk_batch(n_dm, nao, with_j, with_k, sym_k, rss_added=0):
+    '''The dms of one pass over the integrals in _direct_s8_batch, rss_added MB
+    more allocated than now'''
+    mem_avail = max(lib.param.MAX_MEMORY - lib.current_memory()[0] - rss_added, 2000) * .5e6
     if JK_GEMM and n_dm >= 13:
         per_dm = 8 * nao**2 * (1 + 2 * with_j + with_k * (1 + 2 * (not sym_k)))
     else:

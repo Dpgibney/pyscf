@@ -16,9 +16,10 @@
 '''The CPHF response by chunks of dms and H1 in a temporary file: the same numbers'''
 
 import unittest
+import weakref
 from unittest import mock
 import numpy
-from pyscf import gto, dft
+from pyscf import gto, dft, lib
 from pyscf.dft import numint
 from pyscf.scf import _response_functions
 from pyscf.hessian import rhf as rhf_hess
@@ -50,10 +51,11 @@ class KnownValues(unittest.TestCase):
 
     def test_chunks(self):
         # J + K + long-range K + VV10; J + K; J only; J + long-range K alone; J + short-range K alone
-        for xc in ('wb97m-v', 'b3lyp', 'pbe', 'lrc-wpbe', 'hse06'):
+        # and VV10 without any K
+        for xc in ('wb97m-v', 'b3lyp', 'pbe', 'lrc-wpbe', 'hse06', 'b97m-v'):
             mf1 = dft.RKS(mol, xc=xc)
             mf1.conv_tol = 1e-11
-            if xc == 'wb97m-v':
+            if xc in ('wb97m-v', 'b97m-v'):
                 mf1.nlcgrids.level = 1
             mf1.kernel()
             ref = _response(mf1)
@@ -68,7 +70,7 @@ class KnownValues(unittest.TestCase):
     def test_chunk_size(self):
         chunk = _response_functions._cphf_chunk
         with mock.patch.object(_response_functions._vhf, '_direct_jk_batch',
-                               lambda n_dm, nao, with_j, with_k, sym_k: 82 if not with_j else 41):
+                               lambda n_dm, nao, with_j, with_k, sym_k, rss_added=0: 82 if not with_j else 41):
             # no room under max_memory: one batch of the direct J/K call
             mf1 = mock.Mock(max_memory=1, with_df=None)
             self.assertEqual(chunk(mf1, 186, 872, True, True), 41)
@@ -84,6 +86,39 @@ class KnownValues(unittest.TestCase):
             # no such passes in density-fitted and SGX J/K
             mf1 = mock.Mock(max_memory=1, with_df=object())
             self.assertEqual(chunk(mf1, 186, 2000, True, True), 186)
+
+    def test_chunk_is_one_pass(self):
+        # the direct J/K sizes its batch with the chunk's dms in RSS, at n-C20H42's size 41 where
+        # the chunk was sized as 46 before them: no second pass for the last 5 dms of each chunk
+        chunk = _response_functions._cphf_chunk
+        batch = _response_functions._vhf._direct_jk_batch
+        nao = 872
+        mf1 = mock.Mock(max_memory=4000, with_df=None)
+        with mock.patch.object(lib.param, 'MAX_MEMORY', 4000):
+            for rss in range(100, 4300, 40):
+                for with_j, with_k in ((True, True), (True, False), (False, True)):
+                    with mock.patch.object(lib, 'current_memory', lambda: (rss, 0)):
+                        n = chunk(mf1, 186, nao, with_j, with_k)
+                    rss1 = rss + n * 8 * nao**2 / 1e6
+                    with mock.patch.object(lib, 'current_memory', lambda: (rss1, 0)):
+                        self.assertGreaterEqual(batch(n, nao, with_j, with_k, True), n, (rss, with_j, with_k))
+
+    def test_chunk_freed(self):
+        # the J/K of a chunk is gone when the next chunk's is made
+        mf1 = dft.RKS(mol, xc='pbe')
+        mf1.conv_tol = 1e-9
+        mf1.kernel()
+        refs = []
+        get_j = mf1.get_j
+        def spy(*args, **kwargs):
+            self.assertTrue(all(r() is None for r in refs))
+            v = get_j(*args, **kwargs)
+            # the array that owns the memory: v may be a view of it
+            refs.append(weakref.ref(v if v.base is None else v.base))
+            return v
+        with mock.patch.object(mf1, 'get_j', spy), mock.patch.object(_response_functions, '_cphf_chunk', lambda *a: 2):
+            _response(mf1)
+        self.assertGreater(len(refs), 2)
 
     def test_h1ao_file(self):
         h1ao = [None, numpy.arange(12.).reshape(3,2,2)]
