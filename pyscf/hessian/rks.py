@@ -1775,6 +1775,78 @@ def get_vnlc_resp1(mf, mol, dm0, dm1s, max_memory, out=None):
         vmat = vmat.reshape((mol.nao, mol.nao))
     return vmat
 
+def _even_batch(n, batch):
+    '''The size of the fewest batches of at most batch items that cover n items, evened out'''
+    return -(-n // -(-n // batch))
+
+def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out):
+    """
+        out[k] += P^T v[k] Q (P = mo_coeff, Q the occupied orbitals) for the VV10 responses v[k] that
+        get_vnlc_resp gives for the symmetric dms a[k] Q^T + Q a[k]^T, a[nset,nao,nocc], from these
+        factors. Returns out; None, out untouched, if the fused kernels do not apply to mf.nlcgrids.
+
+        Neither the dms nor the v[k] exist in the AO basis. The pair kernel goes through all pairs of
+        points once per call, so a group of dms is as large as its data on the points of the mask allow
+        (7 ngrids per dm, all of it alive only around the kernel). The densities and the potentials go
+        by blocks of points, and the matrices by batches of dms that keep the partial sums of the fused
+        kernels within a quarter of max_memory.
+    """
+    grids = mf.nlcgrids
+    nao = mol.nao
+    fused = numint._fused_xc(mf._numint, mol, grids, nao, 'GGA', max_memory, (),
+                             match_block_loop=False, radial_cache=False)
+    if fused is None:
+        return None
+    mocc = mo_coeff[:,mo_occ>0]
+    vv = _vv10_hess_data(mf, mol, (mocc * mo_occ[mo_occ>0]) @ mocc.T, max_memory)
+    mocc = numpy.asarray(mocc, order='C')
+    a = numpy.asarray(a, order='C')
+    nset, nq = len(a), mocc.shape[1]
+    mask = vv.mask
+
+    group = _even_batch(nset, max(1, int(max_memory*.6e6 / (7 * vv.ngrids * 8))))
+    # rho and nabla rho, or the potentials, of a group on a block of points in a tenth of max_memory
+    ngemm = numint.BLKSIZE * numint.GEMM_NBLK
+    blksize = max(1, min(int(max_memory*.1e6 / (8 * group * 4 * ngemm)), 300)) * ngemm
+    def blocks():
+        '''The blocks of points: (ip0, ip1) on the grids, the mask on them and (p0, p1) in the arrays on the mask'''
+        p1 = 0
+        for ip0, ip1 in lib.prange(0, vv.ngrids_full, blksize):
+            on = mask[ip0:ip1]
+            p0, p1 = p1, p1 + numpy.count_nonzero(on)
+            yield ip0, ip1, on, p0, p1
+
+    nparts = numint.STREAMS_PER_THREAD * lib.num_threads()
+    max_batch = max(1, int(max_memory*.25e6 / (8 * (nparts+1) * nao * nq)))
+    for g0, g1 in lib.prange(0, nset, group):
+        n = g1 - g0
+        rho_t = numpy.empty((n, vv.ngrids))
+        nabla_rho_t = numpy.empty((n, 3, vv.ngrids))
+        for ip0, ip1, on, p0, p1 in blocks():
+            rho1 = fused.rho_lowrank(ip0, ip1, a[g0:g1], mocc, 'GGA')
+            rho_t[:,p0:p1] = rho1[:,0,on]
+            nabla_rho_t[:,:,p0:p1] = rho1[:,1:4,on]
+        rho1 = None
+        # The factor of 2 before the gamma_j^t term in equation (22)
+        gamma_t = 2 * numpy.einsum('ig,tig->tg', vv.nabla_rho, nabla_rho_t)
+        f_rho_t, f_gamma_t = vv.f_t(rho_t, gamma_t)
+        rho_t = gamma_t = None
+
+        for k0, k1 in lib.prange(0, n, _even_batch(n, max_batch)):
+            vq = numpy.zeros((k1-k0, nao, nq))
+            for ip0, ip1, on, p0, p1 in blocks():
+                w = vv.weights[p0:p1]
+                wv = numpy.zeros((k1-k0, 4, ip1-ip0))
+                wv[:,0,on] = f_rho_t[k0:k1,p0:p1] * w
+                wv[:,1:4,on] = ((vv.nabla_rho[:,p0:p1] * f_gamma_t[k0:k1,numpy.newaxis,p0:p1]
+                                 + nabla_rho_t[k0:k1,:,p0:p1] * vv.f_gamma[p0:p1]) * (2 * w))
+                wv[:,0] *= .5  # as _dot_wv: the matrix is v + v^T
+                fused.dot_ao_mo(ip0, ip1, wv, 'GGA', mocc, vq)
+            out[g0+k0:g0+k1] += lib.einsum('pa,kpi->kai', mo_coeff, vq)
+            vq = None
+        f_rho_t = f_gamma_t = nabla_rho_t = None
+    return out
+
 def _check_mgga_grids(grids):
     mol = grids.mol
     atom_grid = grids.atom_grid

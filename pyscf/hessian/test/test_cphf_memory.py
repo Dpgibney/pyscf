@@ -23,6 +23,7 @@ from pyscf import gto, dft, lib
 from pyscf.dft import numint
 from pyscf.scf import _response_functions
 from pyscf.hessian import rhf as rhf_hess
+from pyscf.hessian import rks as rks_hess
 
 
 def setUpModule():
@@ -66,6 +67,31 @@ class KnownValues(unittest.TestCase):
                         chunks = _response(mf1)
                 self.assertLess(abs(chunks - whole).max(), 1e-10, (xc, cheaper))
                 self.assertLess(abs(whole - ref).max(), 1e-10, (xc, cheaper))
+
+    def test_vnlc_from_factors(self):
+        # the VV10 response from the factors of the dms, with groups and batches down to one dm,
+        # against the MO block of the AO matrices
+        mocc = mf.mo_coeff[:,mf.mo_occ>0]
+        x = numpy.random.default_rng(11).random((9, mf.mo_coeff.shape[1], mocc.shape[1])) - .5
+        a = lib.einsum('pa,kai->kpi', mf.mo_coeff, x)
+        dm = numpy.matmul(a, mocc.T)
+        dm = dm + dm.transpose(0,2,1)
+        ref = rks_hess.get_vnlc_resp(mf, mol, mf.mo_coeff, mf.mo_occ, dm, 2000)
+        ref = numpy.matmul(mf.mo_coeff.T, numpy.matmul(ref, mocc))
+        self.assertGreater(abs(ref).max(), 1e-4)
+        for max_memory in (2000, 1):
+            out = rks_hess.get_vnlc_resp_mo(mf, mol, mf.mo_coeff, mf.mo_occ, a, max_memory,
+                                            numpy.zeros_like(ref))
+            self.assertLess(abs(out - ref).max(), 1e-11 * abs(ref).max(), max_memory)
+
+    def test_vind_mo_vnlc_path(self):
+        # vind_mo takes VV10 from the factors, and through the chunks' AO matrices where that path
+        # does not apply
+        with mock.patch.object(rks_hess, 'get_vnlc_resp_mo', wraps=rks_hess.get_vnlc_resp_mo) as m:
+            v = _response(mf)
+        self.assertEqual(m.call_count, 1)
+        with mock.patch.object(rks_hess, 'get_vnlc_resp_mo', lambda *a: None):
+            self.assertLess(abs(_response(mf) - v).max(), 1e-10)
 
     def test_chunk_size(self):
         chunk = _response_functions._cphf_chunk

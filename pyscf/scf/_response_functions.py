@@ -296,14 +296,16 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 def vind_mo(dm1, x):
                     '''mo_coeff^T vind(dm1) mocc for the symmetric dms
                     dm1 = mo_coeff x mocc^T + h.c., x[nset,nmo,nocc], made from x
-                    for dm1=None. The AO matrices of the dms and of their J, K
-                    and VV10 responses exist for a chunk of the dms at a time:
-                    the J/K call with J by chunks of its own, then the K-only
-                    calls and VV10 by chunks of the larger K-only batches, so
-                    that no J/K call makes more passes over the integrals. The
-                    XC response from the factors needs none of them, nor does
+                    for dm1=None. The AO matrices of the dms and of their J and K
+                    responses exist for a chunk of the dms at a time: the J/K
+                    call with J by chunks of its own, then the K-only calls by
+                    chunks of the larger K-only batches, so that no J/K call
+                    makes more passes over the integrals. The XC and VV10
+                    responses from the factors need none of them, nor does
                     SGX's K of many densities, whose integrals would be
-                    repeated for each chunk of its densities.'''
+                    repeated for each chunk of its densities. Without the
+                    fused kernels for the VV10 grids, VV10 goes with the K-only
+                    chunks.'''
                     x = numpy.asarray(x).reshape(-1,nmo,nocc)
                     nset = len(x)
                     nao = mo_coeff.shape[0]
@@ -332,8 +334,16 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                         v1mo += vk_mo
                         vk_mo = None
 
+                    nlc_done = False
+                    if with_nlc and mf.do_nlc() and a.dtype == numpy.double:
+                        from pyscf.hessian.rks import get_vnlc_resp_mo
+                        nlc_done = get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory,
+                                                    v1mo) is not None
+
                     def k_nlc_xc(d):
-                        v1 = vind_nlc(d, None if k_done else vind_k(d))
+                        v1 = None if k_done else vind_k(d)
+                        if not nlc_done:
+                            v1 = vind_nlc(d, v1)
                         if with_xc:
                             vx = vind_xc(d)
                             v1 = vx if v1 is None else v1 + vx
@@ -346,7 +356,8 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                                   lambda d: mf.get_j(mol, d, hermi=hermi))
                     else:
                         by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
-                    if (k_alone and not k_done) or with_xc or (with_nlc and mf.do_nlc()):
+                    if (k_alone and not k_done) or with_xc or (
+                            with_nlc and mf.do_nlc() and not nlc_done):
                         by_chunks(_cphf_chunk(mf, nset, nao, False, True, k_done or None),
                                   k_nlc_xc)
                     return v1mo
