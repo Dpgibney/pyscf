@@ -519,7 +519,9 @@ def get_jk(mf_grad, mol=None, dm=None, hermi=1, vhfopt=None, with_j=True, with_k
     sgx = mf_grad.base.with_df
     dm = mf_grad.base.make_rdm1()
     if with_j and mf_grad.base.with_df.dfj:
-        vj = super(mf_grad.__class__, mf_grad).get_jk(
+        # _GradientsMixin, not mf_grad.__class__: a gradient scanner, as in geometry
+        # optimizations, derives from the SGX gradient class and would find this get_jk again
+        vj = super(_GradientsMixin, mf_grad).get_jk(
             mf_grad.mol, dm, hermi, with_j=True, with_k=False)[0]
         if not with_k:
             return vj, None

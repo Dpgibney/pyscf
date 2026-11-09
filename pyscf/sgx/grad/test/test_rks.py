@@ -82,6 +82,24 @@ class KnownValues(unittest.TestCase):
         self._check_finite_diff_grad(ALL_SETTINGS[2], ALL_PRECISIONS[2], "HSE06")
         self._check_finite_diff_grad(ALL_SETTINGS[2], ALL_PRECISIONS[2], "WB97X")
 
+    def test_grad_scanner_dfj(self):
+        # the gradient scanner of RI-J + SGX-K, which geometry optimizations use: its class
+        # derives from the SGX gradient class. All four gradient classes share get_jk.
+        for cls, xc in ((scf.RHF, None), (scf.UHF, None), (scf.RKS, 'PBE0'), (scf.UKS, 'PBE0'),
+                        (scf.RKS, 'WB97X')):
+            mf = sgx_fit(cls(mol))
+            mf.with_df.dfj = True
+            mf.with_df.grids_level_f = 1
+            mf.conv_tol = 1e-11
+            if xc is not None:
+                mf.xc = xc
+                mf.grids.level = 1
+            e_ref = mf.kernel()
+            g_ref = mf.nuc_grad_method().kernel()
+            e, g = mf.nuc_grad_method().as_scanner()(mol)
+            self.assertAlmostEqual(e, e_ref, 8, (cls, xc))
+            self.assertLess(abs(g - g_ref).max(), 1e-5, (cls, xc))
+
 
 if __name__ == '__main__':
     unittest.main()
