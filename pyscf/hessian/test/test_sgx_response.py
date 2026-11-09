@@ -95,6 +95,18 @@ class KnownValues(unittest.TestCase):
         mo1 = cphf.solve_residual(fvind, mo_energy, mo_occ, h1, s1, tol=1e-10, level_shift=.1)[0]
         self.assertLess(abs(mo1 - x).max(), 1e-9)
 
+    def test_solve_residual_scale_trials(self):
+        # fvind is linear: the same solution, and fvind sees smaller vectors after the first cycle
+        fvind, mo_energy, mo_occ, h1, s1, x, e1 = _toy_problem()
+        norms = []
+        def f(m):
+            norms.append(numpy.linalg.norm(m.reshape(len(m), -1), axis=1).max())
+            return fvind(m)
+        mo1, mo_e1 = cphf.solve_residual(f, mo_energy, mo_occ, h1, s1, tol=1e-10, scale_trials=True)
+        self.assertLess(abs(mo1 - x).max(), 1e-9)
+        self.assertLess(abs(mo_e1 - e1).max(), 1e-9)
+        self.assertLess(norms[-1], 1e-2)
+
     def test_residual_tol_against_stock(self):
         # cphf.solve stops short for DFT, here by 7.5e-6 from the converged Hessian
         self.assertLess(abs(mf.Hessian().kernel() - h_ref).max(), 3e-5)

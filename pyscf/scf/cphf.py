@@ -221,17 +221,20 @@ def solve_withs1(fvind, mo_energy, mo_occ, h1, s1,
 
 def _orthonormal_rows(t, vs, drop):
     '''Orthonormal rows spanning the part of the rows of t orthogonal to the
-    rows of the blocks vs, without the directions whose norm is below drop.
+    rows of the blocks vs, without the directions whose norm is below drop,
+    and the size of each row in t (the diagonal of the pivoted QR).
     t is overwritten.'''
     for _ in range(2):
         for v in vs:
             t -= lib.dot(lib.dot(t, v.T), v)
     q, r = scipy.linalg.qr(t.T, mode='economic', pivoting=True)[:2]
-    q = q[:,abs(r.diagonal()) > drop].T
+    sizes = abs(r.diagonal())
+    keep = sizes > drop
+    q = q[:,keep].T
     # the rows are combinations of t's, by large coefficients for near-dependent t
     for v in vs:
         q -= lib.dot(lib.dot(q, v.T), v)
-    return q
+    return q, sizes[keep]
 
 def _combine_blocks(c, blocks):
     '''sum_k c[k,r] vectors[k] of the vectors in the list of blocks [nk,...]'''
@@ -244,7 +247,7 @@ def _combine_blocks(c, blocks):
     return out
 
 def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
-                   verbose=logger.WARN, level_shift=0):
+                   verbose=logger.WARN, level_shift=0, scale_trials=False):
     '''The equations of solve_withs1 for real orbitals and perturbations, solved
     until the true residual of every perturbation is below tol.
 
@@ -262,10 +265,12 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
     A cycle adds the preconditioned residuals of the perturbations that are
     not converged, made orthonormal against V and among themselves. Unlike
     lib.krylov, which stops on the sizes of Krylov vectors that shrink by orders
-    of magnitude, the stop and the choice of vectors look at the residuals, and
-    fvind always gets densities of about unit size: thresholds of its
+    of magnitude, the stop and the choice of vectors look at the residuals.
+    By default fvind gets densities of about unit size: the thresholds of its
     integrals (direct SCF, the seminumerical K of SGX) are absolute, and
-    would otherwise mean less and less in the later cycles.
+    would otherwise mean less and less in the later cycles. That is what the
+    approximate K of SGX needs; with scale_trials it is given up for the speed
+    of exact integrals.
 
     Kwargs:
         tol : float
@@ -275,6 +280,11 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
             Max. number of cycles of trial vectors
         level_shift : float
             Added to (e_a - e_i) in the preconditioner
+        scale_trials : bool
+            Give fvind each trial vector at its size in the residuals, and
+            divide the response by that size. fvind is linear, so only what
+            the density screening of its integrals can skip changes: the
+            later cycles cost less. Needs a threshold of fvind well below tol
 
     Returns:
         First order orbital coefficients (in MO basis) and first order orbital
@@ -324,15 +334,16 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
         if cycle == max_cycle:
             raise RuntimeError('CPHF solver failed to converge.')
 
-        x1 = _orthonormal_rows(r[active] / precond, vs, drop)
+        x1, sizes = _orthonormal_rows(r[active] / precond, vs, drop)
         nq = len(x1)
         if nq == 0:
             log.warn('CPHF stopped with no new trial vector; residual %g '
                      'above tol %g', rnorm.max(), tol)
             break
+        scale = sizes.reshape(nq,1,1) if scale_trials else 1.
         trial = numpy.zeros((nq,nmo,nocc))
-        trial[:,viridx] = x1.reshape(nq,nvir,nocc)
-        w = fvind(trial).reshape(nq,nmo,nocc)
+        trial[:,viridx] = x1.reshape(nq,nvir,nocc) * scale
+        w = fvind(trial).reshape(nq,nmo,nocc) / scale
         trial = None
         mx1 = w[:,viridx].reshape(nq,ndim) + x1 * diag
         voo.append(w[:,occidx].reshape(nq,nocc*nocc))
