@@ -351,9 +351,14 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
 
                     if k_done:
                         sgx = mf.with_df
-                        by_chunks(_cphf_chunk(mf, nset, nao, True, False,
-                                              sgx.direct_j and not sgx.dfj),
-                                  lambda d: mf.get_j(mol, d, hermi=hermi))
+                        if sgx.direct_j and not sgx.dfj:
+                            chunk = _cphf_chunk(mf, nset, nao, True, False, True)
+                        else:
+                            # RI-J: the J-engine takes its own chunks of the dms in each
+                            # pass, so chunks here cost no integrals either
+                            left = (mf.max_memory - lib.current_memory()[0]) * .5e6
+                            chunk = min(nset, max(16, int(left / (4 * 8 * nao**2))))
+                        by_chunks(chunk, lambda d: mf.get_j(mol, d, hermi=hermi))
                     else:
                         by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
                     if (k_alone and not k_done) or with_xc or (

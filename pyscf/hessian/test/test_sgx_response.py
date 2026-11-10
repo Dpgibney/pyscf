@@ -21,6 +21,7 @@ import numpy
 from pyscf import gto, scf, dft, lib
 from pyscf.scf import cphf, _response_functions
 from pyscf.sgx import sgx, sgx_jk
+from pyscf.hessian import rhf as rhf_hess
 
 
 def setUpModule():
@@ -150,6 +151,34 @@ class KnownValues(unittest.TestCase):
         self.assertLess(d0, 1e-3)
         self.assertGreater(d0, 1e-7)
         self.assertLess(d1, d0)
+
+    def test_sgx_response_auxbasis(self):
+        # RI-J for the response's J: the even-tempered fitting basis stays close to direct J,
+        # the SCF's Coulomb-fitting basis less so; the J-engine takes the dms together
+        from pyscf.df import df_jk
+        hobj = mf.Hessian()
+        hobj.sgx_response = True
+        h_direct = hobj.kernel()
+        err = {}
+        for auxbasis in ('aug_etb', 'def2-universal-jfit'):
+            hobj = mf.Hessian()
+            hobj.sgx_response = True
+            hobj.sgx_response_auxbasis = auxbasis
+            calls = []
+            drv_many = df_jk._RIJEngineData.drv_many
+            def spy(self, npass, out, *args):
+                calls.append(len(out))
+                return drv_many(self, npass, out, *args)
+            with lib.temporary_env(df_jk._RIJEngineData, drv_many=spy):
+                err[auxbasis] = abs(hobj.kernel() - h_direct).max()
+            self.assertTrue(len(calls) > 0 and max(calls) > 1)
+        self.assertLess(err['aug_etb'], 2e-5)
+        self.assertLess(err['aug_etb'], err['def2-universal-jfit'])
+        self.assertGreater(err['def2-universal-jfit'], 1e-6)
+        mf_sgx = rhf_hess._sgx_response_scf(mf, 1, 'aug_etb')
+        self.assertTrue(mf_sgx.with_df.dfj and not mf_sgx.with_df.direct_j)
+        mf_sgx = rhf_hess._sgx_response_scf(mf, 1)
+        self.assertTrue(mf_sgx.with_df.direct_j and not mf_sgx.with_df.dfj)
 
     def test_sgx_response_k_from_factors(self):
         # the K of the response from the factors of the dms in the MO basis, and direct J by

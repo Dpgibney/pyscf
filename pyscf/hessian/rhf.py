@@ -692,25 +692,33 @@ def gen_hop(hobj, mo_energy=None, mo_coeff=None, mo_occ=None, verbose=None):
     return h_op, hdiag
 
 
-def _sgx_response_scf(mf, level):
+def _sgx_response_scf(mf, level, auxbasis=None):
     '''A copy of the SCF object mf whose J and K, and so those of its response
-    function, are direct SCF's J and SGX's K on grid level level, the shell
-    pairs of K screened by batch as in mf.RIJCOSX(). The orbitals, the XC grids
-    and everything else are mf's.'''
+    function, are direct SCF's J (auxbasis None) or RI-J in the fitting basis
+    auxbasis ('aug_etb': df.aug_etb(mol)), and SGX's K on grid level level, the
+    shell pairs of K screened by batch as in mf.RIJCOSX(). The orbitals, the XC
+    grids and everything else are mf's.'''
     if getattr(mf, 'with_df', None) is not None:
         raise NotImplementedError('sgx_response with a density-fitted SCF')
     from pyscf.sgx.sgx import rijcosx
-    mf_sgx = rijcosx(mf)
+    if auxbasis is None:
+        mf_sgx = rijcosx(mf)
+    else:
+        if isinstance(auxbasis, str) and auxbasis.lower().replace('-', '_') == 'aug_etb':
+            from pyscf.df import addons
+            auxbasis = addons.aug_etb(mf.mol)
+        mf_sgx = rijcosx(mf, auxbasis=auxbasis)
     sgx = mf_sgx.with_df
-    sgx.dfj = False
-    sgx.direct_j = True
+    if auxbasis is None:
+        sgx.dfj = False
+        sgx.direct_j = True
     sgx.grids_level_i = sgx.grids_level_f = level
     sgx.build(level=level)
     # the state of an SCF that this copy does not run
     mf_sgx._nsteps_direct = 0
     mf_sgx._in_scf = False
-    logger.info(mf, 'CPHF response with direct J and SGX K on grid level %d, '
-                '%d points', level, sgx.grids.weights.size)
+    logger.info(mf, 'CPHF response with %s and SGX K on grid level %d, %d points',
+                'direct J' if auxbasis is None else 'RI-J', level, sgx.grids.weights.size)
     return mf_sgx
 
 @contextlib.contextmanager
@@ -752,13 +760,20 @@ class HessianBase(lib.StreamObject):
     # diffuse functions (0.03 to 0.5 cm^-1 with def2-SVP and def2-TZVP).
     sgx_response = False
     sgx_response_level = 1
+    # The J of the response under sgx_response: None for direct SCF's (exact), or
+    # the fitting basis of RI-J, whose many-density J-engine costs a small
+    # fraction of it. 'aug_etb' is the even-tempered basis of df.aug_etb(mol);
+    # the Coulomb-fitting sets of the SCF (def2-universal-jfit) miss the core
+    # region of the response densities of the nuclei and cost a few tenths of a
+    # cm^-1.
+    sgx_response_auxbasis = None
     # None: cphf.solve to mf.conv_tol_cpscf, unless sgx_response, which needs
     # SGX_RESPONSE_RESIDUAL_TOL. A number: cphf.solve_residual with that tol
     cphf_residual_tol = None
 
     _keys = {
         'mol', 'base', 'atmlst', 'de', 'max_cycle', 'level_shift',
-        'sgx_response', 'sgx_response_level', 'cphf_residual_tol'
+        'sgx_response', 'sgx_response_level', 'sgx_response_auxbasis', 'cphf_residual_tol'
     }
 
     def __init__(self, scf_method):
@@ -860,7 +875,8 @@ class HessianBase(lib.StreamObject):
             if residual_tol is None:
                 residual_tol = SGX_RESPONSE_RESIDUAL_TOL
             if fx is None:
-                fx = gen_vind(_sgx_response_scf(self.base, self.sgx_response_level),
+                fx = gen_vind(_sgx_response_scf(self.base, self.sgx_response_level,
+                                                self.sgx_response_auxbasis),
                               mo_coeff, mo_occ)
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
