@@ -1658,6 +1658,9 @@ def _pre_scf_grids(grids, mol, level):
     import copy
     from pyscf.dft import gen_grid
     g = copy.copy(grids).reset(mol)
+    # copy.copy goes through StreamObject's pickle methods, which leave the
+    # copy with sys.stdout
+    g.stdout = grids.stdout
     g.__dict__.pop('_fused_ao_data', None)
     g.level = min(grids.level, level)
     atom_grid = grids.atom_grid
