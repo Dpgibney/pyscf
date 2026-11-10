@@ -36,8 +36,11 @@ The solution is the expensive model's own, to its convergence thresholds.
     >>> mf.kernel()
 
 Caffeine, wB97M-V/def2-TZVPD with XC grid (99,590) and VV10 grid (50,194): the
-energy of the plain SCF to 7e-11 Eh with 2 Fock builds of the model instead of
-15, 204 s against 451 s.
+energy of the plain SCF to 1e-10 Eh with 2 Fock builds of the model instead of
+15, 170 s against 451 s; for mf.RIJCOSX(), where only the grids of the cheap
+model differ, 126 s against 176 s. The cheap model's grids are of levels 1 (XC)
+and 0 (VV10): with level 0 for XC a third build is needed, with levels 2 and 1
+the cheap SCF costs more (202 and 158 s).
 '''
 
 import numpy

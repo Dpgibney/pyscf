@@ -1724,7 +1724,7 @@ class SCF(lib.StreamObject):
             model is two_level_scf if set, otherwise a copy with RI-J in
             two_level_auxbasis ('aug_etb': df.aug_etb(mol)), seminumerical K,
             and for DFT the grids of levels two_level_grids_level and
-            two_level_nlcgrids_level (2 and 1). The solution is this model's
+            two_level_nlcgrids_level (1 and 0). The solution is this model's
             own, to conv_tol and conv_tol_grad. Default is False
         DIIS : DIIS class
             The class to generate diis object.  It can be one of
@@ -1803,8 +1803,8 @@ class SCF(lib.StreamObject):
     pre_scf_fit = getattr(__config__, 'scf_hf_SCF_pre_scf_fit', 'auto')
     two_level = getattr(__config__, 'scf_hf_SCF_two_level', False)
     two_level_scf = None
-    two_level_grids_level = getattr(__config__, 'scf_hf_SCF_two_level_grids_level', 2)
-    two_level_nlcgrids_level = getattr(__config__, 'scf_hf_SCF_two_level_nlcgrids_level', 1)
+    two_level_grids_level = getattr(__config__, 'scf_hf_SCF_two_level_grids_level', 1)
+    two_level_nlcgrids_level = getattr(__config__, 'scf_hf_SCF_two_level_nlcgrids_level', 0)
     two_level_auxbasis = getattr(__config__, 'scf_hf_SCF_two_level_auxbasis', 'aug_etb')
     two_level_conv_factor = 100
     two_level_micro_cycles = 20
