@@ -1649,6 +1649,35 @@ class SCF_Scanner(lib.SinglePointScanner):
         return e_tot
 
 
+def _pre_scf_grids(grids, mol, level):
+    '''The grids of the pre-SCF of init_guess='pre_scf': a copy of grids (not
+    built) at most as fine as the default grids of the given level. A user's
+    atom_grid, which takes precedence over the level in gen_grid, is kept only
+    for the elements it gives fewer points than that level.
+    '''
+    import copy
+    from pyscf.dft import gen_grid
+    g = copy.copy(grids).reset(mol)
+    g.__dict__.pop('_fused_ao_data', None)
+    g.level = min(grids.level, level)
+    atom_grid = grids.atom_grid
+    if atom_grid:
+        symbs = {mol.atom_symbol(ia) for ia in range(mol.natm)}
+        if isinstance(atom_grid, (list, tuple)):
+            atom_grid = {symb: atom_grid for symb in symbs}
+        default = atom_grid.get('default', None)
+        kept = {}
+        for symb in symbs:
+            conf = atom_grid.get(symb, default)
+            if conf is None:
+                continue
+            chg = gto.charge(symb)
+            n = gen_grid._default_rad(chg, g.level) * gen_grid._default_ang(chg, g.level)
+            if conf[0] * conf[1] < n:
+                kept[symb] = conf
+        g.atom_grid = kept
+    return g
+
 class SCF(lib.StreamObject):
     '''SCF base class.   non-relativistic RHF.
 
@@ -1680,7 +1709,14 @@ class SCF(lib.StreamObject):
             for DFT the grids of level pre_scf_grids_level) to this energy
             threshold. Default is 1e-6
         pre_scf_grids_level : int
-            Grid level of the pre-SCF of init_guess='pre_scf'. Default is 1
+            Grid level of the pre-SCF of init_guess='pre_scf', also where
+            grids.atom_grid asks for more points than that level. Default is 1
+        pre_scf_fit : str
+            How the pre-SCF of init_guess='pre_scf' fits the Coulomb and
+            exchange terms: 'df' (density fitting: RI-J and RI-K), 'rijcosx'
+            (RI-J and seminumerical exchange, which store no 3-index tensor)
+            or 'auto' (density fitting if its tensors fit in memory, otherwise
+            'rijcosx'). Default is 'auto'
         DIIS : DIIS class
             The class to generate diis object.  It can be one of
             diis.SCF_DIIS, diis.ADIIS, diis.EDIIS, diis.ADIIS_CDIIS.
@@ -1755,6 +1791,7 @@ class SCF(lib.StreamObject):
     sap_basis = 'sapgrasplarge' # Basis for SAP initial guess
     pre_scf_conv_tol = getattr(__config__, 'scf_hf_SCF_pre_scf_conv_tol', 1e-6)
     pre_scf_grids_level = getattr(__config__, 'scf_hf_SCF_pre_scf_grids_level', 1)
+    pre_scf_fit = getattr(__config__, 'scf_hf_SCF_pre_scf_fit', 'auto')
     disp = None  # for DFT-D3 and DFT-D4
 
     # To avoid diis pollution from previous run, self.diis should not be
@@ -1779,7 +1816,7 @@ class SCF(lib.StreamObject):
 
     _keys = {
         'conv_tol', 'conv_tol_grad', 'conv_tol_cpscf', 'max_cycle', 'init_guess',
-        'sap_basis', 'pre_scf_conv_tol', 'pre_scf_grids_level',
+        'sap_basis', 'pre_scf_conv_tol', 'pre_scf_grids_level', 'pre_scf_fit',
         'DIIS', 'diis', 'diis_space', 'diis_damp', 'diis_start_cycle',
         'diis_file', 'diis_space_rollback', 'damp', 'level_shift',
         'direct_scf', 'direct_scf_tol', 'semi_direct', 'conv_check', 'callback',
@@ -2025,16 +2062,12 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
 
     def init_guess_by_pre_scf(self, mol=None):
         '''Density of a cheaper SCF of the same model, converged from the minao
-        guess to pre_scf_conv_tol: density fitting for the Coulomb and exchange
-        terms (unless the object fits already), and for DFT the grids of level
-        pre_scf_grids_level. Starting from it, the SCF needs a few of its own
-        Fock builds instead of a full sequence (the DF_SCF_GUESS of Psi4).
+        guess to pre_scf_conv_tol: the Coulomb and exchange terms fitted (unless
+        the object fits already, see pre_scf_fit), and for DFT the grids of
+        level pre_scf_grids_level. Starting from it, the SCF needs a few of its
+        own Fock builds instead of a full sequence (the DF_SCF_GUESS of Psi4).
         '''
-        import copy
         if mol is None: mol = self.mol
-        logger.info(self, 'Initial guess from an SCF with density fitting%s, '
-                    'converged to %g', ', grids level %d' % self.pre_scf_grids_level
-                    if hasattr(self, 'grids') else '', self.pre_scf_conv_tol)
         mf = self.copy()
         mf.mol = mol
         mf._eri = None
@@ -2051,14 +2084,54 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
         for key in ('grids', 'nlcgrids'):
             grids = getattr(self, key, None)
             if grids is not None:
-                grids = copy.copy(grids).reset(mol)
-                grids.__dict__.pop('_fused_ao_data', None)
-                grids.level = min(grids.level, self.pre_scf_grids_level)
-                setattr(mf, key, grids)
+                setattr(mf, key, _pre_scf_grids(grids, mol, self.pre_scf_grids_level))
+        fit = 'the fitting of the SCF'
         if getattr(mf, 'with_df', None) is None:
-            mf = mf.density_fit()
+            mf, fit = self._pre_scf_fit(mf, mol)
+        logger.info(self, 'Initial guess from an SCF with %s%s, converged to %g', fit,
+                    ', grids level %d' % self.pre_scf_grids_level
+                    if hasattr(self, 'grids') else '', self.pre_scf_conv_tol)
         mf.kernel()
         return mf.make_rdm1()
+
+    def _pre_scf_fit(self, mf, mol):
+        '''(mf with its Coulomb and exchange terms fitted for the pre-SCF of
+        init_guess='pre_scf', a description). pre_scf_fit 'df': density fitting
+        (RI-J and RI-K, which keeps the 3-index tensor of each exchange operator);
+        'rijcosx': RI-J and seminumerical exchange, which keep nothing
+        (sgx.rijcosx); 'auto': density fitting if its tensors fit in half of the
+        memory left under max_memory, otherwise RI-J and seminumerical exchange.
+        '''
+        from pyscf.scf import ghf, dhf
+        method = self.pre_scf_fit
+        if method not in ('auto', 'df', 'rijcosx'):
+            raise ValueError('pre_scf_fit %s' % method)
+        ntensor = 1
+        if isinstance(mf, KohnShamDFT):
+            ni = mf._numint
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
+            if not ni.libxc.is_hybrid_xc(mf.xc):
+                ntensor = 0
+            elif omega != 0 and alpha != 0 and hyb != 0:
+                ntensor = 2
+        mfdf = mf.density_fit()
+        if (method == 'df' or ntensor == 0 or isinstance(mf, (ghf.GHF, dhf.DHF))
+                or numpy.iscomplexobj(getattr(mf, 'mo_coeff', None))):
+            return mfdf, 'density fitting'
+        if method == 'auto':
+            from pyscf.df import addons
+            auxbasis = mfdf.with_df.auxbasis
+            if auxbasis is None:
+                auxbasis = addons.make_auxbasis(mol)
+            naux = addons.make_auxmol(mol, auxbasis).nao_nr()
+            nao = mol.nao_nr()
+            size = ntensor * naux * nao * (nao + 1) * 4e-6
+            if size < .5 * (mf.max_memory - lib.current_memory()[0]):
+                return mfdf, 'density fitting'
+        from pyscf.sgx import sgx
+        mf = sgx.rijcosx(mf)
+        mf.with_df.grids_level_energy = None
+        return mf, 'RI-J and seminumerical exchange'
 
     @lib.with_doc(init_guess_by_chkfile.__doc__)
     def init_guess_by_chkfile(self, chkfile=None, project=None):

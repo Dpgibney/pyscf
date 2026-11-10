@@ -1023,6 +1023,42 @@ H     0    0.757    0.587'''
             # the guess leaves the object's own two-electron method alone
             self.assertEqual(mf.istype('_DFHF'), make().istype('_DFHF'))
 
+    def test_init_guess_pre_scf_grids_and_fit(self):
+        from pyscf import dft
+        from pyscf.scf import hf
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*', verbose=0)
+        # grids.atom_grid takes precedence over grids.level: the pre-SCF drops it where it asks
+        # for more points than its level, and keeps it where it asks for fewer
+        mf = dft.RKS(mol, xc='b3lyp')
+        mf.grids.atom_grid = (99, 590)
+        g = hf._pre_scf_grids(mf.grids, mol, 1)
+        self.assertEqual(g.atom_grid, {})
+        self.assertEqual(g.level, 1)
+        self.assertEqual(g.build().weights.size, dft.gen_grid.Grids(mol).set(level=1).build().weights.size)
+        self.assertEqual(mf.grids.atom_grid, (99, 590))
+        mf.grids.atom_grid = {'H': (10, 50), 'default': (99, 590)}
+        self.assertEqual(hf._pre_scf_grids(mf.grids, mol, 1).atom_grid, {'H': (10, 50)})
+        # every choice of the pre-SCF's fitting ends on the SCF's own solution
+        for xc in ('b3lyp', 'wb97x', 'pbe'):
+            mf = dft.RKS(mol, xc=xc)
+            mf.grids.atom_grid = (50, 194)
+            mf.conv_tol = 1e-10
+            e_ref = mf.kernel()
+            for fit in ('auto', 'df', 'rijcosx'):
+                mf = dft.RKS(mol, xc=xc)
+                mf.grids.atom_grid = (50, 194)
+                mf.conv_tol = 1e-10
+                mf.init_guess = 'pre_scf'
+                mf.pre_scf_fit = fit
+                self.assertAlmostEqual(mf.kernel(), e_ref, 8)
+                self.assertTrue(mf.converged)
+                self.assertEqual(mf.grids.atom_grid, (50, 194))
+                self.assertFalse(mf.istype('_SGXHF') or mf.istype('_DFHF'))
+        mf = scf.RHF(mol)
+        mf.init_guess = 'pre_scf'
+        mf.pre_scf_fit = 'unknown'
+        self.assertRaises(ValueError, mf.kernel)
+
 
 if __name__ == "__main__":
     print("Full Tests for rhf")
