@@ -416,6 +416,31 @@ class KnownValues(unittest.TestCase):
 
         assert np.max(np.abs(test_hessian - ref_hessian)) < 1e-7
 
+    def test_response_from_factors(self):
+        # the CPHF response of a solvated model from the factors of its density
+        # matrices (the solvent wrapper's vind_mo) against their AO matrices
+        from pyscf.solvent import _attach_solvent
+        for spin, charge in ((0, 0), (1, 1)):
+            mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0.1 -0.76 -0.47', basis='def2-svp',
+                         charge=charge, spin=spin, verbose=0)
+            cls = dft.RKS if spin == 0 else dft.UKS
+            mf1 = cls(mol1, xc='wb97x-v').PCM()
+            mf1.grids.level = 1
+            mf1.nlcgrids.level = 0
+            mf1.conv_tol = 1e-11
+            mf1.kernel()
+            vresp = mf1.gen_response(mf1.mo_coeff, mf1.mo_occ, hermi=1)
+            with lib.temporary_env(mf1.with_solvent, equilibrium_solvation=True):
+                self.assertTrue(getattr(mf1.gen_response(mf1.mo_coeff, mf1.mo_occ, hermi=1),
+                                        'vind_mo', None) is not None)
+            hs = []
+            for make in (_attach_solvent._solvent_vind_mo, lambda *args: None):
+                with lib.temporary_env(_attach_solvent, _solvent_vind_mo=make):
+                    hobj = mf1.Hessian()
+                    hobj.cphf_residual_tol = 1e-8
+                    hs.append(hobj.kernel())
+            self.assertAlmostEqual(abs(hs[0] - hs[1]).max(), 0, 9)
+
 if __name__ == "__main__":
     print("Full Tests for Hessian of PCMs")
     unittest.main()

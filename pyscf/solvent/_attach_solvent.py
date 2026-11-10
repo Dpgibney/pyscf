@@ -27,6 +27,60 @@ from pyscf.lib import logger
 from functools import reduce
 from pyscf import scf
 
+def _solvent_vind_mo(mf, vind_mo, mo_coeff, mo_occ, is_uhf):
+    '''vind_mo of the gas-phase response function with the solvent's response
+    added, mo_coeff^T B[dm1] mocc: the surface potentials of the density
+    matrices, the charges they induce, and the potential matrices of these, for
+    a chunk of the dms at a time.'''
+    with_solvent = mf.with_solvent
+    def solvent_mo(dm_of, nset, nao, add):
+        # the dms and their potential matrices in the AO basis, by chunks
+        left = max(mf.max_memory - lib.current_memory()[0], 500) * .25e6
+        chunk = min(nset, max(8, int(left / (2 * 8 * nao**2))))
+        for p0, p1 in lib.prange(0, nset, chunk):
+            add(p0, p1, with_solvent._B_dot_x(dm_of(p0, p1)))
+
+    if not is_uhf:
+        mocc = mo_coeff[:,mo_occ>0]
+        nmo, nocc = mo_coeff.shape[1], mocc.shape[1]
+        def vind_mo_with_solvent(dm1, x):
+            v1mo = vind_mo(dm1, x)
+            if not with_solvent.equilibrium_solvation:
+                return v1mo
+            x = numpy.asarray(x).reshape(-1,nmo,nocc)
+            def dm_of(p0, p1):
+                if dm1 is not None:
+                    return numpy.asarray(dm1[p0:p1])
+                d = numpy.matmul(numpy.matmul(mo_coeff, x[p0:p1]), mocc.T)
+                return d + d.transpose(0,2,1)
+            def add(p0, p1, v):
+                v1mo[p0:p1] += numpy.matmul(mo_coeff.T, numpy.matmul(v, mocc))
+            solvent_mo(dm_of, len(x), mo_coeff.shape[0], add)
+            return v1mo
+    else:
+        mocc = [mo_coeff[k][:,mo_occ[k]>0] for k in range(2)]
+        shapes = [(mo_coeff[k].shape[1], mocc[k].shape[1]) for k in range(2)]
+        def vind_mo_with_solvent(dm1, x):
+            v1mo = vind_mo(dm1, x)
+            if not with_solvent.equilibrium_solvation:
+                return v1mo
+            v1mo = [numpy.asarray(v) for v in v1mo]
+            nset = len(v1mo[0])
+            xs = [numpy.asarray(x[k]).reshape(nset, *shapes[k]) for k in range(2)]
+            def dm_of(p0, p1):
+                if dm1 is not None:
+                    return numpy.asarray(dm1[0][p0:p1]) + numpy.asarray(dm1[1][p0:p1])
+                d = sum(numpy.matmul(numpy.matmul(mo_coeff[k], xs[k][p0:p1]), mocc[k].T)
+                        for k in range(2))
+                return d + d.transpose(0,2,1)
+            def add(p0, p1, v):
+                for k in range(2):
+                    vk = numpy.matmul(mo_coeff[k].T, numpy.matmul(v, mocc[k]))
+                    v1mo[k][p0:p1] += vk.reshape(v1mo[k][p0:p1].shape)
+            solvent_mo(dm_of, nset, mo_coeff[0].shape[0], add)
+            return v1mo
+    return vind_mo_with_solvent
+
 def _for_scf(mf, solvent_obj, dm=None):
     '''Add solvent model to SCF (HF and DFT) method.
 
@@ -173,6 +227,18 @@ class SCFWithSolvent(_Solvation):
                 else:
                     v += self.with_solvent._B_dot_x(dm1)
             return v
+
+        # The gas-phase response in the MO basis from the factors of the CPHF's
+        # density matrices (vind.vind_mo, see scf._response_functions), with
+        # the solvent's response added: without it the CPHF of a solvated
+        # model would take the AO matrices for every term.
+        vind_mo = getattr(vind, 'vind_mo', None)
+        if vind_mo is not None:
+            mo_coeff = args[0] if len(args) > 0 else kwargs.get('mo_coeff')
+            mo_occ = args[1] if len(args) > 1 else kwargs.get('mo_occ')
+            if mo_coeff is None: mo_coeff = self.mo_coeff
+            if mo_occ is None: mo_occ = self.mo_occ
+            vind_with_solvent.vind_mo = _solvent_vind_mo(self, vind_mo, mo_coeff, mo_occ, is_uhf)
         return vind_with_solvent
 
     def stability(self, *args, **kwargs):
