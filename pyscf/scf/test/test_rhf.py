@@ -1023,6 +1023,34 @@ H     0    0.757    0.587'''
             # the guess leaves the object's own two-electron method alone
             self.assertEqual(mf.istype('_DFHF'), make().istype('_DFHF'))
 
+    def test_two_level(self):
+        # the model's own solution from a few of its Fock builds (scf.two_level)
+        from pyscf import dft
+        from pyscf.scf import two_level
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*', verbose=0)
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*',
+                     charge=1, spin=1, verbose=0)
+        for make in (lambda: scf.RHF(mol), lambda: scf.UHF(mol1),
+                     lambda: dft.RKS(mol, xc='b3lyp'), lambda: dft.RKS(mol, xc='wb97m-v'),
+                     lambda: dft.UKS(mol1, xc='wb97x'), lambda: dft.ROKS(mol1, xc='pbe')):
+            mf = make()
+            mf.conv_tol = 1e-10
+            e_ref = mf.kernel()
+            mf = make()
+            mf.conv_tol = 1e-10
+            mf.two_level = True
+            self.assertAlmostEqual(mf.kernel(), e_ref, 8)
+            self.assertTrue(mf.converged)
+            self.assertLessEqual(mf.cycles, 3)
+            # the object keeps its own two-electron method and grids
+            self.assertFalse(mf.istype('_SGXHF') or mf.istype('_DFHF'))
+            self.assertAlmostEqual(mf.energy_tot(), e_ref, 7)
+        # a model with nothing to make cheaper runs the plain SCF
+        mf = scf.RHF(mol).density_fit()
+        self.assertIsNone(two_level.cheap_scf(mf))
+        mf.two_level = True
+        self.assertAlmostEqual(mf.kernel(), scf.RHF(mol).density_fit().kernel(), 9)
+
     def test_init_guess_pre_scf_grids_and_fit(self):
         from pyscf import dft
         from pyscf.scf import hf

@@ -1717,6 +1717,15 @@ class SCF(lib.StreamObject):
             (RI-J and seminumerical exchange, which store no 3-index tensor)
             or 'auto' (density fitting if its tensors fit in memory, otherwise
             'rijcosx'). Default is 'auto'
+        two_level : bool
+            Reach the SCF solution with a few Fock builds of this model: the
+            iterations run on its Fock matrix at a reference density plus the
+            change of a cheap model's Fock matrix (scf.two_level). The cheap
+            model is two_level_scf if set, otherwise a copy with RI-J in
+            two_level_auxbasis ('aug_etb': df.aug_etb(mol)), seminumerical K,
+            and for DFT the grids of levels two_level_grids_level and
+            two_level_nlcgrids_level (2 and 1). The solution is this model's
+            own, to conv_tol and conv_tol_grad. Default is False
         DIIS : DIIS class
             The class to generate diis object.  It can be one of
             diis.SCF_DIIS, diis.ADIIS, diis.EDIIS, diis.ADIIS_CDIIS.
@@ -1792,6 +1801,13 @@ class SCF(lib.StreamObject):
     pre_scf_conv_tol = getattr(__config__, 'scf_hf_SCF_pre_scf_conv_tol', 1e-6)
     pre_scf_grids_level = getattr(__config__, 'scf_hf_SCF_pre_scf_grids_level', 1)
     pre_scf_fit = getattr(__config__, 'scf_hf_SCF_pre_scf_fit', 'auto')
+    two_level = getattr(__config__, 'scf_hf_SCF_two_level', False)
+    two_level_scf = None
+    two_level_grids_level = getattr(__config__, 'scf_hf_SCF_two_level_grids_level', 2)
+    two_level_nlcgrids_level = getattr(__config__, 'scf_hf_SCF_two_level_nlcgrids_level', 1)
+    two_level_auxbasis = getattr(__config__, 'scf_hf_SCF_two_level_auxbasis', 'aug_etb')
+    two_level_conv_factor = 100
+    two_level_micro_cycles = 20
     disp = None  # for DFT-D3 and DFT-D4
 
     # To avoid diis pollution from previous run, self.diis should not be
@@ -1817,6 +1833,8 @@ class SCF(lib.StreamObject):
     _keys = {
         'conv_tol', 'conv_tol_grad', 'conv_tol_cpscf', 'max_cycle', 'init_guess',
         'sap_basis', 'pre_scf_conv_tol', 'pre_scf_grids_level', 'pre_scf_fit',
+        'two_level', 'two_level_scf', 'two_level_grids_level', 'two_level_nlcgrids_level',
+        'two_level_auxbasis', 'two_level_conv_factor', 'two_level_micro_cycles',
         'DIIS', 'diis', 'diis_space', 'diis_damp', 'diis_start_cycle',
         'diis_file', 'diis_space_rollback', 'damp', 'level_shift',
         'direct_scf', 'direct_scf_tol', 'semi_direct', 'conv_check', 'callback',
@@ -1910,6 +1928,8 @@ class SCF(lib.StreamObject):
         if self.direct_scf:
             log.info('direct_scf_tol = %g', self.direct_scf_tol)
             log.info('semi_direct = %s', self.semi_direct)
+        if self.two_level:
+            log.info('two_level = %s', self.two_level)
         if self.chkfile:
             log.info('chkfile to save SCF result = %s', self.chkfile)
         log.info('max_memory %d MB (current use %d MB)',
@@ -2224,11 +2244,15 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
             dm0 = self.make_rdm1()
 
         if self.max_cycle > 0 or self.mo_coeff is None:
+            scf_kernel = kernel
+            if self.two_level:
+                from pyscf.scf import two_level
+                scf_kernel = two_level.kernel
             self.converged, self.e_tot, \
                     self.mo_energy, self.mo_coeff, self.mo_occ = \
-                    kernel(self, self.conv_tol, self.conv_tol_grad,
-                           dm0=dm0, callback=self.callback,
-                           conv_check=self.conv_check, **kwargs)
+                    scf_kernel(self, self.conv_tol, self.conv_tol_grad,
+                               dm0=dm0, callback=self.callback,
+                               conv_check=self.conv_check, **kwargs)
         else:
             # Avoid to update SCF orbitals in the non-SCF initialization
             # (issue #495).  But run regular SCF for initial guess if SCF was
