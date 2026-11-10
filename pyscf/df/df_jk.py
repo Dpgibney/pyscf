@@ -29,6 +29,11 @@ DEBUG = False
 # get_j by the McMurchie-Davidson J-engine of libcvhf (rij_engine.c): the same integral-direct RI-J,
 # the three-center integrals through Hermite Gaussians instead of int3c2e
 RIJ_ENGINE = getattr(__config__, 'df_df_jk_rij_engine', True)
+# Density matrices from which the J-engine takes them a chunk at a time in one
+# pass over its integrals (rij_engine.c, RIJdrv_many) instead of one after the
+# other, and the memory (MB) of a chunk's Cartesian density and J matrices
+RIJ_MANY_MIN = getattr(__config__, 'df_df_jk_rij_many_min', 2)
+RIJ_MANY_MEMORY = getattr(__config__, 'df_df_jk_rij_many_memory', 400)
 
 libri = lib.load_library('libri')
 
@@ -548,11 +553,79 @@ class _RIJEngineData:
             raise NotImplementedError('angular momentum beyond the J-engine')
         return out
 
+    def drv_many(self, npass, out, dms, cfit, qaux):
+        '''RIJdrv for all the density matrices dms[nset] (pass 1) or fitted
+        densities cfit[nset] (pass 2) in one pass over the integrals'''
+        from pyscf.scf import _vhf
+        order = numpy.asarray(numpy.argsort(-qaux, kind='stable'), dtype=numpy.int32)
+        qaux = numpy.ascontiguousarray(qaux)
+        nset = len(out)
+        _vhf.libcvhf.RIJdrv_many.restype = ctypes.c_int
+        err = _vhf.libcvhf.RIJdrv_many(
+            ctypes.c_int(npass), out.ctypes.data_as(ctypes.c_void_p),
+            dms.ctypes.data_as(ctypes.c_void_p) if dms is not None else None,
+            cfit.ctypes.data_as(ctypes.c_void_p) if cfit is not None else None,
+            ctypes.c_int(nset),
+            self.pairs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.pairs.shape[0]),
+            self.qpair.ctypes.data_as(ctypes.c_void_p), ctypes.c_double(self.direct_scf_tol),
+            self.ao_loc.ctypes.data_as(ctypes.c_void_p),
+            self.atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.atm.shape[0]),
+            self.bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.bas.shape[0]),
+            self.env.ctypes.data_as(ctypes.c_void_p),
+            self.auxatm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxatm.shape[0]),
+            self.auxbas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxbas.shape[0]),
+            self.auxenv.ctypes.data_as(ctypes.c_void_p),
+            self.aux_loc.ctypes.data_as(ctypes.c_void_p),
+            qaux.ctypes.data_as(ctypes.c_void_p), order.ctypes.data_as(ctypes.c_void_p),
+            self.c2s.ctypes.data_as(ctypes.c_void_p), self.c2s_off.ctypes.data_as(ctypes.c_void_p))
+        if err != 0:
+            raise NotImplementedError('angular momentum beyond the J-engine')
+        return out
+
+    def get_j_many(self, dms):
+        '''J of the density matrices dms[nset,nao,nao] (nset > 1), a chunk of them
+        per pass over the integrals: the Hermite Coulomb integrals of each AO
+        pair and the auxiliary primitives are computed once per pass and meet
+        all the densities of the chunk in matrix products (RIJdrv_many). The
+        Cartesian matrices of a chunk take at most RIJ_MANY_MEMORY MB.'''
+        from pyscf.scf import _vhf
+        nset, nao = dms.shape[:2]
+        nao_cart = self.ao_loc[-1]
+        naux = self.aux_loc[-1]
+        loc = self.aux_loc
+        chunk = max(2, min(nset, int(RIJ_MANY_MEMORY * 1e6 / (16 * nao_cart**2))))
+        vj = numpy.empty((nset, nao, nao))
+        c2s = self.c2s_ao
+        for p0, p1 in lib.prange(0, nset, chunk):
+            d = dms[p0:p1]
+            d = (d + d.transpose(0,2,1)) * .5
+            if c2s is not None:
+                d = lib.einsum('pi,xij,qj->xpq', c2s, d, c2s)
+            d = numpy.ascontiguousarray(d)
+            gam = self.drv_many(1, numpy.empty((p1-p0, naux)), d, None, self.qaux)
+            d = None
+            if self.j2c_type == 'cd':
+                rho = scipy.linalg.cho_solve(self.j2c, gam.T).T
+            else:
+                rho = scipy.linalg.solve(self.j2c, gam.T).T
+            rho = numpy.ascontiguousarray(rho)
+            cmax = numpy.array([abs(rho[:,i0:i1]).max() for i0, i1 in zip(loc[:-1], loc[1:])])
+            v = self.drv_many(2, numpy.empty((p1-p0, nao_cart, nao_cart)), None, rho,
+                              self.qaux * cmax)
+            if c2s is not None:
+                v = lib.einsum('pi,xpq,qj->xij', c2s, v, c2s)
+            vj[p0:p1] = v
+        return vj
+
     def get_j(self, dm):
         dm = numpy.asarray(dm)
         dm_shape = dm.shape
         nao = dm_shape[-1]
         dms = dm.reshape(-1, nao, nao)
+        if len(dms) >= RIJ_MANY_MIN:
+            from pyscf.scf import _vhf
+            if hasattr(_vhf.libcvhf, 'RIJdrv_many'):
+                return self.get_j_many(dms).reshape(dm_shape)
         nao_cart = self.ao_loc[-1]
         naux = self.aux_loc[-1]
         loc = self.aux_loc

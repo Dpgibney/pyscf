@@ -807,3 +807,428 @@ int RIJdrv(int pass, double *out, double *dm, double *cfit, int *pairs, int npai
         }
         return 0;
 }
+
+/*
+ * The J-engine for many density matrices at once (the densities of a CPHF or
+ * TDDFT response): the Hermite Coulomb integrals of an AO primitive pair with
+ * the auxiliary primitives do not depend on the density, so they are computed
+ * once, RIJ_BCHUNK batches of LANES primitives at a time, into
+ *      B[m, (q,k)] = lam_q R_(t,u,v)_m + k,
+ * and meet the Hermite densities (pass 1) or the fitted densities (pass 2) of
+ * all nset matrices in one matrix product each:
+ *      pass 1: gam[x, (q,k)] += sum_m dh[x,m] B[m, (q,k)]
+ *      pass 2: V[x, m] += sum_(q,k) chat[x, (q,k)] B[m, (q,k)]
+ * dblk and vblk are the pair's blocks [a,b,x], gam[nset, ldg] and
+ * chat[nset, nherm of aux]; dht[nherm_ij, nset] and bmat[nherm_ij, ldb] are work
+ * space. dmax: the largest |D| of the pair over the densities (pass 1), 1 in
+ * pass 2, where aux->pq carries the largest |c| of each shell over them.
+ */
+#define RIJ_BCHUNK      32
+
+void dgemm_(const char*, const char*, const int*, const int*, const int*,
+            const double*, const double*, const int*, const double*, const int*,
+            const double*, double*, const int*);
+
+static void _pair_loop_many(int pass, RIJPair *pr, int nset, double *dblk, double dmax,
+                            double *vblk, double qab, double cutoff, double *gam, int ldg,
+                            double *chat, RIJAux *aux, int *atm, int *bas, double *env,
+                            double *work, double *dht, double *bmat, int ldb)
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D1 = 1;
+        const int li = pr->li;
+        const int lj = pr->lj;
+        const int lij = li + lj;
+        const int nci = NCART(li);
+        const int ncj = NCART(lj);
+        const int ish = pr->ish;
+        const int jsh = pr->jsh;
+        const int npi = bas(NPRIM_OF, ish);
+        const int npj = bas(NPRIM_OF, jsh);
+        const double *ai = env + bas(PTR_EXP, ish);
+        const double *aj = env + bas(PTR_EXP, jsh);
+        const double *ci = env + bas(PTR_COEFF, ish);
+        const double *cj = env + bas(PTR_COEFF, jsh);
+        const double fac_ij = _fac_sp(li) * _fac_sp(lj);
+        const double *ri = pr->ri;
+        const double *rj = pr->rj;
+        const double rr = (ri[0]-rj[0])*(ri[0]-rj[0]) + (ri[1]-rj[1])*(ri[1]-rj[1])
+                        + (ri[2]-rj[2])*(ri[2]-rj[2]);
+        int ixs[NCART(RIJ_MAXL/2)], iys[NCART(RIJ_MAXL/2)], izs[NCART(RIJ_MAXL/2)];
+        int jxs[NCART(RIJ_MAXL/2)], jys[NCART(RIJ_MAXL/2)], jzs[NCART(RIJ_MAXL/2)];
+        _cart_comp(ixs, iys, izs, li);
+        _cart_comp(jxs, jys, jzs, lj);
+
+        const int nherm_ij = NHERM(lij);
+        const int ne = (li + 1) * (lj + 1) * (lij + 1);
+        double *ex = work;
+        double *ey = ex + ne;
+        double *ez = ey + ne;
+        double (*f)[LANES] = (double (*)[LANES])(ez + ne + nherm_ij);
+        double (*r)[LANES] = f + RIJ_MAXL + 1;
+        double *rbuf = (double *)(r + NHERM(RIJ_MAXL));
+
+        int ip, jp, lc, k, lane, t, u, v, a, b, x, m;
+        for (ip = 0; ip < npi; ip++) {
+        for (jp = 0; jp < npj; jp++) {
+                const double p = ai[ip] + aj[jp];
+                const double inv_p = 1. / p;
+                const double mu = ai[ip] * aj[jp] * inv_p;
+                const double kab = exp(-mu * rr) * ci[ip] * cj[jp] * fac_ij;
+                if (fabs(kab) * dmax < cutoff * 1e-3) {
+                        continue;
+                }
+                double P[3];
+                for (k = 0; k < 3; k++) {
+                        P[k] = (ai[ip] * ri[k] + aj[jp] * rj[k]) / p;
+                }
+                _hermite_e(ex, li, lj, p, P[0]-ri[0], P[0]-rj[0]);
+                _hermite_e(ey, li, lj, p, P[1]-ri[1], P[1]-rj[1]);
+                _hermite_e(ez, li, lj, p, P[2]-ri[2], P[2]-rj[2]);
+                const int nt = lij + 1;
+                const int ldi = (lj + 1) * nt;
+
+                memset(dht, 0, sizeof(double) * nherm_ij * nset);
+                if (pass == 1) {
+                        // dht[tuv,x] = sum_ab D[x]_ab Ex Ey Ez
+                        for (a = 0; a < nci; a++) {
+                        for (b = 0; b < ncj; b++) {
+                                const double *d = dblk + (size_t)(a * ncj + b) * nset;
+                                const double *exab = ex + ixs[a] * ldi + jxs[b] * nt;
+                                const double *eyab = ey + iys[a] * ldi + jys[b] * nt;
+                                const double *ezab = ez + izs[a] * ldi + jzs[b] * nt;
+                                const int mx = ixs[a] + jxs[b];
+                                const int my = iys[a] + jys[b];
+                                const int mz = izs[a] + jzs[b];
+                                for (t = 0; t <= mx; t++) {
+                                for (u = 0; u <= my; u++) {
+                                        const double exy = kab * exab[t] * eyab[u];
+                                        for (v = 0; v <= mz; v++) {
+                                                const double e = exy * ezab[v];
+                                                double *h = dht + (size_t)_hidx[t][u][v] * nset;
+#pragma omp simd
+                                                for (x = 0; x < nset; x++) {
+                                                        h[x] += d[x] * e;
+                                                }
+                                        }
+                                } }
+                        } }
+                }
+
+                for (lc = 0; lc <= aux->lmax; lc++) {
+                        const int L = lij + lc;
+                        const int ncc = NCART(lc);
+                        const int p0 = aux->pstart[lc];
+                        const int p1 = aux->pstart[lc+1];
+                        const int *ridx = _ridx + _ridx_off[lij][lc];
+                        // the screened prefix of the primitives (qaux: q_C in pass 1,
+                        // q_C max|c_C| in pass 2)
+                        const double qcut = cutoff / (qab * dmax + 1e-300);
+                        int pp = p0;
+                        while (pp < p1 && aux->pq[pp] >= qcut) {
+                                // a chunk of batches into bmat
+                                const int pp0 = pp;
+                                int nprim = 0;
+                                int nb;
+                                for (nb = 0; nb < RIJ_BCHUNK && pp < p1 && aux->pq[pp] >= qcut;
+                                     nb++, pp += LANES) {
+                                        const int nl = MIN(LANES, p1 - pp);
+                                        double al[LANES], T[LANES], lam[LANES];
+                                        double pcx[LANES], pcy[LANES], pcz[LANES], g[LANES], ginv[LANES];
+                                        for (lane = 0; lane < LANES; lane++) {
+                                                int q = pp + MIN(lane, nl - 1);
+                                                g[lane] = aux->pexp[q];
+                                                ginv[lane] = aux->pinv[q];
+                                                pcx[lane] = P[0] - aux->pr[3*q+0];
+                                                pcy[lane] = P[1] - aux->pr[3*q+1];
+                                                pcz[lane] = P[2] - aux->pr[3*q+2];
+                                        }
+#pragma omp simd
+                                        for (lane = 0; lane < LANES; lane++) {
+                                                double s1 = 1. / (p + g[lane]);
+                                                al[lane] = p * g[lane] * s1;
+                                                T[lane] = al[lane] * (pcx[lane]*pcx[lane] + pcy[lane]*pcy[lane]
+                                                                      + pcz[lane]*pcz[lane]);
+                                                // 2 pi^5/2 / (p g sqrt(p+g)), 0 for the padding
+                                                lam[lane] = lane < nl ? 34.986836655249725 * inv_p * ginv[lane]
+                                                        * sqrt(s1) : 0;
+                                        }
+                                        _boys(f, T, L);
+                                        double pw[LANES];
+                                        for (lane = 0; lane < LANES; lane++) {
+                                                pw[lane] = 1;
+                                        }
+                                        for (int n = 1; n <= L; n++) {
+#pragma omp simd
+                                                for (lane = 0; lane < LANES; lane++) {
+                                                        pw[lane] *= -2 * al[lane];
+                                                        f[n][lane] *= pw[lane];
+                                                }
+                                        }
+                                        _hermite_r(r, rbuf, f, pcx, pcy, pcz, L);
+                                        // bmat[m, (q,k)], the primitives of the chunk in order
+                                        for (m = 0; m < nherm_ij; m++) {
+                                                double *bm = bmat + (size_t)m * ldb + (size_t)nprim * ncc;
+                                                const int *rm = ridx + m * ncc;
+                                                for (k = 0; k < ncc; k++) {
+                                                        const double *rk = r[rm[k]];
+                                                        for (lane = 0; lane < nl; lane++) {
+                                                                bm[lane * ncc + k] = rk[lane] * lam[lane];
+                                                        }
+                                                }
+                                        }
+                                        nprim += nl;
+                                }
+                                const int ncols = nprim * ncc;
+                                const int col0 = aux->phoff[pp0];
+                                if (pass == 1) {
+                                        dgemm_(&TRANS_N, &TRANS_T, &ncols, &nset, &nherm_ij, &D1,
+                                               bmat, &ldb, dht, &nset, &D1, gam + col0, &ldg);
+                                } else {
+                                        dgemm_(&TRANS_T, &TRANS_N, &nset, &nherm_ij, &ncols, &D1,
+                                               chat + col0, &ldg, bmat, &ldb, &D1, dht, &nset);
+                                }
+                        }
+                }
+
+                if (pass == 2) {
+                        // v[x]_ab += kab sum_tuv Ex Ey Ez V[tuv,x]
+                        for (a = 0; a < nci; a++) {
+                        for (b = 0; b < ncj; b++) {
+                                double *vab = vblk + (size_t)(a * ncj + b) * nset;
+                                const double *exab = ex + ixs[a] * ldi + jxs[b] * nt;
+                                const double *eyab = ey + iys[a] * ldi + jys[b] * nt;
+                                const double *ezab = ez + izs[a] * ldi + jzs[b] * nt;
+                                const int mx = ixs[a] + jxs[b];
+                                const int my = iys[a] + jys[b];
+                                const int mz = izs[a] + jzs[b];
+                                for (t = 0; t <= mx; t++) {
+                                for (u = 0; u <= my; u++) {
+                                        const double exy = kab * exab[t] * eyab[u];
+                                        for (v = 0; v <= mz; v++) {
+                                                const double e = exy * ezab[v];
+                                                const double *h = dht + (size_t)_hidx[t][u][v] * nset;
+#pragma omp simd
+                                                for (x = 0; x < nset; x++) {
+                                                        vab[x] += e * h[x];
+                                                }
+                                        }
+                                } }
+                        } }
+                }
+        } }
+}
+
+/*
+ * RIJdrv for nset density matrices in one pass over the integrals:
+ * pass 1: out[nset,naux] from dm[nset,nao_cart,nao_cart] (symmetric);
+ * pass 2: out[nset,nao_cart,nao_cart] from cfit[nset,naux]. qaux: q_C in pass 1,
+ * q_C times the largest |cfit_C| over the sets in pass 2. The other arguments
+ * and the return value as RIJdrv.
+ */
+int RIJdrv_many(int pass, double *out, double *dm, double *cfit, int nset, int *pairs,
+                int npair, double *qpair, double cutoff, int *ao_loc,
+                int *atm, int natm, int *bas, int nbas, double *env,
+                int *auxatm, int nauxatm, int *auxbas, int nauxbas, double *auxenv,
+                int *aux_loc, double *qaux, int *aux_order, double *c2s, int *c2s_off)
+{
+        RIJinit();
+        const size_t nao = ao_loc[nbas];
+        const size_t nn = nao * nao;
+        const size_t naux = aux_loc[nauxbas];
+        int i, l, sh, x, lmax_ao = 0, lmax_aux = 0, nprim_aux = 0;
+        for (sh = 0; sh < nbas; sh++) {
+                lmax_ao = MAX(lmax_ao, bas(ANG_OF, sh));
+        }
+        for (sh = 0; sh < nauxbas; sh++) {
+                lmax_aux = MAX(lmax_aux, auxbas[ANG_OF+sh*BAS_SLOTS]);
+                nprim_aux += auxbas[NPRIM_OF+sh*BAS_SLOTS] * auxbas[NCTR_OF+sh*BAS_SLOTS];
+        }
+        if (2 * lmax_ao > RIJ_LIJ || lmax_aux > RIJ_LC || 2 * lmax_ao + lmax_aux > RIJ_MAXL) {
+                return -1;
+        }
+        // the auxiliary primitives by l, in the order of aux_order
+        RIJAux aux;
+        aux.nauxbas = nauxbas;
+        aux.aux_loc = aux_loc;
+        aux.qaux = qaux;
+        aux.lmax = lmax_aux;
+        aux.c2s = c2s;
+        aux.c2s_off = c2s_off;
+        aux.pstart = malloc(sizeof(int) * (lmax_aux + 2));
+        aux.pshell = malloc(sizeof(int) * (nprim_aux + 1));
+        aux.pexp = malloc(sizeof(double) * (nprim_aux + 1));
+        aux.pinv = malloc(sizeof(double) * (nprim_aux + 1));
+        aux.pcoef = malloc(sizeof(double) * (nprim_aux + 1));
+        aux.pr = malloc(sizeof(double) * 3 * (nprim_aux + 1));
+        aux.pq = malloc(sizeof(double) * (nprim_aux + 1));
+        aux.phoff = malloc(sizeof(int) * (nprim_aux + 1));
+        int np = 0;
+        int nh = 0;
+        for (l = 0; l <= lmax_aux; l++) {
+                aux.pstart[l] = np;
+                for (i = 0; i < nauxbas; i++) {
+                        sh = aux_order[i];
+                        int *b = auxbas + sh * BAS_SLOTS;
+                        if (b[ANG_OF] != l) {
+                                continue;
+                        }
+                        double *e = auxenv + b[PTR_EXP];
+                        double *c = auxenv + b[PTR_COEFF];
+                        double *rc = auxenv + auxatm[PTR_COORD + b[ATOM_OF] * ATM_SLOTS];
+                        for (int ip = 0; ip < b[NPRIM_OF]; ip++, np++) {
+                                aux.pshell[np] = sh;
+                                aux.pexp[np] = e[ip];
+                                aux.pinv[np] = 1. / e[ip];
+                                aux.pcoef[np] = c[ip] * _fac_sp(l) * pow(-2 * e[ip], -l);
+                                aux.pr[3*np+0] = rc[0];
+                                aux.pr[3*np+1] = rc[1];
+                                aux.pr[3*np+2] = rc[2];
+                                aux.pq[np] = qaux[sh];
+                                aux.phoff[np] = nh;
+                                nh += NCART(l);
+                        }
+                }
+        }
+        aux.pstart[lmax_aux+1] = np;
+        aux.nherm = nh;
+        const int ldg = nh + 1;
+        // pass 2: the fitted densities' Hermite components [nset, ldg], from the primitives'
+        aux.chat = NULL;
+        if (pass == 2) {
+                aux.chat = malloc(sizeof(double) * nset * ldg);
+#pragma omp parallel for schedule(static) private(i, sh, l)
+                for (x = 0; x < nset; x++) {
+                        double *chx = aux.chat + (size_t)x * ldg;
+                        for (i = 0; i < np; i++) {
+                                sh = aux.pshell[i];
+                                l = auxbas[ANG_OF+sh*BAS_SLOTS];
+                                int nsc = 2 * l + 1;
+                                double *cs = c2s + c2s_off[l];
+                                double *cf = cfit + x * naux + aux_loc[sh];
+                                for (int k = 0; k < NCART(l); k++) {
+                                        double v = 0;
+                                        for (int m = 0; m < nsc; m++) {
+                                                v += cs[k * nsc + m] * cf[m];
+                                        }
+                                        chx[aux.phoff[i] + k] = v * aux.pcoef[i];
+                                }
+                        }
+                }
+        }
+
+        if (pass == 1) {
+                memset(out, 0, sizeof(double) * nset * naux);
+        } else {
+                memset(out, 0, sizeof(double) * nset * nn);
+        }
+        const size_t wsize = _work_size(lmax_ao);
+        const int nherm_max = NHERM(2 * lmax_ao);
+        const int ldb = RIJ_BCHUNK * LANES * NCART(lmax_aux);
+#pragma omp parallel
+{
+        double *work = malloc(sizeof(double) * wsize);
+        double *dht = malloc(sizeof(double) * nherm_max * nset);
+        double *bmat = malloc(sizeof(double) * nherm_max * ldb);
+        double *gam = NULL;
+        if (pass == 1) {
+                gam = calloc((size_t)nset * ldg, sizeof(double));
+        }
+        int maxc = NCART(lmax_ao);
+        double *blk = malloc(sizeof(double) * maxc * maxc * nset);
+        int ip, a, b, y;
+#pragma omp for schedule(dynamic, 4)
+        for (ip = 0; ip < npair; ip++) {
+                int ish = pairs[2*ip];
+                int jsh = pairs[2*ip+1];
+                RIJPair pr;
+                pr.ish = ish;
+                pr.jsh = jsh;
+                pr.li = bas(ANG_OF, ish);
+                pr.lj = bas(ANG_OF, jsh);
+                double *r = env + atm(PTR_COORD, bas(ATOM_OF, ish));
+                pr.ri[0] = r[0]; pr.ri[1] = r[1]; pr.ri[2] = r[2];
+                r = env + atm(PTR_COORD, bas(ATOM_OF, jsh));
+                pr.rj[0] = r[0]; pr.rj[1] = r[1]; pr.rj[2] = r[2];
+                int i0 = ao_loc[ish];
+                int j0 = ao_loc[jsh];
+                int di = ao_loc[ish+1] - i0;
+                int dj = ao_loc[jsh+1] - j0;
+                if (pass == 1) {
+                        double fac = ish == jsh ? 1 : 2;
+                        double dmax = 0;
+                        for (y = 0; y < nset; y++) {
+                                double *dmy = dm + y * nn;
+                                for (a = 0; a < di; a++) {
+                                for (b = 0; b < dj; b++) {
+                                        double d = dmy[(i0+a)*nao+j0+b] * fac;
+                                        blk[(size_t)(a*dj+b)*nset+y] = d;
+                                        dmax = MAX(dmax, fabs(d));
+                                } }
+                        }
+                        if (qpair[ip] * dmax * qaux[aux_order[0]] < cutoff) {
+                                continue;
+                        }
+                        _pair_loop_many(1, &pr, nset, blk, dmax, NULL, qpair[ip], cutoff, gam, ldg,
+                                        NULL, &aux, atm, bas, env, work, dht, bmat, ldb);
+                } else {
+                        memset(blk, 0, sizeof(double) * di * dj * nset);
+                        _pair_loop_many(2, &pr, nset, NULL, 1., blk, qpair[ip], cutoff, NULL, ldg,
+                                        aux.chat, &aux, atm, bas, env, work, dht, bmat, ldb);
+                        for (y = 0; y < nset; y++) {
+                                double *oy = out + y * nn;
+                                for (a = 0; a < di; a++) {
+                                for (b = 0; b < dj; b++) {
+                                        double vab = blk[(size_t)(a*dj+b)*nset+y];
+                                        oy[(i0+a)*nao+j0+b] = vab;
+                                        oy[(j0+b)*nao+i0+a] = vab;
+                                } }
+                        }
+                }
+        }
+        if (pass == 1) {
+                // the primitives' Hermite blocks into the spherical functions of their shells
+                double *gs = calloc((size_t)nset * naux, sizeof(double));
+                for (y = 0; y < nset; y++) {
+                        for (int iq = 0; iq < np; iq++) {
+                                int shq = aux.pshell[iq];
+                                int lq = auxbas[ANG_OF+shq*BAS_SLOTS];
+                                int nsc = 2 * lq + 1;
+                                double *cs = c2s + c2s_off[lq];
+                                double *gh = gam + (size_t)y * ldg + aux.phoff[iq];
+                                double *g = gs + y * naux + aux_loc[shq];
+                                for (int m = 0; m < nsc; m++) {
+                                        double v = 0;
+                                        for (int k = 0; k < NCART(lq); k++) {
+                                                v += cs[k * nsc + m] * gh[k];
+                                        }
+                                        g[m] += v * aux.pcoef[iq];
+                                }
+                        }
+                }
+#pragma omp critical
+                for (size_t n = 0; n < nset * naux; n++) {
+                        out[n] += gs[n];
+                }
+                free(gs);
+                free(gam);
+        }
+        free(blk);
+        free(bmat);
+        free(dht);
+        free(work);
+}
+        free(aux.pstart);
+        free(aux.pshell);
+        free(aux.pexp);
+        free(aux.pinv);
+        free(aux.pcoef);
+        free(aux.pr);
+        free(aux.pq);
+        free(aux.phoff);
+        if (aux.chat != NULL) {
+                free(aux.chat);
+        }
+        return 0;
+}
