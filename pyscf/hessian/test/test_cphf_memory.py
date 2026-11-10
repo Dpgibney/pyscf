@@ -138,6 +138,45 @@ class KnownValues(unittest.TestCase):
         self.assertLess(d, 5e-5)
         self.assertGreater(d, 1e-10)
 
+    def test_h1_split(self):
+        # the XC and VV10 kernel potentials of make_h1 as products with the occupied orbitals
+        # (rks._make_h1_split): the same H1 mocc, and the same Hessian
+        mocc = mf.mo_coeff[:,mf.mo_occ>0]
+        for xc in ('lda,vwn', 'pbe', 'r2scan', 'wb97m-v'):
+            mf1 = dft.RKS(mol, xc=xc)
+            mf1.nlcgrids.level = 0
+            mf1.conv_tol = 1e-11
+            mf1.kernel()
+            mocc = mf1.mo_coeff[:,mf1.mo_occ>0]
+            hobj = mf1.Hessian()
+            h1ao = hobj.make_h1(mf1.mo_coeff, mf1.mo_occ)
+            h1ao_s, h1occ = rks_hess._make_h1_split(hobj, mf1.mo_coeff, mf1.mo_occ)
+            self.assertEqual(h1occ.shape, (mol.natm, 3, mol.nao, mocc.shape[1]))
+            self.assertGreater(abs(h1occ).max(), 1e-3)
+            ref = lib.einsum('axpq,qi->axpi', numpy.asarray(h1ao), mocc)
+            new = lib.einsum('axpq,qi->axpi', numpy.asarray(h1ao_s), mocc) + h1occ
+            self.assertAlmostEqual(abs(new - ref).max(), 0, 11)
+            with lib.temporary_env(rks_hess, H1_OCC=False):
+                hobj = mf1.Hessian()
+                hobj.cphf_residual_tol = 1e-7
+                h_ref = hobj.kernel()
+                self.assertIsNone(rks_hess._make_h1_split(hobj, mf1.mo_coeff, mf1.mo_occ)[1])
+            hobj = mf1.Hessian()
+            hobj.cphf_residual_tol = 1e-7
+            self.assertAlmostEqual(abs(hobj.kernel() - h_ref).max(), 0, 10)
+        # hess_elec takes the split form of the RKS make_h1 and of the solvent's, not of others
+        self.assertIs(rhf_hess._MAKE_H1_SPLIT[rks_hess.make_h1], rks_hess._make_h1_split)
+        mfs = dft.RKS(mol, xc='pbe').PCM()
+        mfs.conv_tol = 1e-11
+        mfs.kernel()
+        hs = mfs.Hessian()
+        self.assertIn(hs.make_h1.__func__, rhf_hess._MAKE_H1_SPLIT)
+        with lib.temporary_env(rks_hess, H1_OCC=False):
+            h_ref = mfs.Hessian().kernel()
+        self.assertAlmostEqual(abs(hs.kernel() - h_ref).max(), 0, 9)
+        self.assertNotIn(dft.RKS(mol, xc='pbe').density_fit().Hessian().make_h1.__func__,
+                         rhf_hess._MAKE_H1_SPLIT)
+
     def test_chunk_size(self):
         chunk = _response_functions._cphf_chunk
         with mock.patch.object(_response_functions._vhf, '_direct_jk_batch',

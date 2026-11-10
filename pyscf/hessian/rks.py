@@ -26,6 +26,7 @@ import ctypes
 from pyscf import lib
 from pyscf import gto
 from pyscf.lib import logger
+from pyscf import __config__
 from pyscf.hessian import rhf as rhf_hess
 from pyscf.grad import rks as rks_grad
 from pyscf.dft import numint, gen_grid
@@ -96,7 +97,20 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     log.timer('RKS partial hessian', *time0)
     return de2
 
-def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+# The XC and VV10 kernel potentials of make_h1 as products with the occupied orbitals where
+# hess_elec asks for them that way (_make_h1_split); False: always the AO matrices
+H1_OCC = getattr(__config__, 'hessian_rks_h1_occ', True)
+
+def _make_h1_split(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+    '''make_h1 for hess_elec: (h1ao, h1occ) with h1ao[ia] mocc + h1occ[ia] = the Fock derivative of
+    make_h1 times the occupied orbitals, all that hess_elec uses of it. h1occ [natm,3,nao,nocc]
+    holds the potential matrices of the 3*natm density derivatives of the XC and VV10 kernels,
+    made as such products (nao x nocc instead of nao x nao per perturbation and grid point).'''
+    if not H1_OCC:
+        return make_h1(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose), None
+    return make_h1(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose, _split=True)
+
+def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None, _split=False):
     if hessobj.grid_response:
         raise NotImplementedError('CPU RKS Hessian grid response is not implemented')
     mol = hessobj.mol
@@ -116,9 +130,12 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.9-mem_now)
-    h1ao = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+    h1occ = None
+    if _split:
+        h1occ = numpy.zeros((mol.natm, 3, nao, mocc.shape[1]))
+    h1ao = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=h1occ)
     if mf.do_nlc():
-        _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=h1ao)
+        _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=h1ao, occ_out=h1occ)
 
     aoslices = mol.aoslice_by_atom()
     vhfopt = rhf_hess._make_h1_vhfopt(mol, dm0, 'jk' if hybrid else 'j')
@@ -158,7 +175,11 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         h1ao[ia] += veff + veff.transpose(0,2,1)
         h1ao[ia] += hcore_deriv(ia)
 
+    if _split:
+        return h1ao, h1occ
     return h1ao
+
+rhf_hess._MAKE_H1_SPLIT[make_h1] = _make_h1_split
 
 XX, XY, XZ = 4, 5, 6
 YX, YY, YZ = 5, 7, 8
@@ -1347,7 +1368,17 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
     d2e += d2e_k.reshape(natm,3,natm,3).transpose(0,2,1,3)
     return d2e
 
-def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
+def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
+    '''The XC part of the Fock matrix derivatives, [natm,3,nao,nao].
+
+    With occ_out [natm,3,nao,nocc]: the potential matrices of the 3*natm
+    density derivatives (the kernel term), which the Hessian uses only as
+    products with the occupied orbitals, are added to occ_out as such products
+    (numint._FusedXC.dot_ao_mo: nao x nocc per perturbation and grid point
+    instead of nao x nao) and left out of the matrices returned; the two
+    together are the Fock derivative times the occupied orbitals. Where the
+    fused XC kernels do not apply, the matrices hold everything and occ_out is
+    not touched.'''
     mol = hessobj.mol
     mf = hessobj.base
     if hessobj.grids is not None:
@@ -1367,6 +1398,29 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 
     v_ip = numpy.zeros((3,nao,nao))
     vmat = numpy.zeros((mol.natm,3,nao,nao))
+    fused = mocc = None
+    if occ_out is not None:
+        fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (),
+                                 match_block_loop=False)
+        mocc = numpy.asarray(mo_coeff[:,mo_occ>0], order='C')
+        occ_sets = occ_out.reshape(mol.natm*3, nao, mocc.shape[1])
+
+    def add_potentials(wv, p0, p1):
+        '''The potential matrices of wv[natm,3,ncomp,p1-p0] (wv[:,:,0] halved, a meta-GGA's
+        wv[:,:,4] times .25: half of each matrix, as vmat holds them): into vmat, or times the
+        occupied orbitals into occ_out with the sign vmat gets at the end'''
+        nset = wv.shape[0] * wv.shape[1]
+        wv = wv.reshape(nset, wv.shape[2], p1-p0)
+        if fused is None:
+            return False
+        if wv.shape[1] == 5:
+            wv[:,4] *= 2  # dot_ao_mo takes the factor 1/2 of tau alone
+        chunk = fused.mo_chunk(nset, mocc.shape[1])
+        for k0, k1 in lib.prange(0, nset, chunk):
+            vq = numpy.zeros((k1-k0, nao, mocc.shape[1]))
+            fused.dot_ao_mo(p0, p1, wv[k0:k1], xctype, mocc, vq)
+            occ_sets[k0:k1] -= vq
+        return True
     # Per grid point besides the AO values: ao_dm0 and the scaled AO products of the gradient terms, and
     # the potentials of the 3*natm perturbations (with their temporaries)
     ncomp = {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype]
@@ -1375,10 +1429,12 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
     else:
         max_memory = _xc_block_memory(mf, max_memory, 2, 9*nao + 6*ncomp*mol.natm,
                                       vmat.nbytes/1e6)
+    ip1 = 0
     if xctype == 'LDA':
         ao_deriv = 1
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rho = ni.eval_rho2(mol, ao[0], mo_coeff, mo_occ, mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype)[1:3]
             wv = weight * vxc[0]
@@ -1394,14 +1450,19 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 rho1 = numpy.einsum('xpi,pi->xp', ao[1:,:,p0:p1], ao_dm0[:,p0:p1])
                 wv[ia,:,0] = wf * rho1
             # vmat[ia,i] += (ao[0]*wv[ia,i]).T.dot(ao[0]) for all atoms at once
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,1,weight.size),
-                                    mask, ao_loc)
+            if fused is not None:
+                # LDA: vmat holds half of the matrix, dot_ao_mo gives the whole one
+                wv *= 2
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,1,weight.size),
+                                        mask, ao_loc)
             ao_dm0 = wv = None
 
     elif xctype == 'GGA':
         ao_deriv = 2
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rho = ni.eval_rho2(mol, ao[:4], mo_coeff, mo_occ, mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype)[1:3]
             wv = weight * vxc
@@ -1417,8 +1478,9 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 wv[ia] = numpy.einsum('xyg,sxg->syg', wf, dR_rho1)
             wv[:,:,0] *= .5
             # vmat[ia,i] += einsum('xgp,xg->gp', ao[:4], wv[ia,i]).T.dot(ao[0])
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,4,weight.size),
-                                    mask, ao_loc)
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,4,weight.size),
+                                        mask, ao_loc)
             ao_dm0 = wv = None
 
     elif xctype == 'MGGA':
@@ -1426,6 +1488,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         ao_deriv = 2
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rho = ni.eval_rho2(mol, ao[:10], mo_coeff, mo_occ, mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype)[1:3]
             wv = weight * vxc
@@ -1444,8 +1507,9 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             wv[:,:,4] *= .25
             # vmat[ia,i] += einsum('xgp,xg->gp', ao[:4], wv[ia,i,:4]).T.dot(ao[0])
             #             + sum_j (ao[j]*wv[ia,i,4]).T.dot(ao[j])
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,5,weight.size),
-                                    mask, ao_loc)
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,5,weight.size),
+                                        mask, ao_loc)
             ao_dm0 = wv = None
 
     for ia in range(mol.natm):
@@ -1538,7 +1602,7 @@ def get_dweight_dA(mol, grids):
 
     return dweight_dA
 
-def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None):
+def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=None):
     """
         Equation notation follows:
         Liang J, Feng X, Liu X, Head-Gordon M. Analytical harmonic vibrational frequencies with
@@ -1550,7 +1614,9 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None):
         weights and the grid response of E, U and W) in one pass over the grid, and the derivatives of the
         AO products with the ground-state potential, for the AOs of atom A and for the points of atom A.
         With out (natm,3,nao,nao) of symmetric matrices, h1 is added to it and it is returned, without an
-        array of h1's own.
+        array of h1's own. With occ_out (natm,3,nao,nocc), the potential matrices of the 3*natm perturbed
+        potentials are added to it as products with the occupied orbitals instead (see _get_vxc_deriv1),
+        where the fused XC kernels apply.
     """
     # Note (Henry Wang 20250428):
     # We observed that in several very simple systems, for example H2O2, H2CO, C2H4,
@@ -1566,6 +1632,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None):
     aoslices = mol.aoslice_by_atom()
 
     mocc = mo_coeff[:,mo_occ>0]
+    mocc_c = numpy.asarray(mocc, order='C')
     dm0 = 2 * mocc @ mocc.T
     vv = _vv10_hess_data(mf, mol, dm0, max_memory)
     grids = mf.nlcgrids
@@ -1660,7 +1727,16 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None):
                            + d2rho * wf_gamma[p0:p1])
         d2rho = None
         wv = wv.reshape(natm*3,4,p1-p0)
-        if fused is not None:
+        if fused is not None and occ_out is not None:
+            wv[:,0] *= .5  # as _dot_wv: the matrix is v + v^T
+            nocc = occ_out.shape[-1]
+            occ_sets = occ_out.reshape(natm*3, nao, nocc)
+            chunk = fused.mo_chunk(natm*3, nocc)
+            for k0, k1 in lib.prange(0, natm*3, chunk):
+                vq = numpy.zeros((k1-k0, nao, nocc))
+                fused.dot_ao_mo(p0, p1, wv[k0:k1], 'GGA', mocc_c, vq)
+                occ_sets[k0:k1] += vq
+        elif fused is not None:
             fused._dot_wv(p0, p1, wv, 'GGA', 1, h1_sets, None)
         else:
             wv[:,0] *= .5

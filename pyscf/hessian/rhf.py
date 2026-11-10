@@ -73,19 +73,30 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     de2 = hessobj.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst,
                                     max_memory, log)
 
+    # h1occ: a part of H1 kept as its products with the occupied orbitals, where the
+    # make_h1 of hessobj has such a form (_MAKE_H1_SPLIT); H1 mocc = h1ao mocc + h1occ
+    h1occ = None
     if h1ao is None:
-        h1ao = _h1ao_out_of_core(hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log),
-                                 mf.max_memory, log)
+        split = _MAKE_H1_SPLIT.get(getattr(hessobj.make_h1, '__func__', None))
+        if split is None:
+            h1ao = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        else:
+            h1ao, h1occ = split(hessobj, mo_coeff, mo_occ, None, atmlst, log)
+        h1ao = _h1ao_out_of_core(h1ao, mf.max_memory, log)
         t1 = log.timer_debug1('making H1', *time0)
     if mo1 is None or mo_e1 is None:
-        mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
-                                       None, atmlst, max_memory, log)
+        if h1occ is None:
+            mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
+                                           None, atmlst, max_memory, log)
+        else:
+            mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
+                                           None, atmlst, max_memory, log, h1occ=h1occ)
         t1 = log.timer_debug1('solving MO1', *t1)
 
     mocc = mo_coeff[:,mo_occ>0]
     # *2 for double occupancy, *2 for +c.c.
     de2_mo1 = _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc,
-                             mo_energy[mo_occ>0], max_memory=max_memory) * 4
+                             mo_energy[mo_occ>0], max_memory=max_memory, h1occ=h1occ) * 4
     for i0 in range(len(atmlst)):
         de2[i0,:i0+1] += de2_mo1[i0,:i0+1]
         for j0 in range(i0):
@@ -93,6 +104,11 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
 
     log.timer('RHF hessian', *time0)
     return de2
+
+# make_h1 functions of the Hessian classes -> functions with their arguments that return
+# (h1ao, h1occ) for hess_elec: a part of the Fock derivatives as products with the occupied
+# orbitals, h1occ [natm,3,nao,nocc] or None (hessian.rks._make_h1_split)
+_MAKE_H1_SPLIT = {}
 
 class _H1aoFile:
     '''The matrices of make_h1 in a temporary file, h1ao[ia] reads an atom's'''
@@ -116,7 +132,7 @@ def _h1ao_out_of_core(h1ao, max_memory, log):
     return _H1aoFile(h1ao)
 
 def _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc, mo_eocc, s1a=None,
-                   max_memory=4000):
+                   max_memory=4000, h1occ=None):
     '''tr(h1ao[A] dm1[B]) - tr(s1ao[A] dme1[B]) - tr(s1oo[A] mo_e1[B])/2 for all pairs of atoms
     A, B of atmlst, as [natm,natm,3,3]. Here dm1[B] = mo1[B] C^T and dme1[B] = mo1[B] e C^T, where
     C holds the occupied orbitals and e their energies; s1ao[A] is the overlap derivative for
@@ -144,6 +160,9 @@ def _hess_elec_mo1(mol, atmlst, h1ao, mo1, mo_e1, mocc, mo_eocc, s1a=None,
             s1oo_k = lib.einsum('pi,xpj->xij', mocc[p0:p1], s1c)
             s1oo[k] = s1oo_k + s1oo_k.transpose(0,2,1)
             h1mo[k] = lib.einsum('xpq,qi->xpi', h1ao[ia], mocc)
+            if h1occ is not None:
+                # the part of H1 made as products with the occupied orbitals
+                h1mo[k] += h1occ[ia]
             h1mo[k,:,p0:p1] -= lib.einsum('xpq,qi->xpi', s1a[:,p0:p1], mocc_e)
             h1mo[k] -= lib.einsum('xqp,qi->xpi', s1a[:,p0:p1], mocc_e[p0:p1])
         out[a0*3:a1*3] = lib.dot(h1mo.reshape(-1,nao*nocc), mo1.T)
@@ -518,7 +537,8 @@ def _get_jk(mol, intor, comp, aosym, script_dms,
 
 def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
               fx=None, atmlst=None, max_memory=4000, verbose=None,
-              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False):
+              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False,
+              h1occ=None):
     '''Solve the first order equation
 
     Kwargs:
@@ -530,6 +550,9 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
             with cphf.solve to mf.conv_tol_cpscf
         scale_trials : bool
             scale_trials of cphf.solve_residual
+        h1occ : array [natm,3,nao,nocc]
+            A part of H1 as its products with the occupied orbitals, added to
+            those of h1ao
     '''
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
@@ -562,7 +585,10 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
             s1ao[:,p0:p1] += s1a[:,p0:p1]
             s1ao[:,:,p0:p1] += s1a[:,p0:p1].transpose(0,2,1)
             s1vo.append(_ao2mo(s1ao))
-            h1vo.append(_ao2mo(h1ao[ia]))
+            h1 = _ao2mo(h1ao[ia])
+            if h1occ is not None:
+                h1 += lib.einsum('pq,xpi->xqi', mo_coeff, h1occ[ia])
+            h1vo.append(h1)
 
         h1vo = numpy.vstack(h1vo)
         s1vo = numpy.vstack(s1vo)
@@ -864,7 +890,7 @@ class HessianBase(lib.StreamObject):
         return get_hcore
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
-                  fx=None, atmlst=None, max_memory=4000, verbose=None):
+                  fx=None, atmlst=None, max_memory=4000, verbose=None, h1occ=None):
         residual_tol = self.cphf_residual_tol
         # Direct SCF's integrals skip more for the smaller trial vectors of the
         # later cycles. SGX's K, with its absolute thresholds, needs them at
@@ -881,7 +907,7 @@ class HessianBase(lib.StreamObject):
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
                          max_cycle=self.max_cycle, level_shift=self.level_shift,
-                         residual_tol=residual_tol, scale_trials=scale_trials)
+                         residual_tol=residual_tol, scale_trials=scale_trials, h1occ=h1occ)
 
     def hess_nuc(self, mol=None, atmlst=None):
         if mol is None: mol = self.mol

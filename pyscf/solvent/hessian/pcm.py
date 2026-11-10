@@ -1153,4 +1153,24 @@ class WithSolventHess:
         # where self.de was not yet initialized.
         pass
 
+def _make_h1_split(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+    '''WithSolventHess.make_h1 for hess_elec (hessian.rhf._MAKE_H1_SPLIT): the split form of
+    the solute's make_h1 where it has one, with the solvent term in the AO matrices'''
+    from pyscf.hessian import rhf as rhf_hess
+    base_make = super(WithSolventHess, hessobj).make_h1
+    split = rhf_hess._MAKE_H1_SPLIT.get(getattr(base_make, '__func__', None))
+    if split is None or not isinstance(hessobj.base, scf.hf.RHF):
+        return hessobj.make_h1(mo_coeff, mo_occ, chkfile, atmlst, verbose), None
+    if atmlst is None:
+        atmlst = range(hessobj.mol.natm)
+    h1ao, h1occ = split(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose)
+    dm = hessobj.base.make_rdm1(ao_repr=True)
+    dv = analytical_grad_vmat(hessobj.base.with_solvent, dm, atmlst=atmlst, verbose=verbose)
+    for i0, ia in enumerate(atmlst):
+        h1ao[i0] += dv[i0]
+    return h1ao, h1occ
+
+from pyscf.hessian import rhf as _rhf_hess
+_rhf_hess._MAKE_H1_SPLIT[WithSolventHess.make_h1] = _make_h1_split
+
 
