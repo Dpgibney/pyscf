@@ -39,6 +39,7 @@ import numpy
 import scipy.linalg
 from pyscf import lib
 from pyscf import gto
+from pyscf import __config__
 from pyscf.lib import logger
 from pyscf.df.incore import aux_e2
 from pyscf.gto import moleintor
@@ -1102,6 +1103,39 @@ def get_jk_favork(sgx, dm, hermi=1, with_j=True, with_k=True,
     logger.timer(mol, "vj and vk", *t0)
     return vj.reshape(dm_shape), vk.reshape(dm_shape)
 
+
+# The slots of env for the mixed-range operator of int1e_grids, c_full/r12 +
+# c_lr erf(omega r12)/r12 with omega = env[PTR_RANGE_OMEGA] > 0 (qcint's
+# PTR_RANGE_COEFF_FULL, PTR_RANGE_COEFF_LR)
+PTR_RANGE_COEFF_FULL = 13
+PTR_RANGE_COEFF_LR = 14
+# The full- and long-range exchange of a range-separated hybrid from one
+# evaluation of the mixed-range integrals, where the integral library has them
+MIXED_RANGE = getattr(__config__, 'sgx_mixed_range', True)
+_mixed_range_lib = None
+
+def mixed_range_supported():
+    '''Whether int1e_grids of the integral library takes the mixed-range
+    operator (qcint with PTR_RANGE_COEFF_FULL/LR; libcint ignores the slots and
+    would return the long-range integrals): checked once, on one integral.'''
+    global _mixed_range_lib
+    if _mixed_range_lib is None:
+        mol = gto.M(atom='He 0 0 0', basis=[[0, [1.3, 1.]]], verbose=0)
+        def ints(omega, c_full, c_lr):
+            env = numpy.append(mol._env, [0., 0., .7])
+            env[gto.PTR_RANGE_OMEGA] = omega
+            env[PTR_RANGE_COEFF_FULL] = c_full
+            env[PTR_RANGE_COEFF_LR] = c_lr
+            env[gto.NGRIDS] = 1
+            env[gto.PTR_GRIDS] = mol._env.size
+            return gto.moleintor.getints('int1e_grids_sph', mol._atm, mol._bas, env,
+                                         (0, 1, 0, 1, 0, 1), aosym='s1').ravel()[0]
+        full = ints(0., 0., 0.)
+        lr = ints(.3, 0., 0.)
+        mix = ints(.3, .25, .75)
+        _mixed_range_lib = bool(abs(mix - (.25 * full + .75 * lr)) < 1e-12 * abs(full)
+                                and abs(full - lr) > 1e-3 * abs(full))
+    return MIXED_RANGE and _mixed_range_lib
 
 def _same_dm(a, b):
     if a is None or b is None:

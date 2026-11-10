@@ -305,6 +305,9 @@ def get_k_grad_only(sgx, dm, hermi=1, direct_scf_tol=1e-13):
     nao = dm_shape[-1]
     dms = dms.reshape(-1,nao,nao)
     nset = dms.shape[0]
+    # made here if the SCF did not build this operator's K (its exchange came from the
+    # mixed-range operator, or the gradient asks for another one)
+    sgx_jk._require_pjs(sgx, direct_scf_tol)
     sgxdat = sgx._pjs_data
     loop_data = sgxdat.get_loop_data(nset=nset, with_pair_mask=True, grad=True)
     nbins, screen_index, pair_mask, ao_loc, blksize = loop_data
@@ -515,9 +518,22 @@ def _get_jk(sgx, dm, hermi, with_j, with_k, direct_scf_tol):
 
 def get_jk(mf_grad, mol=None, dm=None, hermi=1, vhfopt=None, with_j=True, with_k=True,
            direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-           omega=None):
+           omega=None, mix=None):
+    '''With mix = (c_full, c_lr) and omega: the gradient of the full-range J, and
+    that of c_full K + c_lr K_LR from one evaluation of the mixed-range
+    integrals (SGX.mixed_range_ok).'''
     sgx = mf_grad.base.with_df
     dm = mf_grad.base.make_rdm1()
+    if mix is not None:
+        assert sgx.mixed_range_ok()
+        vj = vk = None
+        if with_j:
+            vj = get_jk(mf_grad, mol, dm, hermi, vhfopt, True, False, direct_scf_tol)[0]
+        if with_k:
+            with sgx._with_rsh_df(omega, mix) as rsh_df:
+                rsh_df._grid_response = mf_grad.sgx_grid_response
+                vk = _get_jk(rsh_df, dm, hermi, False, True, direct_scf_tol)[1]
+        return vj, vk
     if with_j and mf_grad.base.with_df.dfj:
         # _GradientsMixin, not mf_grad.__class__: a gradient scanner, as in geometry
         # optimizations, derives from the SGX gradient class and would find this get_jk again
@@ -573,6 +589,14 @@ class _GradientsMixin:
     def get_j(self, mol=None, dm=None, hermi=0, omega=None):
         return self.get_jk(mol=mol, dm=dm, hermi=hermi, vhfopt=None,
                            with_j=True, with_k=False, omega=omega)[0]
+
+    def get_jk_mixed_range(self, mol=None, dm=None, omega=None, c_full=1, c_lr=0):
+        '''The gradients of J and of c_full K + c_lr K_LR, the exchange of a
+        range-separated hybrid, K in one pass over the seminumerical integrals
+        with the mixed-range operator; (None, None) where that is not available.'''
+        if not self.base.with_df.mixed_range_ok():
+            return None, None
+        return self.get_jk(mol=mol, dm=dm, omega=omega, mix=(c_full, c_lr))
 
 class Gradients(_GradientsMixin, dfrhf_grad.Gradients):
     '''Restricted SGX Hartree-Fock gradients. Note: sgx_grid_response determines

@@ -171,6 +171,54 @@ class KnownValues(unittest.TestCase):
         mf.with_df.grids_level_energy = None
         self.assertAlmostEqual(e, mf.kernel(), 10)
 
+    def test_mixed_range(self):
+        # hyb K + (alpha - hyb) K_LR of a range-separated hybrid from one evaluation of the
+        # mixed-range integrals (qcint) against the two K builds
+        from pyscf.sgx import sgx_jk
+        if not sgx_jk.mixed_range_supported():
+            self.skipTest('int1e_grids of this integral library has no mixed-range operator')
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
+        mol1 = gto.M(atom=mol.atom, basis='def2-svp', charge=1, spin=1, verbose=0)
+        mf = dft.RKS(mol, xc='wb97x').RIJCOSX()
+        sdf = mf.with_df
+        sdf.sgx_tol_pair = None
+        sdf.build(level=1)
+        self.assertTrue(sdf.mixed_range_ok())
+        dm = mf.get_init_guess()
+        vk = sdf.get_jk(dm, 1, None, False, True)[1]
+        vklr = sdf.get_jk(dm, 1, None, False, True, omega=.3)[1]
+        vj, vkm = sdf.get_jk(dm, 1, None, True, True, omega=.3, mix=(.2, .7))
+        self.assertAlmostEqual(abs(vkm - (.2 * vk + .7 * vklr)).max(), 0, 11)
+        self.assertAlmostEqual(abs(vj - sdf.get_jk(dm, 1, None, True, False)[0]).max(), 0, 12)
+        # the range parameter and the coefficients are back to those of the molecule
+        self.assertEqual(mol.omega, 0)
+        self.assertEqual(abs(mol._env[[sgx_jk.PTR_RANGE_COEFF_FULL, sgx_jk.PTR_RANGE_COEFF_LR]]).max(), 0)
+        for make in (lambda: dft.RKS(mol, xc='wb97x'), lambda: dft.RKS(mol, xc='cam-b3lyp'),
+                     lambda: dft.UKS(mol1, xc='wb97x')):
+            with lib.temporary_env(sgx_jk, MIXED_RANGE=False):
+                mf0 = make().RIJCOSX()
+                mf0.conv_tol = 1e-11
+                e0 = mf0.kernel()
+                g0 = mf0.nuc_grad_method().kernel()
+            mf1 = make().RIJCOSX()
+            mf1.conv_tol = 1e-11
+            kcalls = []
+            get_k_only = sgx_jk.get_k_only
+            def spy(sgx, *args, **kwargs):
+                kcalls.append(sgx.mol.omega)
+                return get_k_only(sgx, *args, **kwargs)
+            with lib.temporary_env(sgx_jk, get_k_only=spy):
+                e1 = mf1.kernel()
+            # every K build is the mixed-range one
+            self.assertTrue(len(kcalls) > 0 and all(w == .3 or abs(w - .33) < 1e-12 for w in kcalls))
+            # one per Fock build (the first, each cycle, the last) and the energy on the larger grid
+            self.assertEqual(len(kcalls), mf1.cycles + 3)
+            self.assertAlmostEqual(e1, e0, 8)
+            self.assertAlmostEqual(abs(mf1.nuc_grad_method().kernel() - g0).max(), 0, 6)
+        # J on the SGX grid keeps the two passes
+        mf = sgx.sgx_fit(dft.RKS(mol, xc='wb97x'))
+        self.assertEqual(mf.get_jk_mixed_range(mol, dm, 1, .3, .2, .7), (None, None))
+
     def test_rijcosx_grad(self):
         # the step on the larger grid leaves the SCF's grid and data to the gradients
         mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
@@ -193,6 +241,12 @@ class KnownValues(unittest.TestCase):
         def get_j_spy(dfobj, dm, *args, **kwargs):
             omegas.append(dfobj.mol.omega)
             return get_j(dfobj, dm, *args, **kwargs)
+        from pyscf.sgx import sgx_jk
+        # the two K builds of a range-separated hybrid (the mixed-range operator, which
+        # replaces them where the integral library has it, is in test_mixed_range)
+        mixed_range = sgx_jk.MIXED_RANGE
+        sgx_jk.MIXED_RANGE = False
+        self.addCleanup(setattr, sgx_jk, 'MIXED_RANGE', mixed_range)
         with lib.temporary_env(df_jk, get_j=get_j_spy):
             mf = dft.RKS(mol, xc='wb97x').RIJCOSX()
             e = mf.kernel()

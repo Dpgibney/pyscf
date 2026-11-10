@@ -175,6 +175,14 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 elif hyb == 0: # SR=0, only LR exchange
                     terms = ((omega, -.5 * alpha),)
                 else: # SR and LR exchange with different ratios
+                    # both from one evaluation of the mixed-range integrals where
+                    # the SGX object has them
+                    if getattr(with_df, 'mixed_range_ok', lambda: False)():
+                        v = with_df.get_k_mo(a, mocc, mo_coeff, mf.direct_scf_tol, omega,
+                                             mix=(hyb, alpha-hyb))
+                        if v is not None:
+                            v *= -.5
+                            return v
                     terms = ((None, -.5 * hyb), (omega, -.5 * (alpha-hyb)))
                 vk = 0
                 for om, coeff in terms:

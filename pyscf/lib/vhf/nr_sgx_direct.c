@@ -606,8 +606,23 @@ static inline double interp_diag_int(double r, double width, int nrad, double *v
         return vals[i] + di * (vals[i+1] - vals[i]);
 }
 
-static inline double diag_esp_est(double r, double omega, double width)
+// The coefficients of the mixed-range operator c_full/r + c_lr erf(omega r)/r of int1e_grids (qcint's
+// PTR_RANGE_COEFF_FULL and PTR_RANGE_COEFF_LR), both 0 when env does not select it
+#define SGX_PTR_COEFF_FULL      13
+#define SGX_PTR_COEFF_LR        14
+static inline int _mixed_range(double *env)
 {
+        return (env[PTR_RANGE_OMEGA] > 0 &&
+                (env[SGX_PTR_COEFF_FULL] != 0 || env[SGX_PTR_COEFF_LR] != 0));
+}
+
+static inline double diag_esp_est(double r, double omega, double width,
+                                  double c_full, double c_lr)
+{
+        if (c_full != 0 || c_lr != 0) {
+                // the mixed-range operator: both parts
+                return (c_full * erf(r / width) + c_lr * erf(omega * r)) / r;
+        }
         double romega;
         if (omega > 0) {
                 romega = omega;
@@ -622,9 +637,11 @@ static inline double diag_esp_est(double r, double omega, double width)
 }
 
 static inline double diag_int_est(double r, double width, double omega,
+                                  double c_full, double c_lr,
                                   int nrad, double *vals)
 {
-        return diag_esp_est(r, omega, width) + interp_diag_int(r, width, nrad, vals);
+        return diag_esp_est(r, omega, width, c_full, c_lr)
+                + interp_diag_int(r, width, nrad, vals);
 }
 
 void SGXfit_diagonal_ints(int (*intor)(), int nrad, double *atm_coords,
@@ -648,6 +665,8 @@ void SGXfit_diagonal_ints(int (*intor)(), int nrad, double *atm_coords,
         double *rads = malloc(sizeof(double) * nrad);
         double *grids;
         const double omega = env[PTR_RANGE_OMEGA];
+        const double c_full = _mixed_range(env) ? env[SGX_PTR_COEFF_FULL] : 0;
+        const double c_lr = _mixed_range(env) ? env[SGX_PTR_COEFF_LR] : 0;
         double radius, est;
         double orig[3];
         int ia;
@@ -698,7 +717,7 @@ void SGXfit_diagonal_ints(int (*intor)(), int nrad, double *atm_coords,
                                 my_int += buf[ij * dims[2] + ig]
                                           * buf[ij * dims[2] + ig];
                         }
-                        est = diag_esp_est(rads[ig] + 1e-10, omega, radius);
+                        est = diag_esp_est(rads[ig] + 1e-10, omega, radius, c_full, c_lr);
                         grids[ig] = sqrt(my_int) / norms[ish] - est;
                 }
                 grids[nrad] = radius;
@@ -737,6 +756,8 @@ void SGXsample_ints(int (*intor)(), double *m_ij, double *r_ij, double *radii,
         memcpy(env, _env, env_size * sizeof(double));
         double *grids = env + (int) env[PTR_GRIDS];
         const double omega = env[PTR_RANGE_OMEGA];
+        const double c_full = _mixed_range(env) ? env[SGX_PTR_COEFF_FULL] : 0;
+        const double c_lr = _mixed_range(env) ? env[SGX_PTR_COEFF_LR] : 0;
         double r, maxrel;
         double rhat[3];
         double rcross[3];
@@ -838,11 +859,11 @@ void SGXsample_ints(int (*intor)(), double *m_ij, double *r_ij, double *radii,
                                     + diff[2] * diff[2];
                                 r = sqrt(r);
                                 my_deni = norms[ish] * diag_int_est(
-                                        r + 1e-10, widths[ish], omega, nrad,
+                                        r + 1e-10, widths[ish], omega, c_full, c_lr, nrad,
                                         vals + ish * nrad
                                 );
                                 my_denj = norms[jsh] * diag_int_est(
-                                        r + 1e-10, widths[jsh], omega, nrad,
+                                        r + 1e-10, widths[jsh], omega, c_full, c_lr, nrad,
                                         vals + jsh * nrad
                                 );
                                 maxrel = MAX(maxrel, my_int / (my_deni * my_denj));
@@ -871,6 +892,8 @@ void SGXdiagonal_ints(int (*intor)(), double *m_bi, int *ao_loc, CINTOpt *cintop
         int ig0, ig1, dg;
         int ish;
         const double omega = env[PTR_RANGE_OMEGA];
+        const double c_full = _mixed_range(env) ? env[SGX_PTR_COEFF_FULL] : 0;
+        const double c_lr = _mixed_range(env) ? env[SGX_PTR_COEFF_LR] : 0;
         double *grids = env + (int) env[PTR_GRIDS];
         double r;
         int ia;
@@ -896,7 +919,7 @@ void SGXdiagonal_ints(int (*intor)(), double *m_bi, int *ao_loc, CINTOpt *cintop
                                     + diff[2] * diff[2];
                                 r = sqrt(r);
                                 my_int = norms[ish] * diag_int_est(
-                                        r + 1e-10, widths[ish], omega, nrad,
+                                        r + 1e-10, widths[ish], omega, c_full, c_lr, nrad,
                                         vals + ish * nrad
                                 );
                                 maxint = MAX(maxint, my_int);

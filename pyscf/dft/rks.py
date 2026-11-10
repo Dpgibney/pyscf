@@ -120,11 +120,18 @@ def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
             vk = ks.get_k(mol, _dm, hermi, omega=omega)
             vk *= alpha
         else: # SR and LR exchange with different ratios
-            vj, vk = ks.get_jk(mol, _dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, _dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
+            vj = vk = None
+            get_mixed = getattr(ks, 'get_jk_mixed_range', None)
+            if get_mixed is not None:
+                # hyb K + (alpha - hyb) K_LR from one evaluation of the integrals
+                # (seminumerical exchange with the mixed-range operator)
+                vj, vk = get_mixed(mol, _dm, hermi, omega, hyb, alpha - hyb)
+            if vk is None:
+                vj, vk = ks.get_jk(mol, _dm, hermi)
+                vk *= hyb
+                vklr = ks.get_k(mol, _dm, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
         if incremental_jk:
             vj += vhf_last.vj
             vk += vhf_last.vk

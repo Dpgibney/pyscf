@@ -202,17 +202,30 @@ class _SGXHF:
         if self.with_df.grids_level_i != self.with_df.grids_level_f:
             self._in_scf = True
 
+    def get_jk_mixed_range(self, mol=None, dm=None, hermi=1, omega=None,
+                           c_full=1, c_lr=0, with_j=True):
+        '''(J, c_full K + c_lr K_LR) for the long-range K of omega: the J and the
+        exchange of a range-separated hybrid, K from one evaluation of the
+        seminumerical integrals with the mixed-range operator instead of one
+        for each K. (None, None) where that is not available (SGX.mixed_range_ok).'''
+        if not (self.with_df and self.with_df.mixed_range_ok()):
+            return None, None
+        return self.get_jk(mol, dm, hermi, with_j, True, omega, (c_full, c_lr))
+
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
-               omega=None):
+               omega=None, mix=None):
         if dm is None: dm = self.make_rdm1()
+        if mol is None: mol = self.mol
         with_df = self.with_df
         if not with_df:
             return super().get_jk(self, mol, dm, hermi, with_j, with_k, omega)
-        if (self._opt.get(omega) is None and
+        # the optimizer of direct J: the full-range one for the mixed-range K
+        omega_j = None if mix is not None else omega
+        if (self._opt.get(omega_j) is None and
             self.with_df.direct_j and (not self.with_df.dfj)):
-            with mol.with_range_coulomb(omega):
-                self._opt[omega] = self.init_direct_scf(mol)
-        vhfopt = self._opt.get(omega)
+            with mol.with_range_coulomb(omega_j):
+                self._opt[omega_j] = self.init_direct_scf(mol)
+        vhfopt = self._opt.get(omega_j)
 
         if (
                 self._in_scf
@@ -236,12 +249,15 @@ class _SGXHF:
             with_df._pair_tol_now = min(with_df.sgx_tol_pair, .01 * abs(ehist[1] - ehist[0]))
         try:
             vj, vk = with_df.get_jk(dm, hermi, vhfopt, with_j, with_k,
-                                    self.direct_scf_tol, omega)
+                                    self.direct_scf_tol, omega, mix)
         finally:
             with_df._pair_tol_now = None
-        self._nsteps_direct += 1
-        if self.rebuild_nsteps > 0 and self._nsteps_direct >= self.rebuild_nsteps:
-            self._nsteps_direct = 0
+        # a mixed-range build stands for the two calls (J and K, then the long-range K) it
+        # replaces, so that the full rebuilds come in the same cycles
+        for step in range(1 if mix is None else 2):
+            self._nsteps_direct += 1
+            if self.rebuild_nsteps > 0 and self._nsteps_direct >= self.rebuild_nsteps:
+                self._nsteps_direct = 0
 
         return vj, vk
 
@@ -329,8 +345,10 @@ class _SGXHF:
         elif hyb == 0:  # SR=0, only LR exchange
             vk = self.get_k(mol, dm, 1, omega=omega) * alpha
         else:  # SR and LR exchange with different ratios
-            vk = self.get_k(mol, dm, 1) * hyb
-            vk += self.get_k(mol, dm, 1, omega=omega) * (alpha - hyb)
+            vk = self.get_jk_mixed_range(mol, dm, 1, omega, hyb, alpha - hyb, with_j=False)[1]
+            if vk is None:
+                vk = self.get_k(mol, dm, 1) * hyb
+                vk += self.get_k(mol, dm, 1, omega=omega) * (alpha - hyb)
         return vk
 
     # The energy on the larger grid (grids_level_energy) from the exchange alone
@@ -697,11 +715,23 @@ class SGX(lib.StreamObject):
         self._sgx_block_cond = None
         return self
 
+    def mixed_range_ok(self):
+        '''Whether this object can build c_full K + c_lr K_LR, the exchange of a
+        range-separated hybrid, from one evaluation of its integrals with the
+        mixed-range operator (get_jk and get_k_mo with mix): the K-only path
+        with J from elsewhere, and an integral library that has the operator.'''
+        return bool(self.optk and (self.dfj or self.direct_j)
+                    and sgx_jk.mixed_range_supported())
+
     @contextlib.contextmanager
-    def _with_rsh_df(self, omega):
-        '''This object's copy for the range parameter omega, for the duration'''
+    def _with_rsh_df(self, omega, mix=None):
+        '''This object's copy for the range parameter omega, for the duration;
+        with mix = (c_full, c_lr), its copy for the mixed-range operator
+        c_full/r12 + c_lr erf(omega r12)/r12.'''
         # A temporary treatment for RSH integrals
         key = '%.6f' % omega
+        if mix is not None:
+            key += ' %.10f %.10f' % tuple(mix)
         if key in self._rsh_df:
             rsh_df = self._rsh_df[key]
         else:
@@ -721,22 +751,38 @@ class SGX(lib.StreamObject):
         # incremental build (for the energy screening) and the threshold of the pair screening
         rsh_df._full_dm = self._full_dm
         rsh_df._pair_tol_now = self._pair_tol_now
+        env = rsh_df.mol._env
+        coeffs = env[[sgx_jk.PTR_RANGE_COEFF_FULL, sgx_jk.PTR_RANGE_COEFF_LR]]
         try:
             with rsh_df.mol.with_range_coulomb(omega):
-                yield rsh_df
+                if mix is not None:
+                    env = rsh_df.mol._env
+                    env[sgx_jk.PTR_RANGE_COEFF_FULL] = mix[0]
+                    env[sgx_jk.PTR_RANGE_COEFF_LR] = mix[1]
+                try:
+                    yield rsh_df
+                finally:
+                    env = rsh_df.mol._env
+                    env[[sgx_jk.PTR_RANGE_COEFF_FULL, sgx_jk.PTR_RANGE_COEFF_LR]] = coeffs
         finally:
             rsh_df._full_dm = None
             rsh_df._pair_tol_now = None
 
     def get_k_mo(self, a, mocc, mo_coeff,
                  direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-                 omega=None):
+                 omega=None, mix=None):
         '''mo_coeff^T K mocc [nset,nmo,nocc] for the K of get_jk (hermi=1) of the
         symmetric density matrices a[x] mocc^T + mocc a[x]^T, a[nset,nao,nocc],
         made without the AO matrices of the densities or of K (sgx_jk.get_k_mo).
         None if K is not one that this path can make.'''
         if not self.optk:
             return None
+        if mix is not None:
+            # c_full K + c_lr K_LR from the mixed-range integrals
+            if not self.mixed_range_ok():
+                return None
+            with self._with_rsh_df(omega, mix) as rsh_df:
+                return rsh_df.get_k_mo(a, mocc, mo_coeff, direct_scf_tol)
         if omega is not None:
             with self._with_rsh_df(omega) as rsh_df:
                 return rsh_df.get_k_mo(a, mocc, mo_coeff, direct_scf_tol)
@@ -744,7 +790,20 @@ class SGX(lib.StreamObject):
 
     def get_jk(self, dm, hermi=1, vhfopt=None, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-               omega=None):
+               omega=None, mix=None):
+        '''J and K. With mix = (c_full, c_lr) and omega: the full-range J, and
+        c_full K + c_lr K_LR (the long-range K of omega) from one evaluation of
+        the mixed-range integrals; needs mixed_range_ok().'''
+        if mix is not None:
+            assert self.mixed_range_ok()
+            vj = vk = None
+            if with_j:
+                vj = self.get_jk(dm, hermi, vhfopt, True, False, direct_scf_tol)[0]
+            if with_k:
+                with self._with_rsh_df(omega, mix) as rsh_df:
+                    vk = rsh_df.get_jk(dm, hermi, None, with_j=False, with_k=True,
+                                       direct_scf_tol=direct_scf_tol)[1]
+            return vj, vk
         if omega is not None:
             with self._with_rsh_df(omega) as rsh_df:
                 return rsh_df.get_jk(dm, hermi, vhfopt, with_j=with_j, with_k=with_k,

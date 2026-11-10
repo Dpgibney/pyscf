@@ -115,16 +115,23 @@ def get_veff(ks_grad, mol=None, dm=None):
             if ks_grad.auxbasis_response:
                 vk.aux *= alpha
         else: # SR and LR exchange with different ratios
-            vj, vk = ks_grad.get_jk(mol, dm)
-            vk[:] *= hyb
-            if ks_grad.auxbasis_response:
-                vk.aux *= hyb
-            vklr = ks_grad.get_k(mol, dm, omega=omega)
-            vklr[:] *= (alpha - hyb)
-            if ks_grad.auxbasis_response:
-                vklr.aux *= (alpha - hyb)
-            vk[:] += vklr
-            vk.aux[:] += vklr.aux[:]
+            vj = vk = None
+            get_mixed = getattr(ks_grad, 'get_jk_mixed_range', None)
+            if get_mixed is not None:
+                # hyb K + (alpha - hyb) K_LR in one pass (seminumerical exchange
+                # with the mixed-range operator)
+                vj, vk = get_mixed(mol, dm, omega, hyb, alpha - hyb)
+            if vk is None:
+                vj, vk = ks_grad.get_jk(mol, dm)
+                vk[:] *= hyb
+                if ks_grad.auxbasis_response:
+                    vk.aux *= hyb
+                vklr = ks_grad.get_k(mol, dm, omega=omega)
+                vklr[:] *= (alpha - hyb)
+                if ks_grad.auxbasis_response:
+                    vklr.aux *= (alpha - hyb)
+                vk[:] += vklr
+                vk.aux[:] += vklr.aux[:]
         vxc += vj[0] + vj[1] - vk
         if ks_grad.auxbasis_response:
             e1_aux = vj.aux.sum((0,1))
