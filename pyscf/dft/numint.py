@@ -1275,6 +1275,33 @@ class _FusedXC:
             self.dot_terms_q(ip0, ip1, wv[numpy.newaxis], terms, Q, out)
         return out[0]
 
+    def get_vxc_grad_q_uks(self, ni, xc_code, xctype, mo_coeff, mo_occ):
+        '''get_vxc_grad_q for the alpha and beta orbitals mo_coeff[2] with
+        occupations mo_occ[2]: einsum('sxij,sij->sxi', vmat, dm) [2,3,nao] of the
+        vmat[2,3,nao,nao] that get_vxc_grad (spin=1) adds. None if an occupation
+        is negative.'''
+        make_rho = self.rho_mo_evaluator(list(mo_coeff), list(mo_occ), xctype)
+        if make_rho is None:
+            return None
+        nq = max(1, max(int((occ > 0).sum()) for occ in mo_occ))
+        Q = numpy.zeros((2, self.nao, nq))
+        for s in range(2):
+            occ = mo_occ[s] > 0
+            Q[s,:,:int(occ.sum())] = mo_coeff[s][:,occ] * numpy.sqrt(mo_occ[s][occ])
+        terms = _xc_grad_terms(xctype)
+        out = numpy.zeros((2, 3, self.nao))
+        for ip0, ip1 in self.blocks:
+            weight = self.grids.weights[ip0:ip1]
+            rho = make_rho(ip0, ip1)
+            wv = numpy.asarray(weight * ni.eval_xc_eff(xc_code, (rho[0], rho[1]), 1, xctype=xctype)[1])
+            wv = wv.reshape(2, _FUSED_NRHO[xctype], ip1-ip0)
+            if xctype != 'LDA':
+                wv[:,0] *= .5
+            if xctype == 'MGGA':
+                wv[:,4] *= .5
+            self.dot_terms_q(ip0, ip1, wv, terms, Q, out)
+        return out
+
     def get_vxc_grad(self, ni, xc_code, xctype, dms, hermi, spin, vmat):
         '''The loop of grad.rks.get_vxc (spin=0) and grad.uks.get_vxc (spin=1,
         dms of alpha and beta); adds to vmat[nset,3,nao,nao] (spin=1: nset=2).'''

@@ -55,8 +55,15 @@ def get_veff(ks_grad, mol=None, dm=None):
     return lib.tag_array(vxc, exc1_grid=exc)
 
 def _get_veff_split(ks_grad, mol, dm):
-    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom'''
-    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom. Where
+    the XC term comes contracted with the density (_get_vxc_de), there is no potential (None)
+    and the energy gradient holds the XC term as well.'''
+    de_xc = _get_vxc_de(ks_grad, mol, dm)
+    if de_xc is None:
+        exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+        vxc = lib.tag_array(vxc, exc1_grid=exc)
+    else:
+        vxc = None
     mf = ks_grad.base
     ni = mf._numint
     if not ni.libxc.is_hybrid_xc(mf.xc):
@@ -66,7 +73,61 @@ def _get_veff_split(ks_grad, mol, dm):
         de = rhf_grad.jk_energy_per_atom(mol, dm, 1, hyb, screen='jk')
         if omega != 0:
             de += rhf_grad.jk_energy_per_atom(mol, dm, 0, alpha - hyb, omega=omega)
-    return lib.tag_array(vxc, exc1_grid=exc), de
+    if de_xc is not None:
+        de += de_xc
+    return vxc, de
+
+def _get_vxc_de(ks_grad, mol, dm, max_memory=None):
+    '''The XC term of the gradient (with VV10) per atom [natm,3], what grad_elec makes of the
+    potential of _get_vxc_veff, from the alpha and beta orbitals on the grid without the
+    [2,3,nao,nao] matrices: grad.rks._get_vxc_de for UKS. None where this path does not apply.'''
+    if not rks_grad.XC_DM or ks_grad.grid_response:
+        return None
+    mo_coeff = getattr(dm, 'mo_coeff', None)
+    mo_occ = getattr(dm, 'mo_occ', None)
+    if (mo_coeff is None or mo_occ is None or numpy.ndim(dm) != 3 or len(mo_coeff) != 2 or
+            numpy.ndim(mo_coeff[0]) != 2 or numpy.iscomplexobj(mo_coeff[0]) or
+            numpy.iscomplexobj(mo_coeff[1])):
+        return None
+    t0 = (logger.process_clock(), logger.perf_counter())
+    mf = ks_grad.base
+    ni = mf._numint
+    grids, nlcgrids = rks_grad._initialize_grids(ks_grad)
+    if max_memory is None:
+        mem_now = lib.current_memory()[0]
+        max_memory = max(2000, ks_grad.max_memory*.9-mem_now)
+    xctype = ni._xc_type(mf.xc)
+    if xctype not in ('LDA', 'GGA', 'MGGA') or (xctype == 'MGGA' and numint.MGGA_DENSITY_LAPL):
+        return None
+    fused = numint._fused_xc(ni, mol, grids, mol.nao, xctype, max_memory,
+                             (mo_coeff[0], mo_coeff[1]), match_block_loop=False)
+    if fused is None:
+        return None
+    g = fused.get_vxc_grad_q_uks(ni, mf.xc, xctype, mo_coeff, mo_occ)
+    if g is None:
+        return None
+    # - sign because nabla_X = -nabla_x
+    g = -(g[0] + g[1])
+    if mf.do_nlc():
+        if ni.libxc.is_nlc(mf.xc):
+            xc = mf.xc
+        else:
+            xc = mf.nlc
+        # the VV10 potential is that of the total density, whose orbitals are
+        # the alpha and the beta ones together
+        dm_sf = numpy.asarray(dm[0] + dm[1])
+        mo_sf = numpy.hstack([mo_coeff[0], mo_coeff[1]])
+        occ_sf = numpy.hstack([mo_occ[0], mo_occ[1]])
+        gnlc = rks_grad.get_nlc_vxc_dm(ni, mol, nlcgrids, xc, dm_sf, mo_sf, occ_sf, max_memory)
+        if gnlc is None:
+            vnlc = rks_grad.get_nlc_vxc(ni, mol, nlcgrids, xc, dm_sf, max_memory=max_memory,
+                                        verbose=ks_grad.verbose)[1]
+            gnlc = numpy.einsum('xij,ij->xi', vnlc, dm_sf)
+        g += gnlc
+    aoslices = mol.aoslice_by_atom()
+    de = numpy.array([g[:,p0:p1].sum(axis=1) for p0, p1 in aoslices[:,2:]]) * 2
+    logger.timer(ks_grad, 'vxc', *t0)
+    return de
 
 def _get_vxc_veff(ks_grad, mol, dm):
     '''The XC part of get_veff, and the grid response exc1_grid'''
@@ -290,14 +351,19 @@ class Gradients(uhf_grad.Gradients):
         method, the grid response in DFT numerical integration can be put in
         this function.
         '''
+        e1 = 0
+        vhf = envs['vhf']
+        # the XC term contracted with the density on the grid, where get_veff
+        # left it out of the potential (_get_vxc_de)
+        de_xc = getattr(vhf, 'de_xc', None)
+        if de_xc is not None:
+            e1 = e1 + de_xc[atom_id]
         if self.grid_response:
-            vhf = envs['vhf']
             log = envs['log']
             log.debug('grids response for atom %d %s',
                       atom_id, vhf.exc1_grid[atom_id])
-            return vhf.exc1_grid[atom_id]
-        else:
-            return 0
+            e1 = e1 + vhf.exc1_grid[atom_id]
+        return e1
 
 Grad = Gradients
 

@@ -316,6 +316,33 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(dexc_t, exc1_approx[2], 1)
         self.assertAlmostEqual(dexc_t, exc1_full[2], 5)
 
+    def test_vxc_de(self):
+        # the XC and VV10 terms contracted with the alpha and beta orbitals on the
+        # grid (uks._get_vxc_de) against their matrices contracted afterwards
+        from pyscf.grad import rks as rks_grad
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0.1 -0.76 -0.47; N 2.5 0.3 0.1; '
+                          'H 2.6 1.2 0.5; H 3.3 0.1 -0.5; H 2.4 -0.4 0.8', basis='def2-svp',
+                     charge=1, spin=1, verbose=0)
+        for xc in ('lda,vwn', 'pbe', 'r2scan', 'wb97m-v'):
+            for fit in (lambda m: m, lambda m: m.density_fit(), lambda m: m.RIJCOSX()):
+                mf1 = dft.UKS(mol1, xc=xc)
+                mf1.nlcgrids.level = 0
+                mf1 = fit(mf1)
+                mf1.conv_tol = 1e-10
+                mf1.kernel()
+                with lib.temporary_env(rks_grad, XC_DM=False):
+                    g_ref = mf1.nuc_grad_method().kernel()
+                taken = []
+                get_vxc_de = uks._get_vxc_de
+                def spy(*args, **kwargs):
+                    de = get_vxc_de(*args, **kwargs)
+                    taken.append(de is not None)
+                    return de
+                with lib.temporary_env(uks, _get_vxc_de=spy):
+                    g = mf1.nuc_grad_method().kernel()
+                self.assertTrue(taken and all(taken))
+                self.assertAlmostEqual(abs(g - g_ref).max(), 0, 11)
+
     def test_range_separated(self):
         mol = gto.M(atom="H; H 1 1.", basis='ccpvdz', verbose=0)
         mf = dft.UKS(mol)

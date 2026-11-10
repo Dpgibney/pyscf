@@ -44,6 +44,7 @@ def get_veff(ks_grad, mol=None, dm=None):
 
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, ks_grad.max_memory*.9-mem_now)
+    de_xc = None
     if ks_grad.grid_response:
         exc, vxc = uks_grad.get_vxc_full_response(
                 ni, mol, grids, mf.xc, dm,
@@ -60,6 +61,13 @@ def get_veff(ks_grad, mol=None, dm=None):
             vxc += vnlc
         logger.debug1(ks_grad, 'sum(grids response) %s', exc.sum(axis=0))
     else:
+        # the XC term contracted with the density on the grid, added per atom by
+        # extra_force; otherwise its matrices
+        de_xc = uks_grad._get_vxc_de(ks_grad, mol, dm, max_memory)
+    if de_xc is not None:
+        exc = None
+        vxc = numpy.zeros((2,3) + numpy.shape(dm)[-2:])
+    elif not ks_grad.grid_response:
         exc, vxc = uks_grad.get_vxc(
                 ni, mol, grids, mf.xc, dm,
                 max_memory=max_memory, verbose=ks_grad.verbose)
@@ -139,9 +147,9 @@ def get_veff(ks_grad, mol=None, dm=None):
 
     if ks_grad.auxbasis_response:
         logger.debug1(ks_grad, 'sum(auxbasis response) %s', e1_aux.sum(axis=0))
-        vxc = lib.tag_array(vxc, exc1_grid=exc, aux=e1_aux)
+        vxc = lib.tag_array(vxc, exc1_grid=exc, aux=e1_aux, de_xc=de_xc)
     else:
-        vxc = lib.tag_array(vxc, exc1_grid=exc)
+        vxc = lib.tag_array(vxc, exc1_grid=exc, de_xc=de_xc)
     return vxc
 
 
