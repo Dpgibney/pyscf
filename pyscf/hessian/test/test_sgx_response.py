@@ -218,17 +218,21 @@ class KnownValues(unittest.TestCase):
         hobj.sgx_response = True
         self.assertLess(abs(hobj.kernel() - ref).max(), 1e-3)
 
-    def test_not_implemented(self):
+    def test_uhf_and_not_implemented(self):
         molu = mol.copy()
         molu.charge = 1
         molu.spin = 1
         molu.build(0, 0)
-        mfu = scf.UHF(molu).run()
-        for attr, val in (('sgx_response', True), ('cphf_residual_tol', 1e-4)):
+        # UHF: the residual solver against itself converged, SGX's K on a fine grid
+        # against the exact response
+        mfu = scf.UHF(molu).run(conv_tol=1e-11)
+        def hess(**kwargs):
             hobj = mfu.Hessian()
-            setattr(hobj, attr, val)
-            with self.assertRaises(NotImplementedError):
-                hobj.solve_mo1(mfu.mo_energy, mfu.mo_coeff, mfu.mo_occ, None)
+            hobj.set(**kwargs)
+            return hobj.kernel()
+        href = hess(cphf_residual_tol=1e-9)
+        self.assertAlmostEqual(abs(hess(cphf_residual_tol=1e-5) - href).max(), 0, 8)
+        self.assertAlmostEqual(abs(hess(sgx_response=True, sgx_response_level=3) - href).max(), 0, 5)
         mfd = scf.RHF(mol).density_fit().run()
         hobj = mfd.Hessian()
         hobj.sgx_response = True

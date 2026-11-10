@@ -179,7 +179,7 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
 def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
               fx=None, atmlst=None, max_memory=4000, verbose=None,
-              max_cycle=50, level_shift=0):
+              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False):
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
     if atmlst is None: atmlst = range(mol.natm)
@@ -224,10 +224,16 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
 
         h1vo = (numpy.vstack(h1voa), numpy.vstack(h1vob))
         s1vo = (numpy.vstack(s1voa), numpy.vstack(s1vob))
-        tol = mf.conv_tol_cpscf * (ia1 - ia0)
-        mo1, e1 = ucphf.solve(fx, mo_energy, mo_occ, h1vo, s1vo,
-                              max_cycle=max_cycle, level_shift=level_shift, tol=tol,
-                              verbose=log)
+        if residual_tol is None:
+            tol = mf.conv_tol_cpscf * (ia1 - ia0)
+            mo1, e1 = ucphf.solve(fx, mo_energy, mo_occ, h1vo, s1vo,
+                                  max_cycle=max_cycle, level_shift=level_shift, tol=tol,
+                                  verbose=log)
+        else:
+            mo1, e1 = ucphf.solve_residual(fx, mo_energy, mo_occ, h1vo, s1vo,
+                                           max_cycle=max_cycle, tol=residual_tol,
+                                           verbose=log, level_shift=level_shift,
+                                           scale_trials=scale_trials)
         mo1a = numpy.einsum('pq,xqi->xpi', mo_coeff[0], mo1[0]).reshape(-1,3,nao,nocca)
         mo1b = numpy.einsum('pq,xqi->xpi', mo_coeff[1], mo1[1]).reshape(-1,3,nao,noccb)
         e1a = e1[0].reshape(-1,3,nocca,nocca)
@@ -366,11 +372,21 @@ class Hessian(rhf_hess.HessianBase):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
-        if self.sgx_response or self.cphf_residual_tol is not None:
-            raise NotImplementedError('sgx_response and cphf_residual_tol for UHF and UKS')
+        # as rhf.HessianBase.solve_mo1
+        residual_tol = self.cphf_residual_tol
+        scale_trials = (fx is None and not self.sgx_response
+                        and not getattr(self.base, 'with_df', None))
+        if self.sgx_response:
+            if residual_tol is None:
+                residual_tol = rhf_hess.SGX_RESPONSE_RESIDUAL_TOL
+            if fx is None:
+                fx = gen_vind(rhf_hess._sgx_response_scf(self.base, self.sgx_response_level,
+                                                         self.sgx_response_auxbasis),
+                              mo_coeff, mo_occ)
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
-                         max_cycle=self.max_cycle, level_shift=self.level_shift)
+                         max_cycle=self.max_cycle, level_shift=self.level_shift,
+                         residual_tol=residual_tol, scale_trials=scale_trials)
 
 from pyscf import scf
 scf.uhf.UHF.Hessian = lib.class_as_method(Hessian)

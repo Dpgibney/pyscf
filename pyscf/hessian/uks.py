@@ -42,8 +42,6 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     mol = hessobj.mol
     mf = hessobj.base
     ni = mf._numint
-    if mf.do_nlc():
-        raise NotImplementedError('UKS Hessian for NLC functional')
 
     if mo_energy is None: mo_energy = mf.mo_energy
     if mo_occ is None:    mo_occ = mf.mo_occ
@@ -90,8 +88,20 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
+    if mf.do_nlc():
+        mo_sf, occ_sf = _total_density_orbitals(mo_coeff, mo_occ)
+        de2 += rks_hess._get_enlc_deriv2(hessobj, mo_sf, occ_sf, max_memory)
+
     log.timer('UKS partial hessian', *time0)
     return de2
+
+def _total_density_orbitals(mo_coeff, mo_occ):
+    '''Orbitals and occupations whose closed-shell density, 2 C C^T, is the
+    total density of the alpha and beta orbitals: VV10 is a functional of the
+    total density, so its terms of the UKS Hessian are those of hessian.rks
+    for these.'''
+    mocc = numpy.hstack([mo_coeff[0][:,mo_occ[0]>0], mo_coeff[1][:,mo_occ[1]>0]]) * .5**.5
+    return mocc, numpy.full(mocc.shape[1], 2.)
 
 def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     if hessobj.grid_response:
@@ -118,6 +128,14 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.9-mem_now)
     h1aoa, h1aob = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+    if mf.do_nlc():
+        # the same potential for both spins
+        mo_sf, occ_sf = _total_density_orbitals(mo_coeff, mo_occ)
+        vnlc = rks_hess._get_vnlc_deriv1(hessobj, mo_sf, occ_sf, max_memory)
+        for ia in range(mol.natm):
+            h1aoa[ia] += vnlc[ia]
+            h1aob[ia] += vnlc[ia]
+        vnlc = None
     aoslices = mol.aoslice_by_atom()
     if hybrid:
         vhfopt = rhf_hess._make_h1_vhfopt(mol, [dm0, dm0a, dm0b], 'jk')

@@ -304,6 +304,39 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(e2-e2ref).max(), 0, 6)
 
 
+    def test_vv10_as_rks(self):
+        # VV10 is a functional of the total density: a closed-shell molecule as UKS
+        # has the RKS Hessian
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0.1 -0.76 -0.47', basis='def2-svp', verbose=0)
+        hs = []
+        for cls in (dft.RKS, dft.UKS):
+            mf1 = cls(mol1, xc='wb97x-v')
+            mf1.grids.level = 1
+            mf1.nlcgrids.level = 0
+            mf1.conv_tol = 1e-11
+            mf1.kernel()
+            hobj = mf1.Hessian()
+            hobj.cphf_residual_tol = 1e-8
+            hs.append(hobj.kernel())
+        self.assertAlmostEqual(abs(hs[0] - hs[1]).max(), 0, 6)
+
+    def test_residual_solver_sgx_response(self):
+        # ucphf.solve_residual against itself converged, and the seminumerical
+        # K of the response on a fine grid against the exact one
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0.1 -0.76 -0.47', basis='def2-svp',
+                     charge=1, spin=1, verbose=0)
+        mf1 = dft.UKS(mol1, xc='b3lyp')
+        mf1.grids.level = 1
+        mf1.conv_tol = 1e-11
+        mf1.kernel()
+        def hess(**kwargs):
+            hobj = mf1.Hessian()
+            hobj.set(**kwargs)
+            return hobj.kernel()
+        href = hess(cphf_residual_tol=1e-9)
+        self.assertAlmostEqual(abs(hess(cphf_residual_tol=1e-5) - href).max(), 0, 8)
+        self.assertAlmostEqual(abs(hess(sgx_response=True, sgx_response_level=3) - href).max(), 0, 5)
+
 if __name__ == "__main__":
     print("Full Tests for UKS Hessian")
     unittest.main()
