@@ -1847,6 +1847,36 @@ static void nrs1_ijg_g_ij(double *eri, double *dm, SGXJKArray *out,
 }
 ADD_OP(nrs1_ijg_g_ij, JTYPE2, s1);
 
+/*
+ * out[icomp,i,g] = sum_j eri[icomp,i,j,g] dm[j,i]: the density contracted over
+ * the second AO only, for the derivative integrals whose first AO says which
+ * atom moves (PCM's gradients and Hessians).
+ */
+static void nrs1_ijg_ji_gi(double *eri, double *dm, SGXJKArray *out,
+                           int i0, int i1, int j0, int j1,
+                           const int k0, const int dk)
+{
+        const size_t ncol = out->v_dims[0];
+        double *data = out->data;
+        int i, j, k, icomp;
+
+        int ij = 0;
+        for (icomp = 0; icomp < out->ncomp; icomp++) {
+                for (j = j0; j < j1; j++) {
+                for (i = i0; i < i1; i++, ij++) {
+                        const double d = dm[j*ncol+i];
+                        double *pout = data + (size_t)i * dk;
+                        const double *peri = eri + (size_t)ij * dk;
+#pragma omp simd
+                        for (k = 0; k < dk; k++) {
+                                pout[k] += peri[k] * d;
+                        }
+                } }
+                data += out->v_dims[0] * dk;
+        }
+}
+ADD_OP(nrs1_ijg_ji_gi, KTYPE1, s1);
+
 SGXJKOperator SGXnrs2_ijg_g_ij = {SGXJKOperator_allocate_nrs1_ijg_g_ij,
         nrs1_ijg_g_ij, SGXJKOperator_set0_nrs1_ijg_g_ij,
         SGXJKOperator_send_nrs1_ijg_g_ij, SGXJKOperator_final_nrs1_ijg_g_ij,

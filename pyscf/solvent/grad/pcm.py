@@ -106,25 +106,33 @@ def get_dF_dA(surface, surface_discretization_method = "SWIG"):
 
     return dF, dA
 
-def get_dD_dS(surface, dF, with_S=True, with_D=False):
+# The memory (MB) of a block of rows of the derivatives of S and D
+D1_BLOCK_MEMORY = 200
+
+def get_dD_dS(surface, dF, with_S=True, with_D=False, rows=None):
     '''
     derivative of D and S w.r.t grids, partial_i D_ij = -partial_j D_ij
     S is symmetric, D is not
+
+    With rows = (i0, i1), those rows of dD and dS only: [i1-i0,n,3].
     '''
     grid_coords = surface['grid_coords']
     exponents   = surface['charge_exp']
     norm_vec    = surface['norm_vec']
     switch_fun  = surface['switch_fun']
+    n = exponents.shape[0]
+    i0, i1 = (0, n) if rows is None else rows
+    diag = (numpy.arange(i1-i0), numpy.arange(i0, i1))
 
-    xi_i, xi_j = numpy.meshgrid(exponents, exponents, indexing='ij')
+    xi_i, xi_j = numpy.meshgrid(exponents[i0:i1], exponents, indexing='ij')
     xi_ij = xi_i * xi_j / (xi_i**2 + xi_j**2)**0.5
-    ri_rj = numpy.expand_dims(grid_coords, axis=1) - grid_coords
+    ri_rj = numpy.expand_dims(grid_coords[i0:i1], axis=1) - grid_coords
     rij = numpy.linalg.norm(ri_rj, axis=-1)
     xi_r_ij = xi_ij * rij
-    numpy.fill_diagonal(rij, 1)
+    rij[diag] = 1
 
     dS_dr = -(erf(xi_r_ij) - 2.0*xi_r_ij/PI**0.5*numpy.exp(-xi_r_ij**2))/rij**2
-    numpy.fill_diagonal(dS_dr, 0)
+    dS_dr[diag] = 0
 
     dS_dr= numpy.expand_dims(dS_dr, axis=-1)
     drij = ri_rj/numpy.expand_dims(rij, axis=-1)
@@ -134,7 +142,7 @@ def get_dD_dS(surface, dF, with_S=True, with_D=False):
     if with_D:
         nj_rij = numpy.sum(ri_rj * norm_vec, axis=-1)
         dD_dri = 4.0*xi_r_ij**2 * xi_ij / PI**0.5 * numpy.exp(-xi_r_ij**2) * nj_rij / rij**3
-        numpy.fill_diagonal(dD_dri, 0.0)
+        dD_dri[diag] = 0.0
 
         rij = numpy.expand_dims(rij, axis=-1)
         nj_rij = numpy.expand_dims(nj_rij, axis=-1)
@@ -143,10 +151,45 @@ def get_dD_dS(surface, dF, with_S=True, with_D=False):
 
         dD = dD_dri * drij + dS_dr * (-nj/rij + 3.0*nj_rij/rij**2 * drij)
 
-    dSii_dF = -exponents * (2.0/PI)**0.5 / switch_fun**2
-    dSii = numpy.expand_dims(dSii_dF, axis=(1,2)) * dF
+    dSii = None
+    if dF is not None:
+        dSii_dF = -exponents * (2.0/PI)**0.5 / switch_fun**2
+        dSii = numpy.expand_dims(dSii_dF, axis=(1,2)) * dF
 
     return dD, dS, dSii
+
+def _d1_block_rows(n):
+    # a row of the 3 components and the temporaries of get_dD_dS
+    return max(1, int(D1_BLOCK_MEMORY * 1e6 / (8 * n * 3 * 8)))
+
+def _map_row_blocks(n, blksize, fn):
+    '''[fn(i0, i1) for the blocks of rows], over the threads: the kernels of the
+    surface matrices are numpy functions of large arrays, which release the
+    interpreter lock. The blocks share the memory of one block of blksize rows.'''
+    nthreads = max(1, min(lib.num_threads(), (n + blksize - 1) // blksize))
+    blksize = max(1, blksize // nthreads)
+    tasks = list(lib.prange(0, n, blksize))
+    if nthreads == 1:
+        return [fn(i0, i1) for i0, i1 in tasks]
+    from concurrent.futures import ThreadPoolExecutor
+    with lib.with_omp_threads(1):
+        with ThreadPoolExecutor(nthreads) as pool:
+            return list(pool.map(lambda t: fn(*t), tasks))
+
+def _d1_antisym(surface, kind, v, q):
+    '''v[i] dX[x,i,j] q[j] summed over j, for each point i, minus the same summed
+    over i, for each point j: [n,3], for dX = dS or dD (kind 'S' or 'D') of
+    get_dD_dS, by blocks of rows without the [n,n,3] array'''
+    n = v.shape[0]
+    out = numpy.zeros([n, 3])
+    def block(i0, i1):
+        dD, dS, _ = get_dD_dS(surface, None, with_D=kind == 'D', rows=(i0, i1))
+        dX = dD if kind == 'D' else dS
+        out[i0:i1] = v[i0:i1, None] * numpy.einsum('ijx,j->ix', dX, q)
+        return numpy.einsum('i,ijx->jx', v[i0:i1], dX)
+    cols = _map_row_blocks(n, _d1_block_rows(n), block)
+    out -= sum(cols) * q[:, None]
+    return out
 
 def grad_nuc(pcmobj, dm, q_sym = None):
     mol = pcmobj.mol
@@ -209,34 +252,18 @@ def grad_qv(pcmobj, dm, q_sym = None):
     grid_coords  = pcmobj.surface['grid_coords']
     exponents    = pcmobj.surface['charge_exp']
 
-    max_memory = pcmobj.max_memory - lib.current_memory()[0]
-    blksize = int(max(max_memory*.9e6/8/nao**2/3, 8))
-    ngrids = q_sym.shape[0]
-    int3c2e_ip1 = mol._add_suffix('int3c2e_ip1')
-    cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas, mol._env, int3c2e_ip1)
-    dvj = numpy.zeros([3,nao])
-    for p0, p1 in lib.prange(0, ngrids, blksize):
-        fakemol = gto.fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-        fakemol.cart = mol.cart
-        v_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e_ip1, aosym='s1', cintopt=cintopt)
-        dvj += numpy.einsum('xijk,ij,k->xi', v_nj, dm, q_sym[p0:p1])
-        # Free up v_nj to stay within mem limits
-        del v_nj
-
-    int3c2e_ip2 = mol._add_suffix('int3c2e_ip2')
-    cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas, mol._env, int3c2e_ip2)
-    dq = numpy.empty([3,ngrids])
-    for p0, p1 in lib.prange(0, ngrids, blksize):
-        fakemol = gto.fakemol_for_charges(grid_coords[p0:p1], expnt=exponents[p0:p1]**2)
-        fakemol.cart = mol.cart
-        q_nj = df.incore.aux_e2(mol, fakemol, intor=int3c2e_ip2, aosym='s1', cintopt=cintopt)
-        dq[:,p0:p1] = numpy.einsum('xijk,ij,k->xk', q_nj, dm, q_sym[p0:p1])
-        # Free up q_nj to stay within mem limits
-        del q_nj
+    # w[x,i,g] = sum_j (d i j|g) (D_ij + D_ji), one pass over the integrals.
+    # The derivative with the AOs of an atom moving is its rows of w with the
+    # charges; with a charge moving, (i j|d g) = -(d i j|g) - (i d j|g).
+    from pyscf.solvent.pcm import _int1e_grids_deriv
+    w, = _int1e_grids_deriv(mol, pcmobj.surface, 'int1e_grids_ip', 3, dms_i=[dm + dm.T])
+    dvj = numpy.dot(w, q_sym)
+    dq = -w.sum(axis=1) * q_sym
+    w = None
 
     aoslice = mol.aoslice_by_atom()
     dq = numpy.asarray([numpy.sum(dq[:,p0:p1], axis=1) for p0,p1 in gridslice])
-    dvj= 2.0 * numpy.asarray([numpy.sum(dvj[:,p0:p1], axis=1) for p0,p1 in aoslice[:,2:]])
+    dvj = numpy.asarray([numpy.sum(dvj[:,p0:p1], axis=1) for p0,p1 in aoslice[:,2:]])
     de = dq + dvj
     t1 = log.timer_debug1('grad qv', *t1)
     return de
@@ -270,7 +297,10 @@ def grad_solver(pcmobj, dm):
     dF, dA = get_dF_dA(pcmobj.surface, pcmobj.surface_discretization_method)
 
     with_D = pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM', 'SS(V)PE']
-    dD, dS, dSii = get_dD_dS(pcmobj.surface, dF, with_D=with_D, with_S=True)
+    # dS and dD by blocks of rows in _d1_antisym; the diagonal's derivative here
+    exponents = pcmobj.surface['charge_exp']
+    dSii = numpy.expand_dims(-exponents * (2.0/PI)**0.5 / pcmobj.surface['switch_fun']**2, axis=(1,2)) * dF
+    surface = pcmobj.surface
 
     if pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM', 'SS(V)PE']:
         DA = D*A
@@ -282,18 +312,14 @@ def grad_solver(pcmobj, dm):
     # dQ = v^T K^-1 (dR - dK K^-1 R) v
     de = numpy.zeros([pcmobj.mol.natm,3])
     if pcmobj.method.upper() in ['C-PCM', 'CPCM', 'COSMO']:
-        dS = dS.transpose([2,0,1])
         dSii = dSii.transpose([2,0,1])
 
         # dR = 0, dK = dS
-        de_dS  = 0.5*(vK_1 * dS.dot(q)).T # numpy.einsum('i,xij,j->ix', vK_1, dS, q)
-        de_dS -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dS, q)
+        de_dS = 0.5*_d1_antisym(surface, 'S', vK_1, q)
         de -= numpy.asarray([numpy.sum(de_dS[p0:p1], axis=0) for p0,p1, in gridslice])
         de -= 0.5*numpy.einsum('i,xij->jx', vK_1*q, dSii) # 0.5*numpy.einsum('i,xij,i->jx', vK_1, dSii, q)
 
     elif pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM']:
-        dD = dD.transpose([2,0,1])
-        dS = dS.transpose([2,0,1])
         dSii = dSii.transpose([2,0,1])
         dA = dA.transpose([2,0,1])
 
@@ -303,24 +329,21 @@ def grad_solver(pcmobj, dm):
         fac = f_epsilon/(2.0*PI)
 
         Av = A*v_grids
-        de_dR  = 0.5*fac * numpy.einsum('i,xij,j->ix', vK_1, dD, Av)
-        de_dR -= 0.5*fac * numpy.einsum('i,xij,j->jx', vK_1, dD, Av)
+        de_dR = 0.5*fac * _d1_antisym(surface, 'D', vK_1, Av)
         de_dR  = numpy.asarray([numpy.sum(de_dR[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_D = vK_1.dot(D)
         vK_1_Dv = vK_1_D * v_grids
         de_dR += 0.5*fac * numpy.einsum('j,xjn->nx', vK_1_Dv, dA)
 
-        de_dS0  = 0.5*numpy.einsum('i,xij,j->ix', vK_1, dS, q)
-        de_dS0 -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dS, q)
+        de_dS0 = 0.5*_d1_antisym(surface, 'S', vK_1, q)
         de_dS0  = numpy.asarray([numpy.sum(de_dS0[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_q = vK_1 * q
         de_dS0 += 0.5*numpy.einsum('i,xin->nx', vK_1_q, dSii)
 
         vK_1_DA = numpy.dot(vK_1, DA)
-        de_dS1  = 0.5*numpy.einsum('i,xij,j->ix', vK_1_DA, dS, q)
-        de_dS1 -= 0.5*numpy.einsum('i,xij,j->jx', vK_1_DA, dS, q)
+        de_dS1 = 0.5*_d1_antisym(surface, 'S', vK_1_DA, q)
         de_dS1  = numpy.asarray([numpy.sum(de_dS1[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_DAq = vK_1_DA*q
@@ -328,8 +351,7 @@ def grad_solver(pcmobj, dm):
 
         Sq = numpy.dot(S,q)
         ASq = A*Sq
-        de_dD  = 0.5*numpy.einsum('i,xij,j->ix', vK_1, dD, ASq)
-        de_dD -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dD, ASq)
+        de_dD = 0.5*_d1_antisym(surface, 'D', vK_1, ASq)
         de_dD  = numpy.asarray([numpy.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
 
         de_dA = 0.5*numpy.einsum('j,xjn->nx', vK_1_D*Sq, dA)
@@ -338,8 +360,6 @@ def grad_solver(pcmobj, dm):
         de += de_dR - de_dK
 
     elif pcmobj.method.upper() in ['SS(V)PE']:
-        dD = dD.transpose([2,0,1])
-        dS = dS.transpose([2,0,1])
         dSii = dSii.transpose([2,0,1])
         dA = dA.transpose([2,0,1])
 
@@ -349,46 +369,41 @@ def grad_solver(pcmobj, dm):
         fac_R = f_epsilon/(2.0*PI)
 
         Av = A*v_grids
-        de_dR  = 0.5*fac_R * numpy.einsum('i,xij,j->ix', vK_1, dD, Av)
-        de_dR -= 0.5*fac_R * numpy.einsum('i,xij,j->jx', vK_1, dD, Av)
+        de_dR = 0.5*fac_R * _d1_antisym(surface, 'D', vK_1, Av)
         de_dR  = numpy.asarray([numpy.sum(de_dR[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_D = vK_1.dot(D)
         vK_1_Dv = vK_1_D * v_grids
         de_dR += 0.5*fac_R * numpy.einsum('j,xjn->nx', vK_1_Dv, dA)
 
-        de_dS0  = 0.5*numpy.einsum('i,xij,j->ix', vK_1, dS, q)
-        de_dS0 -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dS, q)
+        de_dS0 = 0.5*_d1_antisym(surface, 'S', vK_1, q)
         de_dS0  = numpy.asarray([numpy.sum(de_dS0[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_q = vK_1 * q
         de_dS0 += 0.5*numpy.einsum('i,xin->nx', vK_1_q, dSii)
 
         vK_1_DA = numpy.dot(vK_1, DA)
-        de_dS1  = 0.5*numpy.einsum('i,xij,j->ix', vK_1_DA, dS, q)
-        de_dS1 -= 0.5*numpy.einsum('i,xij,j->jx', vK_1_DA, dS, q)
+        de_dS1 = 0.5*_d1_antisym(surface, 'S', vK_1_DA, q)
         de_dS1  = numpy.asarray([numpy.sum(de_dS1[p0:p1], axis=0) for p0,p1 in gridslice])
         vK_1_DAq = vK_1_DA*q
         de_dS1 += 0.5*numpy.einsum('j,xjn->nx', vK_1_DAq, dSii)
 
         DT_q = numpy.dot(D.T, q)
         ADT_q = A * DT_q
-        de_dS1_T  = 0.5*numpy.einsum('i,xij,j->ix', vK_1, dS, ADT_q)
-        de_dS1_T -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dS, ADT_q)
+        de_dS1_T = 0.5*_d1_antisym(surface, 'S', vK_1, ADT_q)
         de_dS1_T  = numpy.asarray([numpy.sum(de_dS1_T[p0:p1], axis=0) for p0,p1 in gridslice])
         vK_1_ADT_q = vK_1 * ADT_q
         de_dS1_T += 0.5*numpy.einsum('j,xjn->nx', vK_1_ADT_q, dSii)
 
         Sq = numpy.dot(S,q)
         ASq = A*Sq
-        de_dD  = 0.5*numpy.einsum('i,xij,j->ix', vK_1, dD, ASq)
-        de_dD -= 0.5*numpy.einsum('i,xij,j->jx', vK_1, dD, ASq)
+        de_dD = 0.5*_d1_antisym(surface, 'D', vK_1, ASq)
         de_dD  = numpy.asarray([numpy.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_S = numpy.dot(vK_1, S)
         vK_1_SA = vK_1_S * A
-        de_dD_T  = 0.5*numpy.einsum('i,xij,j->ix', vK_1_SA, -dD.transpose(0,2,1), q)
-        de_dD_T -= 0.5*numpy.einsum('i,xij,j->jx', vK_1_SA, -dD.transpose(0,2,1), q)
+        # the transpose of dD with a minus sign: the two vectors change places
+        de_dD_T = 0.5*_d1_antisym(surface, 'D', q, vK_1_SA)
         de_dD_T  = numpy.asarray([numpy.sum(de_dD_T[p0:p1], axis=0) for p0,p1 in gridslice])
 
         de_dA = 0.5*numpy.einsum('j,xjn->nx', vK_1_D*Sq, dA)

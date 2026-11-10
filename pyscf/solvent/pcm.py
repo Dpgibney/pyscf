@@ -350,13 +350,95 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
         lib.hermi_triu(v, inplace=True)
     return out
 
+def _int1e_grids_deriv(mol, surface, intor, comp, dms=None, charges=None,
+                       dms_i=None, grids=None):
+    r'''
+    The derivative integrals of the AO pairs with the Gaussian charges of the
+    surface, intor = 'int1e_grids_ip' (\nabla i j|g), 'int1e_grids_ipip'
+    (\nabla\nabla i j|g) or 'int1e_grids_ipvip' (\nabla i \nabla j|g), with
+    comp components, contracted as they are made in one pass (see
+    _int1e_grids_dot). The pairs are not symmetric. Any of
+
+    dms     : sum_ij D_ij (ij|g)  -> [len(dms),comp,ngrids]
+    dms_i   : sum_j D_ij (ij|g)   -> [len(dms_i),comp,nao,ngrids]
+    charges : sum_g q_g (ij|g)    -> [len(charges),comp,nao,nao]
+
+    in this order in the list returned. grids = (g0, g1) takes these surface
+    points only (the charges and the outputs are of g1-g0 points then).
+
+    The derivatives with respect to the position of a charge follow from
+    these: (ij|\nabla g) = -(\nabla i j|g) - (i \nabla j|g).
+    '''
+    from pyscf.sgx import sgx
+    from pyscf.scf import _vhf
+    g0, g1 = (0, len(surface['charge_exp'])) if grids is None else grids
+    xi, group = numpy.unique(surface['charge_exp'][g0:g1], return_inverse=True)
+    order = numpy.argsort(group, kind='stable')
+    ngrids = order.size
+    nao = mol.nao
+    blksize = _vhf.libcvhf.SGXreturn_blksize()
+    group_loc = numpy.append(0, numpy.cumsum(numpy.bincount(group)))
+    batch_loc = numpy.append(
+        numpy.hstack([numpy.arange(p0, p1, blksize)
+                      for p0, p1 in zip(group_loc[:-1], group_loc[1:])]),
+        ngrids).astype(numpy.int32)
+    batch_zeta = numpy.ascontiguousarray(xi[group[order[batch_loc[:-1]]]]**2)
+    coords = numpy.asarray(surface['grid_coords'][g0:g1][order], order='C')
+    env = numpy.append(mol._env, coords.ravel())
+    env[gto.NGRIDS] = ngrids
+    env[gto.PTR_GRIDS] = mol._env.size
+    sgxopt = sgx._make_opt(mol, False, INT1E_GRIDS_CUTOFF)
+    intor = mol._add_suffix(intor)
+    cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas, mol._env, intor)
+    ao_loc = gto.moleintor.make_loc(mol._bas, intor)
+    ins, outs, ops, kinds = [], [], [], []
+    # the operators index the density as D[j,i]
+    for dm in (() if dms is None else dms):
+        ins.append(numpy.ascontiguousarray(dm.T))
+        outs.append(numpy.zeros((comp, ngrids)))
+        ops.append('SGXnrs1_ijg_ji_g')
+        kinds.append('g')
+    for dm in (() if dms_i is None else dms_i):
+        ins.append(numpy.ascontiguousarray(dm.T))
+        outs.append(numpy.zeros((comp, nao, ngrids)))
+        ops.append('SGXnrs1_ijg_ji_gi')
+        kinds.append('g')
+    for c in (() if charges is None else charges):
+        ins.append(numpy.ascontiguousarray(c[order]))
+        outs.append(numpy.zeros((comp, nao, nao)))
+        ops.append('SGXnrs1_ijg_g_ij')
+        kinds.append('ij')
+    n = len(ins)
+    def ptrs(arrays):
+        return (ctypes.c_void_p*n)(*[a.ctypes.data_as(ctypes.c_void_p) for a in arrays])
+    _vhf.libcvhf.SGXnr_direct_drv_batches(
+        _vhf._fpointer(intor), (ctypes.c_void_p*n)(*[_vhf._fpointer(op) for op in ops]),
+        ptrs(ins), ptrs(outs), ctypes.c_int(n), ctypes.c_int(comp),
+        (ctypes.c_int*4)(0, mol.nbas, 0, mol.nbas),
+        ao_loc.ctypes.data_as(ctypes.c_void_p),
+        cintopt, ctypes.byref(sgxopt._this),
+        mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
+        mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
+        env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(1),
+        ctypes.c_int(batch_loc.size - 1), batch_loc.ctypes.data_as(ctypes.c_void_p),
+        batch_zeta.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size))
+    for k, kind in enumerate(kinds):
+        if kind == 'g':
+            v = numpy.empty_like(outs[k])
+            v[...,order] = outs[k]
+            outs[k] = v
+    return outs
+
 def _R_dot(pcmobj, x, trans=False):
     '''R x (R^T x with trans) over the last axis of x, the surface points.
     C-PCM and COSMO keep no R: it is -f_epsilon times the identity there.'''
     R = pcmobj._intermediates['R']
     if R is None:
         return -pcmobj._intermediates['f_epsilon'] * x
-    return numpy.dot(x, R) if trans else numpy.dot(x, R.T)
+    # one matrix product: numpy.dot of an array of more than two indices with a
+    # matrix is a loop of dot products
+    x2 = x.reshape(-1, x.shape[-1])
+    return numpy.dot(x2, R if trans else R.T).reshape(x.shape)
 
 def _K_solve(pcmobj, b, trans=False):
     '''K^-1 b (K^-T b with trans) over the last axis of b, the surface points,
