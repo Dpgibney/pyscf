@@ -133,6 +133,17 @@ def rijcosx(mf, auxbasis='def2-universal-jfit', with_df=None):
     return mf
 
 
+def _exchange_energy(dm, vk):
+    '''The energy of the exchange matrix vk (with its coefficients) of the density
+    matrix dm: -1/4 tr(D K) for a total density, -1/2 sum_s tr(D_s K_s) for spin
+    densities'''
+    dm = numpy.asarray(dm)
+    vk = numpy.asarray(vk)
+    if dm.ndim == 2:
+        return -.25 * numpy.einsum('ij,ji', dm, vk).real
+    return -.5 * numpy.einsum('sij,sji', dm, vk).real
+
+
 # A tag to label the derived SCF class
 class _SGXHF:
 
@@ -299,12 +310,52 @@ class _SGXHF:
 
     kernel = lib.alias(scf, alias_name='kernel')
 
+    def _sgx_exchange(self, dm):
+        '''The exchange matrix of the model as it enters the energy, on the current
+        SGX grid: K for Hartree-Fock, and for a Kohn-Sham functional its full-,
+        long- or short-range K with their coefficients (as get_veff combines
+        them); None without exact exchange.'''
+        mol = self.mol
+        if not isinstance(self, scf.hf.KohnShamDFT):
+            return self.get_k(mol, dm, 1)
+        ni = self._numint
+        if not ni.libxc.is_hybrid_xc(self.xc):
+            return None
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
+        if omega == 0:
+            vk = self.get_k(mol, dm, 1) * hyb
+        elif alpha == 0:  # LR=0, only SR exchange
+            vk = self.get_k(mol, dm, 1, omega=-omega) * hyb
+        elif hyb == 0:  # SR=0, only LR exchange
+            vk = self.get_k(mol, dm, 1, omega=omega) * alpha
+        else:  # SR and LR exchange with different ratios
+            vk = self.get_k(mol, dm, 1) * hyb
+            vk += self.get_k(mol, dm, 1, omega=omega) * (alpha - hyb)
+        return vk
+
+    # The energy on the larger grid (grids_level_energy) from the exchange alone
+    # where only it depends on the SGX grid; False: from a whole get_veff
+    _energy_on_grid_k_only = True
+
     def _sgx_energy_on_grid(self, level, dm, vhf):
-        '''The energy of dm with K on SGX grid level, J and XC as in the SCF'''
+        '''The energy of dm with K on SGX grid level, J and XC as in the SCF.
+
+        For a Kohn-Sham model whose J does not come from the SGX grid (dfj or
+        direct_j), only the exchange is evaluated again: vhf, the potential of dm
+        at the end of the SCF, carries the exchange matrix its energy was made
+        with, and the new energy is the SCF's with that exchange energy
+        replaced. XC, VV10 and J, which do not depend on the SGX grid, are not
+        computed again. Otherwise the whole get_veff is.'''
         t0 = (logger.process_clock(), logger.perf_counter())
         with_df = self.with_df
         level_scf = with_df.grids_level_f
         e_scf = self.e_tot
+        vk_scf = getattr(vhf, 'vk', None)
+        k_only = (self._energy_on_grid_k_only and isinstance(self, scf.hf.KohnShamDFT)
+                  and (with_df.dfj or with_df.direct_j))
+        if k_only and vk_scf is None:
+            # no exact exchange: nothing of this energy is on the SGX grid
+            return e_scf
         # what follows (gradients, properties) keeps the SCF's grid and data, and those of
         # the range-separated copies
         keys = ('grids', '_opt', '_pjs_data', '_overlap_correction_matrix', '_sgx_block_cond')
@@ -313,8 +364,12 @@ class _SGXHF:
         try:
             with_df.build(level=level)
             self._nsteps_direct = 0
-            vhf = self.get_veff(self.mol, dm)
-            e_tot = self.energy_tot(dm, vhf=vhf)
+            if k_only:
+                vk = self._sgx_exchange(dm)
+                e_tot = e_scf + _exchange_energy(dm, vk) - _exchange_energy(dm, vk_scf)
+            else:
+                vhf = self.get_veff(self.mol, dm)
+                e_tot = self.energy_tot(dm, vhf=vhf)
             npoints = with_df.grids.weights.size
         finally:
             for obj, state in saved:

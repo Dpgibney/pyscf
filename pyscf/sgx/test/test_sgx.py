@@ -136,6 +136,41 @@ class KnownValues(unittest.TestCase):
         # the exact SCF gives -76.3581494902
         self.assertAlmostEqual(e, -76.3582451667, 7)
 
+    def test_rijcosx_energy_k_only(self):
+        # the energy on the larger grid from the exchange alone (no XC, VV10 or J again)
+        # against the whole get_veff on that grid
+        from pyscf.dft import numint
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
+        mol1 = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp',
+                     charge=1, spin=1, verbose=0)
+        for make in (lambda: dft.RKS(mol, xc='b3lyp'), lambda: dft.RKS(mol, xc='wb97m-v'),
+                     lambda: dft.RKS(mol, xc='hse06'), lambda: dft.RKS(mol, xc='lrc-wpbe'),
+                     lambda: dft.UKS(mol1, xc='wb97x'), lambda: dft.ROKS(mol1, xc='b3lyp')):
+            mf = make().RIJCOSX()
+            mf.conv_tol = 1e-10
+            mf._energy_on_grid_k_only = False
+            e_full = mf.kernel()
+            mf = make().RIJCOSX()
+            mf.conv_tol = 1e-10
+            calls = []
+            nr_rks, nr_uks = numint.NumInt.nr_rks, numint.NumInt.nr_uks
+            def spy(fn):
+                def f(*args, **kwargs):
+                    calls.append(mf._sgx_last is not None)
+                    return fn(*args, **kwargs)
+                return f
+            with lib.temporary_env(numint.NumInt, nr_rks=spy(nr_rks), nr_uks=spy(nr_uks)):
+                e = mf.kernel()
+            self.assertAlmostEqual(e, e_full, 10)
+            # no XC integration after the SCF has ended
+            self.assertTrue(len(calls) > 0 and not any(calls))
+            self.assertEqual(mf.with_df.grids_level_f, 1)
+        # a functional without exact exchange has nothing on the SGX grid
+        mf = dft.RKS(mol, xc='pbe').RIJCOSX()
+        e = mf.kernel()
+        mf.with_df.grids_level_energy = None
+        self.assertAlmostEqual(e, mf.kernel(), 10)
+
     def test_rijcosx_grad(self):
         # the step on the larger grid leaves the SCF's grid and data to the gradients
         mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='def2-svp', verbose=0)
