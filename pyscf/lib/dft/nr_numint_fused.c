@@ -927,6 +927,130 @@ static void _gather_rows(double *out, double *src, int ncol, GemmGroup *g)
 }
 
 /*
+ * VXCfused_dot_terms contracted with the density matrices D[k] = Q[k] Q[k]^T on
+ * its second index, without the [nao,nao] matrices:
+ *   out[k,o,i] += sum_s sum_g bra[k,o,s,i,g] * sum_j ket[k,s,j,g] D[k]_ji
+ * for real Q[nset,nao,nq] (C order), which is einsum('koij,ij->koi') of the
+ * matrices of VXCfused_dot_terms with D[k]: what the XC term of a nuclear
+ * gradient takes of them. On the points of a group, with FQ = ket Q,
+ * sum_j ket_j D_ji = (FQ Q^T)_i: two GEMMs of nseg*ng x ns x nq per set, shared
+ * by the outputs, instead of one of nseg*ng x ns x ns per output, and a dot
+ * product over the points per AO and output. out[nset,nout,nao].
+ */
+void VXCfused_dot_terms_q(double *out, double *wv, int nset, int nwv,
+                          int nout, int nseg, int *ket_terms, int *bra_terms, int deriv,
+                          double *Q, int nq,
+                          int nao, int ngrids, double *coords, int ldc,
+                          uint8_t *screen_index, int *ao_loc,
+                          int *atm, int natm, int *bas, int nbas, double *env,
+                          double *rcache, int64_t *roffs)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const int ncomp = (deriv+1)*(deriv+2)*(deriv+3)/6;
+        const int npriv = nset * nout;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        const int nstream = _slot_nstreams(ngroup);
+        if (deriv > 1) {
+                rcache = NULL;
+        }
+        if (max_nao <= 0 || npriv <= 0 || nq <= 0) {
+                return;
+        }
+        SlotStreams st;
+        _slot_streams_init(&st, ngroup, nstream);
+        double **vparts = _slot_parts_alloc(nstream, npriv * Nao);
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        char *skip = malloc(sizeof(char) * nstream);
+        double *aobuf = malloc(sizeof(double) * max_nao * GEMM_NGRIDS * ncomp);
+        double *ketbuf = malloc(sizeof(double) * max_nao * GEMM_NGRIDS * nseg * 3);
+        double *brabuf = ketbuf + (size_t)max_nao * GEMM_NGRIDS * nseg;
+        double *mbuf = brabuf + (size_t)max_nao * GEMM_NGRIDS * nseg;
+        double *fq = malloc(sizeof(double) * GEMM_NGRIDS * nseg * nq);
+        double *qg = malloc(sizeof(double) * max_nao * nq);
+        double *work = malloc(sizeof(double) * EVAL_WORK(ncomp));
+        int igroup, blk0, blk1, ig0, ng, ns, nk, k, o, s, a, q, slot, stream;
+        size_t comp_size, n;
+        double *wvk, *vpriv, *pb, *pm;
+        double sum;
+        stream = -1;
+        while ((slot = _slot_take(&st, &stream, skip)) >= 0) {
+        vpriv = _slot_part(&st, vparts, stream, slot, npriv * Nao);
+        for (igroup = slot * SLOT_GROUPS;
+             igroup < MIN((slot+1) * SLOT_GROUPS, ngroup); igroup++) {
+                blk0 = igroup * GEMM_NBLK;
+                blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                ig0 = blk0 * BLKSIZE;
+                ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                ns = g.nao;
+                if (ns == 0) {
+                        continue;
+                }
+                comp_size = (size_t)ns * ng;
+                nk = nseg * ng;
+                _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                            nbas, atm, bas, env, work);
+                for (k = 0; k < nset; k++) {
+                        wvk = wv + (size_t)k * nwv * Ngrids;
+                        // qg[n,l] = Q[k][i_n,l]: as a column-major matrix, Q^T (nq x ns)
+                        _gather_rows(qg, Q + (size_t)k * Nao * nq, nq, &g);
+                        for (s = 0; s < nseg; s++) {
+                                _combine(ketbuf + s * ng, nk, aobuf, comp_size,
+                                         ket_terms + s * TERM_SLOTS, wvk, Ngrids, ig0,
+                                         &g, ao_loc, ng);
+                        }
+                        // fq[q,l] = sum_n ketbuf[n,q] qg[n,l], then mbuf[n,q] = sum_l fq[q,l] qg[n,l]
+                        dgemm_(&TRANS_N, &TRANS_T, &nk, &nq, &ns, &D1, ketbuf, &nk,
+                               qg, &nq, &D0, fq, &nk);
+                        dgemm_(&TRANS_N, &TRANS_N, &nk, &ns, &nq, &D1, fq, &nk,
+                               qg, &nq, &D0, mbuf, &nk);
+                        for (o = 0; o < nout; o++) {
+                                for (s = 0; s < nseg; s++) {
+                                        _combine(brabuf + s * ng, nk, aobuf, comp_size,
+                                                 bra_terms + (o * nseg + s) * TERM_SLOTS,
+                                                 wvk, Ngrids, ig0, &g, ao_loc, ng);
+                                }
+                                for (s = 0; s < g.nseg; s++) {
+                                for (a = 0; a < g.seg_len[s]; a++) {
+                                        n = g.seg_off[s] + a;
+                                        pb = brabuf + n * nk;
+                                        pm = mbuf + n * nk;
+                                        sum = 0;
+#pragma omp simd reduction(+:sum)
+                                        for (q = 0; q < nk; q++) {
+                                                sum += pb[q] * pm[q];
+                                        }
+                                        vpriv[(k * nout + o) * Nao + g.seg_ao[s] + a] += sum;
+                                } }
+                        }
+                }
+        }
+        _slot_release(&st, stream);
+        }
+        _gemm_group_free(&g);
+        free(skip);
+        free(aobuf);
+        free(ketbuf);
+        free(fq);
+        free(qg);
+        free(work);
+}
+        _slot_streams_add(out, vparts, nstream, 0, npriv * Nao);
+        _slot_parts_free(vparts, nstream);
+        _slot_streams_free(&st);
+}
+
+/*
  * The densities rho[c*ldrho+q] (c < nrho, q < ng) on a group of the symmetric
  * matrix D = A B^T + B A^T, from the rows abuf[ns,r] of A for the AOs of the
  * group and TB[c] = ao[c] B (tb[c,l,q]). TA[c] = ao[c] A goes to ta[c,l,q],

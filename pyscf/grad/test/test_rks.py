@@ -908,6 +908,56 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(dexc_t, exc1_approx[2], 1)
         self.assertAlmostEqual(dexc_t, exc1_full[2], 7)
 
+    def test_vxc_dm(self):
+        # the XC and VV10 terms contracted with the density on the grid (get_vxc_dm,
+        # get_nlc_vxc_dm) against their matrices contracted afterwards
+        from pyscf.grad import rks as rks_grad
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0.1 -0.76 -0.47; N 2.5 0.3 0.1; '
+                          'H 2.6 1.2 0.5; H 3.3 0.1 -0.5; H 2.4 -0.4 0.8', basis='def2-svp', verbose=0)
+        for xc in ('lda,vwn', 'pbe', 'r2scan', 'wb97m-v'):
+            mf1 = dft.RKS(mol1, xc=xc)
+            mf1.nlcgrids.level = 0
+            mf1.conv_tol = 1e-10
+            mf1.kernel()
+            ni = mf1._numint
+            dm = mf1.make_rdm1()
+            v = rks_grad.get_vxc(ni, mol1, mf1.grids, xc, dm)[1]
+            g = rks_grad.get_vxc_dm(ni, mol1, mf1.grids, xc, mf1.mo_coeff, mf1.mo_occ)
+            self.assertAlmostEqual(abs(g - numpy.einsum('xij,ij->xi', v, dm)).max(), 0, 12)
+            if mf1.do_nlc():
+                v = rks_grad.get_nlc_vxc(ni, mol1, mf1.nlcgrids, xc, dm)[1]
+                g = rks_grad.get_nlc_vxc_dm(ni, mol1, mf1.nlcgrids, xc, dm, mf1.mo_coeff, mf1.mo_occ)
+                self.assertAlmostEqual(abs(g - numpy.einsum('xij,ij->xi', v, dm)).max(), 0, 13)
+            # the gradients: direct, density-fitted and RI-J + SGX-K take the same path
+            for fit in (lambda m: m, lambda m: m.density_fit(), lambda m: m.RIJCOSX()):
+                mf2 = dft.RKS(mol1, xc=xc)
+                mf2.nlcgrids.level = 0
+                mf2 = fit(mf2)
+                mf2.conv_tol = 1e-10
+                mf2.kernel()
+                with lib.temporary_env(rks_grad, XC_DM=False):
+                    g_ref = mf2.nuc_grad_method().kernel()
+                taken = []
+                get_vxc_de = rks_grad._get_vxc_de
+                def spy(*args, **kwargs):
+                    de = get_vxc_de(*args, **kwargs)
+                    taken.append(de is not None)
+                    return de
+                with lib.temporary_env(rks_grad, _get_vxc_de=spy):
+                    g1 = mf2.nuc_grad_method().kernel()
+                self.assertEqual(taken, [True])
+                self.assertAlmostEqual(abs(g1 - g_ref).max(), 0, 11)
+        # not with the grid response, nor for a density without orbitals
+        gobj = mf1.nuc_grad_method()
+        dm = lib.tag_array(mf1.make_rdm1(), mo_coeff=mf1.mo_coeff, mo_occ=mf1.mo_occ)
+        self.assertIsNotNone(rks_grad._get_vxc_de(gobj, mol1, dm))
+        self.assertIsNone(rks_grad._get_vxc_de(gobj, mol1, mf1.make_rdm1() * 1.))
+        gobj.grid_response = True
+        self.assertIsNone(rks_grad._get_vxc_de(gobj, mol1, dm))
+        with lib.temporary_env(rks_grad, XC_DM=False):
+            g_ref = gobj.kernel()
+        self.assertAlmostEqual(abs(gobj.kernel() - g_ref).max(), 0, 12)
+
     def test_range_separated(self):
         mf = dft.RKS(mol)
         mf.conv_tol = 1e-14

@@ -30,6 +30,13 @@ from pyscf import __config__
 import ctypes
 
 
+# The XC and VV10 terms of the gradient contracted with the density on the grid
+# (get_vxc_dm, get_nlc_vxc_dm) where grad_elec needs only that of their matrices:
+# without the grid response, for densities that carry real orbitals, where the
+# fused XC kernels apply. False: the [3,nao,nao] matrices of get_vxc
+XC_DM = getattr(__config__, 'grad_rks_xc_dm', True)
+
+
 def get_veff(ks_grad, mol=None, dm=None):
     '''
     First order derivative of DFT effective potential matrix (wrt electron coordinates)
@@ -76,8 +83,15 @@ def get_veff(ks_grad, mol=None, dm=None):
     return lib.tag_array(vxc, exc1_grid=exc)
 
 def _get_veff_split(ks_grad, mol, dm):
-    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom'''
-    exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+    '''get_veff for grad_elec: the XC potential, and the energy gradient of J/K per atom. Where
+    the XC term comes contracted with the density (_get_vxc_de), there is no potential (None)
+    and the energy gradient holds the XC term as well.'''
+    de_xc = _get_vxc_de(ks_grad, mol, dm)
+    if de_xc is None:
+        exc, vxc = _get_vxc_veff(ks_grad, mol, dm)
+        vxc = lib.tag_array(vxc, exc1_grid=exc)
+    else:
+        vxc = None
     mf = ks_grad.base
     ni = mf._numint
     if not ni.libxc.is_hybrid_xc(mf.xc):
@@ -87,7 +101,97 @@ def _get_veff_split(ks_grad, mol, dm):
         de = rhf_grad.jk_energy_per_atom(mol, dm, 1, hyb, screen='jk')
         if omega != 0:
             de += rhf_grad.jk_energy_per_atom(mol, dm, 0, alpha - hyb, omega=omega)
-    return lib.tag_array(vxc, exc1_grid=exc), de
+    if de_xc is not None:
+        de += de_xc
+    return vxc, de
+
+def _get_vxc_de(ks_grad, mol, dm, max_memory=None):
+    '''The XC term of the gradient (with VV10) per atom [natm,3], what grad_elec makes of the
+    potential of _get_vxc_veff: 2 einsum('xij,ij->x', vxc[:,p0:p1], dm[p0:p1]) for the AOs
+    p0:p1 of each atom. The weighted AO products are contracted with the occupied orbitals
+    on the grid, without the [3,nao,nao] matrices (get_vxc_dm). None where this path does not
+    apply: XC_DM off, the grid response, a density without real orbitals (the tags
+    mo_coeff and mo_occ of grad_elec's dm), or a case the fused XC kernels do not take.'''
+    if not XC_DM or ks_grad.grid_response:
+        return None
+    mo_coeff = getattr(dm, 'mo_coeff', None)
+    mo_occ = getattr(dm, 'mo_occ', None)
+    if (mo_coeff is None or mo_occ is None or numpy.ndim(mo_coeff) != 2 or
+            numpy.ndim(dm) != 2 or numpy.iscomplexobj(mo_coeff)):
+        return None
+    t0 = (logger.process_clock(), logger.perf_counter())
+    mf = ks_grad.base
+    ni = mf._numint
+    grids, nlcgrids = _initialize_grids(ks_grad)
+    if max_memory is None:
+        mem_now = lib.current_memory()[0]
+        max_memory = max(2000, ks_grad.max_memory*.9-mem_now)
+    g = get_vxc_dm(ni, mol, grids, mf.xc, mo_coeff, mo_occ, max_memory)
+    if g is None:
+        return None
+    if mf.do_nlc():
+        if ni.libxc.is_nlc(mf.xc):
+            xc = mf.xc
+        else:
+            xc = mf.nlc
+        gnlc = get_nlc_vxc_dm(ni, mol, nlcgrids, xc, dm, mo_coeff, mo_occ, max_memory)
+        if gnlc is None:
+            vnlc = get_nlc_vxc(ni, mol, nlcgrids, xc, dm, max_memory=max_memory,
+                               verbose=ks_grad.verbose)[1]
+            gnlc = numpy.einsum('xij,ij->xi', vnlc, dm)
+        g += gnlc
+    aoslices = mol.aoslice_by_atom()
+    de = numpy.array([g[:,p0:p1].sum(axis=1) for p0, p1 in aoslices[:,2:]]) * 2
+    logger.timer(ks_grad, 'vxc', *t0)
+    return de
+
+def get_vxc_dm(ni, mol, grids, xc_code, mo_coeff, mo_occ, max_memory=2000):
+    '''einsum('xij,ij->xi', vxc, dm) [3,nao] for the vxc of get_vxc and the density matrix dm of
+    the real orbitals mo_coeff with occupations mo_occ, from the fused XC kernels without vxc
+    (numint._FusedXC.get_vxc_grad_q); None where they do not apply.'''
+    xctype = ni._xc_type(xc_code)
+    if xctype not in ('LDA', 'GGA', 'MGGA') or (xctype == 'MGGA' and numint.MGGA_DENSITY_LAPL):
+        return None
+    # the kernels apply to dense blocks as well; there is no block_loop path to match
+    fused = numint._fused_xc(ni, mol, grids, mol.nao, xctype, max_memory, (mo_coeff,),
+                             match_block_loop=False)
+    if fused is None:
+        return None
+    g = fused.get_vxc_grad_q(ni, xc_code, xctype, mo_coeff, mo_occ)
+    if g is None:
+        return None
+    # - sign because nabla_X = -nabla_x
+    return -g
+
+def get_nlc_vxc_dm(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ, max_memory=2000):
+    '''einsum('xij,ij->xi', vnlc, dm) [3,nao] for the vnlc of get_nlc_vxc, as get_vxc_dm; None
+    where the fused XC kernels do not apply.'''
+    nao = mol.nao
+    nlc_coefs = ni.nlc_coeff(xc_code)
+    if len(nlc_coefs) != 1:
+        raise NotImplementedError('Additive NLC')
+    nlc_pars, fac = nlc_coefs[0]
+    if (mo_occ < 0).any():
+        return None
+    fused = numint._fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (dm,),
+                             match_block_loop=False, radial_cache=False)
+    if fused is None:
+        return None
+    make_rho = fused.rho_evaluator(ni, [dm], 1, 'GGA')
+    rho = numpy.hstack([make_rho(ip0, ip1)[0][0] for ip0, ip1 in fused.blocks])
+    vxc = numint._vv10nlc(rho, grids.coords, rho, grids.weights,
+                          grids.coords, nlc_pars)[1]
+    vv_vxc = xc_deriv.transform_vxc(rho, vxc, 'GGA', spin=0)
+    occ = mo_occ > 0
+    Q = (mo_coeff[:,occ] * numpy.sqrt(mo_occ[occ]))[numpy.newaxis]
+    terms = numint._xc_grad_terms('GGA')
+    g = numpy.zeros((1,3,nao))
+    for ip0, ip1 in fused.blocks:
+        wv = vv_vxc[:,ip0:ip1] * grids.weights[ip0:ip1]
+        wv[0] *= .5
+        fused.dot_terms_q(ip0, ip1, wv[numpy.newaxis], terms, Q, g)
+    # - sign because nabla_X = -nabla_x
+    return -g[0]
 
 def _get_vxc_veff(ks_grad, mol, dm):
     '''The XC part of get_veff, and the grid response exc1_grid'''
@@ -816,14 +920,19 @@ class Gradients(rhf_grad.Gradients):
         method, the grid response in DFT numerical integration can be put in
         this function.
         '''
+        e1 = 0
+        vhf = envs['vhf']
+        # the XC term contracted with the density on the grid, where get_veff
+        # left it out of the potential (_get_vxc_de)
+        de_xc = getattr(vhf, 'de_xc', None)
+        if de_xc is not None:
+            e1 = e1 + de_xc[atom_id]
         if self.grid_response:
-            vhf = envs['vhf']
             log = envs['log']
             log.debug('grids response for atom %d %s',
                       atom_id, vhf.exc1_grid[atom_id])
-            return vhf.exc1_grid[atom_id]
-        else:
-            return 0
+            e1 = e1 + vhf.exc1_grid[atom_id]
+        return e1
 
 Grad = Gradients
 

@@ -1230,6 +1230,51 @@ class _FusedXC:
                 bras.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(deriv),
                 *self._args(ip0, ip1, deriv))
 
+    def dot_terms_q(self, ip0, ip1, wv, terms, Q, out):
+        '''out[k,o,i] += einsum('ij,ij->i', v[k,o], Q[k] Q[k]^T) for the matrices
+        v[k,o] that dot_terms adds for the weights wv[k,:,ip0:ip1], without the
+        matrices (VXCfused_dot_terms_q). Q[nset,nao,nq] real, out[nset,nout,nao].'''
+        kets, bras, deriv = terms
+        wv = numpy.asarray(wv, order='C')
+        Q = numpy.asarray(Q, order='C', dtype=numpy.double)
+        assert out.flags.c_contiguous and out.dtype == numpy.double
+        nset, nwv = wv.shape[:2]
+        nout, nseg = bras.shape[:2]
+        assert Q.shape[:2] == (nset, self.nao) and out.shape == (nset, nout, self.nao)
+        libdft.VXCfused_dot_terms_q(
+            out.ctypes.data_as(ctypes.c_void_p),
+            wv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nset),
+            ctypes.c_int(nwv), ctypes.c_int(nout), ctypes.c_int(nseg),
+            kets.ctypes.data_as(ctypes.c_void_p),
+            bras.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(deriv),
+            Q.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(Q.shape[2]),
+            *self._args(ip0, ip1, deriv))
+
+    def get_vxc_grad_q(self, ni, xc_code, xctype, mo_coeff, mo_occ):
+        '''einsum('xij,ij->xi', vmat, dm) [3,nao] of the vmat[3,nao,nao] that
+        get_vxc_grad (spin=0) adds for the density matrix dm of the real orbitals
+        mo_coeff with occupations mo_occ, without vmat: the weighted AO products
+        are contracted with the occupied orbitals on the grid (dot_terms_q).
+        None if an occupation is negative.'''
+        make_rho = self.rho_mo_evaluator([mo_coeff], [mo_occ], xctype)
+        if make_rho is None:
+            return None
+        occ = mo_occ > 0
+        Q = (mo_coeff[:,occ] * numpy.sqrt(mo_occ[occ]))[numpy.newaxis]
+        terms = _xc_grad_terms(xctype)
+        out = numpy.zeros((1, 3, self.nao))
+        for ip0, ip1 in self.blocks:
+            weight = self.grids.weights[ip0:ip1]
+            rho = make_rho(ip0, ip1)[0]
+            wv = numpy.asarray(weight * ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype)[1])
+            wv = wv.reshape(_FUSED_NRHO[xctype], ip1-ip0)
+            if xctype != 'LDA':
+                wv[0] *= .5
+            if xctype == 'MGGA':
+                wv[4] *= .5
+            self.dot_terms_q(ip0, ip1, wv[numpy.newaxis], terms, Q, out)
+        return out[0]
+
     def get_vxc_grad(self, ni, xc_code, xctype, dms, hermi, spin, vmat):
         '''The loop of grad.rks.get_vxc (spin=0) and grad.uks.get_vxc (spin=1,
         dms of alpha and beta); adds to vmat[nset,3,nao,nao] (spin=1: nset=2).'''
