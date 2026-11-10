@@ -1056,6 +1056,103 @@ void SGXnr_direct_drv_batches(int (*intor)(), SGXJKOperator **jkop,
 }
 }
 
+/*
+ * vjk[idm][i,j] += sum_g (ij|g) charges[idm][g] for n_dm sets of charges on the
+ * grid points, the batches of points as in SGXnr_direct_drv_batches. The
+ * threads take the shell pairs, each of which belongs to one thread, so the
+ * sums go straight into vjk: SGXnr_direct_drv_batches with SGXnrs2_ijg_g_ij
+ * keeps a [nao,nao] matrix per set of charges in every thread. aosym = 2 fills
+ * i >= j only.
+ */
+void SGXnr_g_ij_drv_batches(int (*intor)(), double **charges, double **vjk,
+                            int n_dm, int *shls_slice, int *ao_loc,
+                            CINTOpt *cintopt, CVHFOpt *vhfopt,
+                            int *atm, int natm, int *bas, int nbas, double *env,
+                            int aosym, int nbatch, int *batch_loc,
+                            double *batch_zeta, int nenv)
+{
+        const int ish0 = shls_slice[0];
+        const int ish1 = shls_slice[1];
+        const int jsh0 = shls_slice[2];
+        const int jsh1 = shls_slice[3];
+        const int nish = ish1 - ish0;
+        const int njsh = jsh1 - jsh0;
+        const int ioff = ao_loc[ish0];
+        const int joff = ao_loc[jsh0];
+        const size_t nj = ao_loc[jsh1] - joff;
+        int di = GTOmax_shell_dim(ao_loc, shls_slice, 2);
+        int cache_size = _max_cache_size_sgx(intor, shls_slice, 2,
+                                             atm, natm, bas, nbas, env,
+                                             SGX_BLKSIZE);
+        int (*fprescreen)();
+        if (vhfopt != NULL) {
+                fprescreen = vhfopt->fprescreen;
+        } else {
+                fprescreen = CVHFnoscreen;
+        }
+#pragma omp parallel
+{
+        int ish, jsh, jmax, ibatch, ig0, ig1, dg, idm, i, j, k, ij;
+        int i0, i1, j0, j1;
+        int shls[4];
+        double *buf = calloc(sizeof(double), SGX_BLKSIZE*di*di);
+        double *cache = malloc(sizeof(double) * cache_size);
+        double *env_b = env;
+        if (batch_zeta != NULL) {
+                env_b = malloc(sizeof(double) * nenv);
+                memcpy(env_b, env, sizeof(double) * nenv);
+        }
+#pragma omp for nowait schedule(dynamic, 1)
+        for (ish = nish - 1; ish >= 0; ish--) {
+                jmax = (aosym == 2) ? ish + 1 : njsh;
+                for (jsh = 0; jsh < jmax; jsh++) {
+                        shls[0] = ish + ish0;
+                        shls[1] = jsh + jsh0;
+                        if (!(*fprescreen)(shls, vhfopt, atm, bas, env_b)) {
+                                continue;
+                        }
+                        i0 = ao_loc[shls[0]] - ioff;
+                        i1 = ao_loc[shls[0]+1] - ioff;
+                        j0 = ao_loc[shls[1]] - joff;
+                        j1 = ao_loc[shls[1]+1] - joff;
+                        for (ibatch = 0; ibatch < nbatch; ibatch++) {
+                                ig0 = batch_loc[ibatch];
+                                ig1 = batch_loc[ibatch+1];
+                                dg = ig1 - ig0;
+                                if (batch_zeta != NULL) {
+                                        env_b[PTR_RINV_ZETA] = batch_zeta[ibatch];
+                                }
+                                const int dims[] = {i1 - i0, j1 - j0, dg};
+                                shls[2] = ig0;
+                                shls[3] = ig1;
+                                (*intor)(buf, dims, shls, atm, natm, bas, nbas,
+                                         env_b, cintopt, cache);
+                                for (idm = 0; idm < n_dm; idm++) {
+                                        const double *q = charges[idm] + ig0;
+                                        double *v = vjk[idm];
+                                        ij = 0;
+                                        for (j = j0; j < j1; j++) {
+                                        for (i = i0; i < i1; i++, ij++) {
+                                                const double *peri = buf + (size_t)ij * dg;
+                                                double s = 0;
+#pragma omp simd reduction(+:s)
+                                                for (k = 0; k < dg; k++) {
+                                                        s += peri[k] * q[k];
+                                                }
+                                                v[i*nj+j] += s;
+                                        } }
+                                }
+                        }
+                }
+        }
+        if (batch_zeta != NULL) {
+                free(env_b);
+        }
+        free(buf);
+        free(cache);
+}
+}
+
 void SGXnr_direct_drv(int (*intor)(), SGXJKOperator **jkop,
                       double **dms, double **vjk, int n_dm, int ncomp,
                       int *shls_slice, int *ao_loc,

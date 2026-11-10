@@ -36,7 +36,7 @@ def _solvent_vind_mo(mf, vind_mo, mo_coeff, mo_occ, is_uhf):
     def solvent_mo(dm_of, nset, nao, add):
         # the dms and their potential matrices in the AO basis, by chunks
         left = max(mf.max_memory - lib.current_memory()[0], 500) * .25e6
-        chunk = min(nset, max(8, int(left / (2 * 8 * nao**2))))
+        chunk = min(nset, max(8, int(left / (3 * 8 * nao**2))))
         for p0, p1 in lib.prange(0, nset, chunk):
             add(p0, p1, with_solvent._B_dot_x(dm_of(p0, p1)))
 

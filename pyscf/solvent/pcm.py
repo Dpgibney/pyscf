@@ -330,6 +330,23 @@ def _int1e_grids_dot(mol, surface, dms=None, charges=None):
     n = len(ins)
     def ptrs(arrays):
         return (ctypes.c_void_p*n)(*[a.ctypes.data_as(ctypes.c_void_p) for a in arrays])
+    if dms is None:
+        # The shell pairs over the threads, summed into the matrices directly:
+        # the driver below would keep a matrix per set of charges in each thread
+        _vhf.libcvhf.SGXnr_g_ij_drv_batches(
+            _vhf._fpointer(sgxopt._intor), ptrs(ins), ptrs(out), ctypes.c_int(n),
+            (ctypes.c_int*4)(0, mol.nbas, 0, mol.nbas),
+            ao_loc.ctypes.data_as(ctypes.c_void_p),
+            sgxopt._cintopt, ctypes.byref(sgxopt._this),
+            mol._atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
+            mol._bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.nbas),
+            env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(2),
+            ctypes.c_int(batch_loc.size - 1), batch_loc.ctypes.data_as(ctypes.c_void_p),
+            batch_zeta.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size))
+        for v in out:
+            # the driver fills the lower triangle
+            lib.hermi_triu(v, inplace=True)
+        return out
     _vhf.libcvhf.SGXnr_direct_drv_batches(
         _vhf._fpointer(sgxopt._intor), (ctypes.c_void_p*n)(*[_vhf._fpointer(fjk)]*n),
         ptrs(ins), ptrs(out), ctypes.c_int(n), ctypes.c_int(1),
