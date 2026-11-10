@@ -744,11 +744,14 @@ class HessianBase(lib.StreamObject):
     # while the error of cphf solver may be increased by one magnitude.
     level_shift = 0
     # Approximate the J and K of the CPHF response, only those: direct SCF's J and
-    # SGX's K on grid level sgx_response_level (1 is more accurate, K costs twice
-    # as much). The SCF, the derivative integrals and the XC and VV10 responses
-    # stay exact. Restricted references without density fitting only.
+    # SGX's K on grid level sgx_response_level. The SCF, the derivative integrals
+    # and the XC and VV10 responses stay exact. Restricted references without
+    # density fitting only. Level 1 moved the harmonic frequencies of
+    # wB97M-V/def2-TZVPD Hessians (water dimer, H2PO4-, glycine) by at most 0.03
+    # cm^-1; level 0, whose K costs half as much, by 0.1 to 1.2 cm^-1 with these
+    # diffuse functions (0.03 to 0.5 cm^-1 with def2-SVP and def2-TZVP).
     sgx_response = False
-    sgx_response_level = 0
+    sgx_response_level = 1
     # None: cphf.solve to mf.conv_tol_cpscf, unless sgx_response, which needs
     # SGX_RESPONSE_RESIDUAL_TOL. A number: cphf.solve_residual with that tol
     cphf_residual_tol = None

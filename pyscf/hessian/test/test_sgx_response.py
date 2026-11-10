@@ -138,11 +138,13 @@ class KnownValues(unittest.TestCase):
     def test_sgx_response(self):
         hobj = mf.Hessian()
         hobj.sgx_response = True
+        hobj.sgx_response_level = 0
         h0 = hobj.kernel()
         d0 = abs(h0 - h_ref).max()
         hobj = mf.Hessian()
         hobj.sgx_response = True
-        hobj.sgx_response_level = 1
+        # level 1 is the default
+        self.assertEqual(hobj.sgx_response_level, 1)
         d1 = abs(hobj.kernel() - h_ref).max()
         # the approximation shows, and shrinks with the grid
         self.assertLess(d0, 1e-3)

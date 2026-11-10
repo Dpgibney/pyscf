@@ -93,6 +93,51 @@ class KnownValues(unittest.TestCase):
         with mock.patch.object(rks_hess, 'get_vnlc_resp_mo', lambda *a: None):
             self.assertLess(abs(_response(mf) - v).max(), 1e-10)
 
+    def test_second_nlcgrids(self):
+        # the VV10 part of the response on mf.second_nlcgrids: the factored path and the AO path take
+        # that grid, the same grid gives the same response, and a coarser one a slightly different one
+        ref = _response(mf)
+        try:
+            grids = dft.gen_grid.Grids(mol)
+            grids.level = 1
+            mf.set_second_nlcgrids(grids)
+            self.assertIs(mf.second_nlcgrids, grids)
+            self.assertIs(rks_hess._vv10_response_grids(mf), grids)
+            self.assertAlmostEqual(abs(_response(mf) - ref).max(), 0, 11)
+            self.assertIsNotNone(getattr(grids, '_vv10_hess_data', None))
+            mf.set_second_nlcgrids(0)
+            self.assertEqual(mf.second_nlcgrids.level, 0)
+            v0 = _response(mf)
+            d0 = abs(v0 - ref).max()
+            self.assertLess(d0, 2e-4)
+            self.assertGreater(d0, 1e-9)
+            # the path through the AO matrices of the dms takes the same grid
+            with mock.patch.object(rks_hess, 'get_vnlc_resp_mo', return_value=None):
+                self.assertAlmostEqual(abs(_response(mf) - v0).max(), 0, 10)
+            # the response without VV10 differs by several times what the coarse grid changes
+            nocc = (mf.mo_occ > 0).sum()
+            x = numpy.random.default_rng(5).random((7, mol.nao, nocc)) - .5
+            vresp = mf.gen_response(mf.mo_coeff, mf.mo_occ, hermi=1, with_nlc=False)
+            self.assertGreater(abs(vresp.vind_mo(None, x*2) - ref).max(), 4 * d0)
+            self.assertRaises(ValueError, mf.set_second_nlcgrids, 'sg2')
+        finally:
+            mf.second_nlcgrids = None
+        self.assertIs(rks_hess._vv10_response_grids(mf), mf.nlcgrids)
+        # the Hessian's own VV10 terms keep mf.nlcgrids
+        mf1 = dft.RKS(mol, xc='wb97m-v')
+        mf1.nlcgrids.level = 1
+        mf1.conv_tol = 1e-11
+        mf1.kernel()
+        hobj = mf1.Hessian()
+        hobj.cphf_residual_tol = 1e-6
+        h_ref = hobj.kernel()
+        mf1.set_second_nlcgrids(0)
+        hobj = mf1.Hessian()
+        hobj.cphf_residual_tol = 1e-6
+        d = abs(hobj.kernel() - h_ref).max()
+        self.assertLess(d, 5e-5)
+        self.assertGreater(d, 1e-10)
+
     def test_chunk_size(self):
         chunk = _response_functions._cphf_chunk
         with mock.patch.object(_response_functions._vhf, '_direct_jk_batch',

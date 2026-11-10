@@ -1034,8 +1034,9 @@ class _VV10HessData:
     derivatives of the VV10 energy density (unweighted). _vv10_hess_data keeps it on the grids for the
     calls with the same density and functional, the CPHF iterations of a Hessian among them.
     '''
-    def __init__(self, mf, mol, dm0, nlc_pars, max_memory):
-        grids = mf.nlcgrids
+    def __init__(self, mf, mol, dm0, nlc_pars, max_memory, grids=None):
+        if grids is None:
+            grids = mf.nlcgrids
         ni = mf._numint
         self.coords_full = grids.coords
         self.mol_data = (mol._atm.copy(), mol._bas.copy(), mol._env.copy())
@@ -1115,9 +1116,19 @@ class _VV10HessData:
             ctypes.c_int(self.ngrids), ctypes.c_int(ntrial))
         return f_rho_t, f_gamma_t
 
-def _vv10_hess_data(mf, mol, dm0, max_memory):
-    '''The _VV10HessData of mf for the density dm0, from mf.nlcgrids._vv10_hess_data when it matches'''
-    grids = mf.nlcgrids
+def _vv10_response_grids(mf):
+    '''The grids of the VV10 part of the response functions: mf.second_nlcgrids if set (see
+    KohnShamDFT.set_second_nlcgrids), otherwise mf.nlcgrids'''
+    grids = getattr(mf, 'second_nlcgrids', None)
+    if grids is None:
+        grids = mf.nlcgrids
+    return grids
+
+def _vv10_hess_data(mf, mol, dm0, max_memory, grids=None):
+    '''The _VV10HessData of mf for the density dm0 on grids (mf.nlcgrids by default), from
+    grids._vv10_hess_data when it matches'''
+    if grids is None:
+        grids = mf.nlcgrids
     if grids.coords is None:
         grids.build(with_non0tab=True)
     if numint.libxc.is_nlc(mf.xc):
@@ -1132,7 +1143,7 @@ def _vv10_hess_data(mf, mol, dm0, max_memory):
     data = getattr(grids, '_vv10_hess_data', None)
     if data is None or not data.matches(mol, grids, dm0, nlc_pars):
         grids._vv10_hess_data = None  # releases the old arrays first
-        data = grids._vv10_hess_data = _VV10HessData(mf, mol, dm0, nlc_pars, max_memory)
+        data = grids._vv10_hess_data = _VV10HessData(mf, mol, dm0, nlc_pars, max_memory, grids)
     return data
 
 def _vv10_rho(ni, mol, grids, dms, hermi, max_memory, fused=None):
@@ -1712,7 +1723,7 @@ def get_vnlc_resp1(mf, mol, dm0, dm1s, max_memory, out=None):
         the calls with the same dm0. With out (an array of the shape of dm1s), the matrices are added
         to it and it is returned: a batch of them is held at a time, not all.
 
-        TODO: check the effect of different grid, using mf.nlcgrids right now
+        On mf.second_nlcgrids if set (KohnShamDFT.set_second_nlcgrids), otherwise mf.nlcgrids.
     """
     output_in_2d = False
     if dm1s.ndim == 2:
@@ -1721,8 +1732,8 @@ def get_vnlc_resp1(mf, mol, dm0, dm1s, max_memory, out=None):
         output_in_2d = True
     assert dm1s.ndim == 3
 
-    vv = _vv10_hess_data(mf, mol, dm0, max_memory)
-    grids = mf.nlcgrids
+    grids = _vv10_response_grids(mf)
+    vv = _vv10_hess_data(mf, mol, dm0, max_memory, grids)
     ni = mf._numint
     nao = mol.nao
     n_dm1 = dm1s.shape[0]
@@ -1783,7 +1794,8 @@ def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out):
     """
         out[k] += P^T v[k] Q (P = mo_coeff, Q the occupied orbitals) for the VV10 responses v[k] that
         get_vnlc_resp gives for the symmetric dms a[k] Q^T + Q a[k]^T, a[nset,nao,nocc], from these
-        factors. Returns out; None, out untouched, if the fused kernels do not apply to mf.nlcgrids.
+        factors. Returns out; None, out untouched, if the fused kernels do not apply to the grids of
+        the VV10 response (mf.second_nlcgrids if set, otherwise mf.nlcgrids).
 
         Neither the dms nor the v[k] exist in the AO basis. The pair kernel goes through all pairs of
         points once per call, so a group of dms is as large as its data on the points of the mask allow
@@ -1791,14 +1803,16 @@ def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out):
         by blocks of points, and the matrices by batches of dms that keep the partial sums of the fused
         kernels within a quarter of max_memory.
     """
-    grids = mf.nlcgrids
+    grids = _vv10_response_grids(mf)
+    if grids.coords is None:
+        grids.build(with_non0tab=True)
     nao = mol.nao
     fused = numint._fused_xc(mf._numint, mol, grids, nao, 'GGA', max_memory, (),
                              match_block_loop=False, radial_cache=False)
     if fused is None:
         return None
     mocc = mo_coeff[:,mo_occ>0]
-    vv = _vv10_hess_data(mf, mol, (mocc * mo_occ[mo_occ>0]) @ mocc.T, max_memory)
+    vv = _vv10_hess_data(mf, mol, (mocc * mo_occ[mo_occ>0]) @ mocc.T, max_memory, grids)
     mocc = numpy.asarray(mocc, order='C')
     a = numpy.asarray(a, order='C')
     nset, nq = len(a), mocc.shape[1]

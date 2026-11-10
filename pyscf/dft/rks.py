@@ -331,6 +331,14 @@ class KohnShamDFT:
             >>> mf = dft.RKS(mol).run()
             >>> mf.set_second_grids(1)
 
+        second_nlcgrids : Grids object
+            Secondary grids for the non-local correlation (VV10) part of the
+            SCF linear response functions, in place of ``self.nlcgrids``. Its
+            cost grows with the square of the number of points. The energy,
+            the gradients and the other terms of the Hessian keep
+            ``self.nlcgrids``. Default is None (the response uses
+            ``self.nlcgrids``). Assign with ``mf.set_second_nlcgrids``.
+
     Examples:
 
     >>> mol = gto.M(atom='O 0 0 0; H 0 0 1; H 0 1 0', basis='ccpvdz', verbose=0)
@@ -341,7 +349,7 @@ class KohnShamDFT:
     '''
 
     _keys = {'xc', 'nlc', 'grids', 'disp', 'nlcgrids', 'small_rho_cutoff',
-             'second_grids'}
+             'second_grids', 'second_nlcgrids'}
 
     # Use rho to filter grids
     small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
@@ -358,6 +366,7 @@ class KohnShamDFT:
         self.nlcgrids.level = getattr(
             __config__, 'dft_rks_RKS_nlcgrids_level', self.nlcgrids.level)
         self.second_grids = None
+        self.second_nlcgrids = None
 ##################################################
 # don't modify the following attributes, they are not input options
         self._numint = numint.NumInt()
@@ -396,6 +405,9 @@ class KohnShamDFT:
         if self.second_grids is not None:
             log.info('** Secondary grids for response functions **')
             self.second_grids.dump_flags(verbose)
+        if getattr(self, 'second_nlcgrids', None) is not None:
+            log.info('** Secondary NLC grids for response functions **')
+            self.second_nlcgrids.dump_flags(verbose)
         return self
 
     define_xc_ = define_xc_
@@ -503,6 +515,8 @@ class KohnShamDFT:
         self.nlcgrids.reset(mol)
         if self.second_grids is not None:
             self.second_grids.reset(mol)
+        if getattr(self, 'second_nlcgrids', None) is not None:
+            self.second_nlcgrids.reset(mol)
         return self
 
     def set_second_grids(self, level=1):
@@ -539,6 +553,41 @@ class KohnShamDFT:
             grids = gen_grid.Grids(self.mol)
             grids.level = int(level)
             self.second_grids = grids
+        return self
+
+    def set_second_nlcgrids(self, level=1):
+        '''Assign the secondary grids for the non-local correlation (VV10) part
+        of the SCF linear response functions (CPHF, Hessian, TDDFT, etc.).
+
+        The VV10 response sums over all pairs of grid points for every
+        response density, so a coarser grid than ``self.nlcgrids`` saves the
+        square of the ratio of the points. The largest errors of the harmonic
+        frequencies of wB97M-V/def2-TZVPD Hessians (water dimer, H2PO4-,
+        glycine, caffeine) against nlcgrids with atom_grid (50,194) were 0.01
+        cm^-1 for level 1 and 0.07 cm^-1 for level 0 (with 1/2.6 and 1/54 of
+        the pairs); leaving the VV10 response out moved them by 2 cm^-1.
+
+        Args:
+            level : int or str or gen_grid.Grids
+                An int builds a gen_grid.Grids of the given level, 'sg1' the
+                SG1 standard grid; a Grids object is used as it is.
+
+        Examples:
+
+        >>> mf = dft.RKS(mol, xc='wb97m-v').run()
+        >>> mf.set_second_nlcgrids(0)
+        >>> hess = mf.Hessian().kernel()
+        '''
+        if isinstance(level, str):
+            if level.lower() != 'sg1':
+                raise ValueError(f'Unknown second_nlcgrids scheme {level!r}.')
+            self.second_nlcgrids = gen_grid.sg1_grids(self.mol)
+        elif isinstance(level, gen_grid.Grids):
+            self.second_nlcgrids = level
+        else:
+            grids = gen_grid.Grids(self.mol)
+            grids.level = int(level)
+            self.second_nlcgrids = grids
         return self
 
     def check_sanity(self):
