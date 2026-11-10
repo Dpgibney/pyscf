@@ -207,6 +207,45 @@ class KnownValues(unittest.TestCase):
             self.assertTrue(used and all(used), xc)
             self.assertLess(abs(h - ref).max(), 1e-10, xc)
 
+    def test_default_solver(self):
+        # cphf.solve_residual to 1e-4 is the default: the Hessian is 5.6e-8 from the converged one, the Krylov
+        # solver's at the default conv_tol_cpscf 7.5e-6
+        from pyscf.eph import rhf as eph_rhf, uhf as eph_uhf, rks as eph_rks, uks as eph_uks
+        self.assertEqual(rhf_hess.HessianBase.cphf_residual_tol, 1e-4)
+        calls = []
+        solve_residual = cphf.solve_residual
+        def counted(*args, **kwargs):
+            calls.append(kwargs.get('tol'))
+            return solve_residual(*args, **kwargs)
+        with mock.patch.object(cphf, 'solve_residual', counted):
+            h = mf.Hessian().kernel()
+        self.assertEqual(calls, [1e-4])
+        self.assertLess(abs(h - h_ref).max(), 2e-7)
+        hobj = mf.Hessian()
+        hobj.cphf_residual_tol = None
+        with mock.patch.object(cphf, 'solve_residual', side_effect=AssertionError):
+            h = hobj.kernel()
+        self.assertLess(abs(h - h_ref).max(), 1e-4)
+        # a conv_tol_cpscf of the user is not used by the default solver: said so, once per solve
+        mf1 = mf.copy()
+        mf1.conv_tol_cpscf = 1e-10
+        for tol, warned in ((1e-4, True), (None, False)):
+            hobj = mf1.Hessian()
+            hobj.cphf_residual_tol = tol
+            with mock.patch.object(rhf_hess.logger, 'warn') as warn:
+                self.assertEqual(rhf_hess._cphf_residual_tol(hobj), tol)
+            self.assertEqual(warn.called, warned)
+        with mock.patch.object(rhf_hess.logger, 'warn') as warn:
+            self.assertEqual(rhf_hess._cphf_residual_tol(mf.Hessian()), 1e-4)
+            hobj = mf.Hessian()
+            hobj.cphf_residual_tol = None
+            hobj.sgx_response = True
+            self.assertEqual(rhf_hess._cphf_residual_tol(hobj), rhf_hess.SGX_RESPONSE_RESIDUAL_TOL)
+        self.assertFalse(warn.called)
+        # the electron-phonon matrix is linear in the solution: its classes keep cphf.solve
+        for mod in (eph_rhf, eph_uhf, eph_rks, eph_uks):
+            self.assertIsNone(mod.EPH.cphf_residual_tol)
+
     def test_sgx_response_rhf(self):
         mf1 = scf.RHF(mol)
         mf1.conv_tol = 1e-11

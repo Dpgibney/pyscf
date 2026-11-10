@@ -52,9 +52,25 @@ JK_ENERGY_DOT = getattr(__config__, 'hessian_rhf_jk_energy_dot', True)
 # The screening threshold of make_h1's int2e_ip1 J/K (_make_h1_vhfopt); 0 computes every quartet, as without a
 # vhfopt
 MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-14)
-# cphf.solve_residual's tol under HessianBase.sgx_response. cphf.solve is not used with SGX's K: its Krylov vectors
-# shrink below what SGX's absolute thresholds resolve (propane: 42 response calls instead of 5, or stopping short)
+# cphf.solve_residual's tol under HessianBase.sgx_response when cphf_residual_tol is None. cphf.solve is not used with
+# SGX's K: its Krylov vectors shrink below what SGX's absolute thresholds resolve (propane: 42 response calls instead
+# of 5, or stopping short)
 SGX_RESPONSE_RESIDUAL_TOL = 1e-4
+
+
+def _cphf_residual_tol(hessobj):
+    '''The tol of cphf.solve_residual for a Hessian object, or None for cphf.solve: its cphf_residual_tol, and
+    SGX_RESPONSE_RESIDUAL_TOL if that is None under sgx_response'''
+    tol = hessobj.cphf_residual_tol
+    if tol is None and hessobj.sgx_response:
+        tol = SGX_RESPONSE_RESIDUAL_TOL
+    mf = hessobj.base
+    if tol is not None and getattr(mf, 'conv_tol_cpscf', None) != getattr(type(mf), 'conv_tol_cpscf', None):
+        logger.warn(hessobj, 'conv_tol_cpscf = %g of the SCF object is not used: the CPHF equations are solved '
+                    'until their residuals are below cphf_residual_tol = %g of the Hessian object. '
+                    'cphf_residual_tol = None restores cphf.solve and conv_tol_cpscf.',
+                    mf.conv_tol_cpscf, tol)
+    return tol
 
 
 def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
@@ -547,7 +563,8 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
             See also the function gen_vind.
         residual_tol : float
             If set, solve with cphf.solve_residual to this tolerance, otherwise
-            with cphf.solve to mf.conv_tol_cpscf
+            with cphf.solve to mf.conv_tol_cpscf. Hessian objects pass their
+            cphf_residual_tol (1e-4 by default)
         scale_trials : bool
             scale_trials of cphf.solve_residual
         h1occ : array [natm,3,nao,nocc]
@@ -793,9 +810,17 @@ class HessianBase(lib.StreamObject):
     # region of the response densities of the nuclei and cost a few tenths of a
     # cm^-1.
     sgx_response_auxbasis = None
-    # None: cphf.solve to mf.conv_tol_cpscf, unless sgx_response, which needs
-    # SGX_RESPONSE_RESIDUAL_TOL. A number: cphf.solve_residual with that tol
-    cphf_residual_tol = None
+    # The CPHF equations are solved by cphf.solve_residual until the true
+    # (preconditioned) residual of every perturbation is below this. The error
+    # of the Hessian goes as its square: about 1e-8 for 1e-4. None: PySCF's
+    # Krylov solver, cphf.solve, to mf.conv_tol_cpscf (SGX_RESPONSE_RESIDUAL_TOL
+    # under sgx_response). That one stops on the size of its Krylov vectors,
+    # for DFT well short of a converged solution at the default conv_tol_cpscf:
+    # 0.003 to 0.05 cm^-1 in the frequencies of RKS Hessians, 1.2 cm^-1 (2e-4 in
+    # the Hessian) for a UKS/B3LYP radical, for the same number of response
+    # calls. Quantities linear in the CPHF solution need a tighter tol than
+    # the Hessian does (pyscf.eph keeps cphf.solve).
+    cphf_residual_tol = 1e-4
 
     _keys = {
         'mol', 'base', 'atmlst', 'de', 'max_cycle', 'level_shift',
@@ -891,15 +916,13 @@ class HessianBase(lib.StreamObject):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None, h1occ=None):
-        residual_tol = self.cphf_residual_tol
+        residual_tol = _cphf_residual_tol(self)
         # Direct SCF's integrals skip more for the smaller trial vectors of the
         # later cycles. SGX's K, with its absolute thresholds, needs them at
         # unit size, and density fitting has no such screening to gain from.
         scale_trials = (fx is None and not self.sgx_response
                         and not getattr(self.base, 'with_df', None))
         if self.sgx_response:
-            if residual_tol is None:
-                residual_tol = SGX_RESPONSE_RESIDUAL_TOL
             if fx is None:
                 fx = gen_vind(_sgx_response_scf(self.base, self.sgx_response_level,
                                                 self.sgx_response_auxbasis),

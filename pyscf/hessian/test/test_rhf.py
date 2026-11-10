@@ -42,13 +42,17 @@ def tearDownModule():
 
 class KnownValues(unittest.TestCase):
     def test_cphf_iterations_are_logged(self):
-        # solve_mo1 passes the Hessian's logger to the CPHF solver, so its Krylov cycles reach the Hessian's stdout
+        # solve_mo1 passes the Hessian's logger to the CPHF solver, so its cycles reach the Hessian's stdout:
+        # cphf.solve_residual's by default, the Krylov solver's with cphf_residual_tol = None
         mf = scf.RHF(mol).run()
-        hobj = mf.Hessian()
-        hobj.verbose = 5
-        hobj.stdout = io.StringIO()
-        hobj.kernel()
-        self.assertIn('krylov cycle', hobj.stdout.getvalue())
+        for tol, line in ((1e-4, 'CPHF cycle'), (None, 'krylov cycle')):
+            hobj = mf.Hessian()
+            self.assertEqual(hobj.cphf_residual_tol, 1e-4)
+            hobj.cphf_residual_tol = tol
+            hobj.verbose = 5
+            hobj.stdout = io.StringIO()
+            hobj.kernel()
+            self.assertIn(line, hobj.stdout.getvalue())
 
     def test_rhf_hess(self):
         mf = scf.RHF(mol)

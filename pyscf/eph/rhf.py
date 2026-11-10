@@ -195,6 +195,10 @@ class EPH(rhf.Hessian):
             Electron phonon matrix eph[j,a,b] (j in nmodes, a,b in norbs)
     '''
 
+    # The electron-phonon matrix is linear in the CPHF solution: PySCF's solver
+    # to mf.conv_tol_cpscf, as before, not the Hessian's residual tolerance
+    cphf_residual_tol = None
+
     def __init__(self, scf_method, cutoff_frequency=CUTOFF_FREQUENCY,
                  keep_imag_frequency=KEEP_IMAG_FREQUENCY):
         rhf.Hessian.__init__(self, scf_method)

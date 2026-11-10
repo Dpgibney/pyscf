@@ -373,12 +373,10 @@ class Hessian(rhf_hess.HessianBase):
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
         # as rhf.HessianBase.solve_mo1
-        residual_tol = self.cphf_residual_tol
+        residual_tol = rhf_hess._cphf_residual_tol(self)
         scale_trials = (fx is None and not self.sgx_response
                         and not getattr(self.base, 'with_df', None))
         if self.sgx_response:
-            if residual_tol is None:
-                residual_tol = rhf_hess.SGX_RESPONSE_RESIDUAL_TOL
             if fx is None:
                 fx = gen_vind(rhf_hess._sgx_response_scf(self.base, self.sgx_response_level,
                                                          self.sgx_response_auxbasis),
