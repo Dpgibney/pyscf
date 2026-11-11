@@ -72,6 +72,7 @@ typedef struct {
 
 // out[chunk_size] = the sum of the chunks' buffers (if chunk_size > 0)
 void CVHFoe_run(OEDriver *d, double *out);
+void CVHFoe_progress(int *done_total);
 
 /*
  * Helpers of the clients: the shell orders of an orbit's integrals, and Gamma

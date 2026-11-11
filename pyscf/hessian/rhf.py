@@ -406,13 +406,17 @@ def hess_jk_energy(mol, dm_j, dms_k, k_fac, tol=None, stats=None, verbose=None):
                                      for intor in intors])
     c_cintopts = (ctypes.c_void_p*3)(*[opt.value for opt in cintopts])
     c_stats = numpy.zeros(4)
-    libcvhf.CVHFhess_jk_energy(
-        ej.ctypes if dmj is not None else lib.c_null_ptr(), ek.ctypes if nk else lib.c_null_ptr(),
-        c_intors, c_cintopts, q_cond.ctypes, dm_cond.ctypes, ctypes.c_double(tol),
-        lib.c_null_ptr() if dmj is None else dmj.ctypes, dmk.ctypes, ctypes.c_int(nk),
-        ctypes.c_double(k_fac), ctypes.c_size_t(int(JK_ENERGY_BUF * 1e6 / 8)), c_stats.ctypes,
-        ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
-        c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
+    label = 'two-electron second derivatives, %s%s' % (
+        ' and '.join(x for x, f in (('J', dmj is not None), ('K', nk)) if f),
+        ' (long range)' if mol.omega else '')
+    with _vhf.oe_progress(log, label):
+        libcvhf.CVHFhess_jk_energy(
+            ej.ctypes if dmj is not None else lib.c_null_ptr(), ek.ctypes if nk else lib.c_null_ptr(),
+            c_intors, c_cintopts, q_cond.ctypes, dm_cond.ctypes, ctypes.c_double(tol),
+            lib.c_null_ptr() if dmj is None else dmj.ctypes, dmk.ctypes, ctypes.c_int(nk),
+            ctypes.c_double(k_fac), ctypes.c_size_t(int(JK_ENERGY_BUF * 1e6 / 8)), c_stats.ctypes,
+            ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+            c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
     log.debug1('hess_jk_energy: %d shell quartet orbits, %d integral evaluations '
                '(%d cross-atom centre pairs), %d orbits batched', *c_stats)
     if stats is not None:

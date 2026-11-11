@@ -285,14 +285,18 @@ def jk_energy_per_atom(mol, dm, j_factor=1., k_factor=1., omega=None, screen=Non
         vhfopt.set_dm(dm, mol._atm, mol._bas, mol._env)
         intor = mol._add_suffix('int2e_ip1')
         ao_loc = _vhf.make_loc(mol._bas, intor)
-        _vhf.libcvhf.CVHFgrad_jk_energy_mode(
-            de.ctypes, getattr(_vhf.libcvhf, intor), vhfopt._cintopt, ctypes.byref(vhfopt._this),
-            dmj.ctypes, dmk.ctypes, ctypes.c_int(len(dmk)),
-            ctypes.c_double(j_factor), ctypes.c_double(ck),
-            ctypes.c_int('j' in screen), ctypes.c_int('k' in screen), lib.c_null_ptr(),
-            ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
-            mol._atm.ctypes, ctypes.c_int(mol.natm),
-            mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
+        label = 'two-electron gradient, %s%s' % (
+            ' and '.join(x for x, f in (('J', j_factor), ('K', k_factor)) if f != 0),
+            ' (long range)' if omega else '')
+        with _vhf.oe_progress(logger.new_logger(mol), label):
+            _vhf.libcvhf.CVHFgrad_jk_energy_mode(
+                de.ctypes, getattr(_vhf.libcvhf, intor), vhfopt._cintopt, ctypes.byref(vhfopt._this),
+                dmj.ctypes, dmk.ctypes, ctypes.c_int(len(dmk)),
+                ctypes.c_double(j_factor), ctypes.c_double(ck),
+                ctypes.c_int('j' in screen), ctypes.c_int('k' in screen), lib.c_null_ptr(),
+                ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+                mol._atm.ctypes, ctypes.c_int(mol.natm),
+                mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
     return de
 
 def get_veff(mf_grad, mol, dm):

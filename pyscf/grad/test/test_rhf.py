@@ -41,6 +41,35 @@ def tearDownModule():
     del mol
 
 class KnownValues(unittest.TestCase):
+    def test_oe_progress(self):
+        # the progress of the energy-type two-electron drivers, read by a thread
+        import io, ctypes
+        from pyscf.scf import _vhf
+        from pyscf.grad import rhf as rhf_grad
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='ccpvdz', verbose=4,
+                     output='/dev/null')
+        dm = scf.hf.init_guess_by_minao(mol1)
+        de = rhf_grad.jk_energy_per_atom(mol1, dm)
+        buf = (ctypes.c_int * 2)()
+        _vhf.libcvhf.CVHFoe_progress(buf)
+        self.assertGreater(buf[1], 0)
+        self.assertEqual(buf[0], buf[1])
+        # lines once a call has run for `after` seconds, none for a short one
+        out = io.StringIO()
+        log = lib.logger.Logger(out, 4)
+        with _vhf.oe_progress(log, 'test', after=0., poll=.01) as p:
+            import time
+            time.sleep(.1)
+        self.assertTrue(p.printed)
+        self.assertIn('test: 100% of the shell-pair chunks', out.getvalue())
+        self.assertIn('test: done in', out.getvalue())
+        out = io.StringIO()
+        with _vhf.oe_progress(lib.logger.Logger(out, 4), 'test'):
+            de1 = rhf_grad.jk_energy_per_atom(mol1, dm)
+        self.assertEqual(out.getvalue(), '')
+        self.assertAlmostEqual(abs(de1 - de).max(), 0, 12)
+        mol1.stdout.close()
+
     def test_rhf_grad_one_atom(self):
         mol = gto.Mole()
         mol.verbose = 0

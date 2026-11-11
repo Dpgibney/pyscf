@@ -18,11 +18,67 @@ import ctypes
 import weakref
 import numpy
 from pyscf import lib
+from pyscf.lib import logger
 from pyscf import gto
 from pyscf import __config__
 from pyscf.gto.moleintor import make_cintopt, make_loc, ascint3
 
 libcvhf = lib.load_library('libcvhf')
+
+class oe_progress:
+    '''Around a call into the energy-type drivers of libcvhf (orbit_engine.c:
+    the two-electron parts of gradients and Hessians, one call for all shell
+    quartets): a line at every `step` percent of the call's chunks of shell
+    pairs once it has run for `after` seconds, written by a thread while the
+    call, which releases the interpreter lock, runs. Short calls print
+    nothing.
+
+    >>> with oe_progress(log, 'two-electron gradient, J and K'):
+    ...     libcvhf.CVHFgrad_jk_energy_mode(...)
+    '''
+    def __init__(self, log, label, after=30., step=10, poll=2.):
+        self.log = log
+        self.label = label
+        self.after = after
+        self.step = step
+        self.poll = poll
+        self.printed = False
+
+    def _run(self):
+        import time
+        buf = (ctypes.c_int * 2)()
+        nxt = self.step
+        while not self._stop.wait(self.poll):
+            dt = time.perf_counter() - self._t0
+            if dt < self.after:
+                continue
+            libcvhf.CVHFoe_progress(buf)
+            if buf[1] <= 0:
+                continue
+            pct = 100. * buf[0] / buf[1]
+            if pct >= nxt or not self.printed:
+                self.log.info('    %s: %d%% of the shell-pair chunks after %d s',
+                              self.label, pct, dt)
+                self.printed = True
+                nxt = (int(pct) // self.step + 1) * self.step
+
+    def __enter__(self):
+        import threading, time
+        self._t0 = time.perf_counter()
+        self._thread = None
+        if hasattr(libcvhf, 'CVHFoe_progress') and self.log.verbose >= logger.INFO:
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        import time
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+            if self.printed:
+                self.log.info('    %s: done in %d s', self.label, time.perf_counter() - self._t0)
 
 def _fpointer(name):
     return ctypes.cast(getattr(libcvhf, name), ctypes.c_void_p)

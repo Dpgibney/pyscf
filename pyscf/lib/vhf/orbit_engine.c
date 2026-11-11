@@ -103,6 +103,19 @@ static void _queue(OEDriver *d, void *th, double *acc, OETable *tb, uint64_t key
         }
 }
 
+/*
+ * The progress of the run in flight, for a caller's other thread: the chunks of
+ * shell pairs done and all of them (0, 0 before the first run).
+ */
+static volatile int _oe_done = 0;
+static volatile int _oe_total = 0;
+
+void CVHFoe_progress(int *done_total)
+{
+        done_total[0] = _oe_done;
+        done_total[1] = _oe_total;
+}
+
 void CVHFoe_run(OEDriver *d, double *out)
 {
         const int nbas = d->nbas;
@@ -164,6 +177,8 @@ void CVHFoe_run(OEDriver *d, double *out)
         while ((1 << bits) < d->qcap) {
                 bits++;
         }
+        _oe_done = 0;
+        _oe_total = nchunk;
 
 #pragma omp parallel
 {
@@ -204,6 +219,8 @@ void CVHFoe_run(OEDriver *d, double *out)
                 if (d->lanes) {
                         _flush_all(d, th, acc, &tb);
                 }
+#pragma omp atomic
+                _oe_done++;
         }
         if (d->lanes) {
                 free(tb.key);
