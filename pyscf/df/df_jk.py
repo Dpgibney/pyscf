@@ -461,6 +461,47 @@ def _split_contractions(bas, env):
     return numpy.asarray(out, dtype=numpy.int32).reshape(-1, 8)
 
 
+def _rij_drv(npass, out, dm, cfit, pairs, qpair, cutoff, ao_loc, atm, bas, env,
+             auxatm, auxbas, auxenv, aux_loc, qaux, c2s, c2s_off):
+    '''RIJdrv of rij_engine.c: pass 1, out[naux] = sum_ab D_ab (ab|P) of the
+    symmetric dm (Cartesian AOs), or pass 2, out[nao_cart,nao_cart] = sum_P
+    (ab|P) cfit_P, over the shell pairs (ish >= jsh) with the weights qpair;
+    qaux weighs the auxiliary shells (see rij_engine.c). The shells have one
+    contraction each.'''
+    from pyscf.scf import _vhf
+    order = numpy.asarray(numpy.argsort(-qaux, kind='stable'), dtype=numpy.int32)
+    qaux = numpy.ascontiguousarray(qaux)
+    _vhf.libcvhf.RIJdrv.restype = ctypes.c_int
+    err = _vhf.libcvhf.RIJdrv(
+        ctypes.c_int(npass), out.ctypes.data_as(ctypes.c_void_p),
+        dm.ctypes.data_as(ctypes.c_void_p) if dm is not None else None,
+        cfit.ctypes.data_as(ctypes.c_void_p) if cfit is not None else None,
+        pairs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pairs.shape[0]),
+        qpair.ctypes.data_as(ctypes.c_void_p), ctypes.c_double(cutoff),
+        ao_loc.ctypes.data_as(ctypes.c_void_p),
+        atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(atm.shape[0]),
+        bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(bas.shape[0]),
+        env.ctypes.data_as(ctypes.c_void_p),
+        auxatm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(auxatm.shape[0]),
+        auxbas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(auxbas.shape[0]),
+        auxenv.ctypes.data_as(ctypes.c_void_p),
+        aux_loc.ctypes.data_as(ctypes.c_void_p),
+        qaux.ctypes.data_as(ctypes.c_void_p), order.ctypes.data_as(ctypes.c_void_p),
+        c2s.ctypes.data_as(ctypes.c_void_p), c2s_off.ctypes.data_as(ctypes.c_void_p))
+    if err != 0:
+        raise NotImplementedError('angular momentum beyond the J-engine')
+    return out
+
+
+def _rij_engine_data(dfobj, mol, auxmol, direct_scf_tol):
+    '''The J-engine's data of dfobj for mol and auxmol: those it keeps, if
+    they are of this molecule and auxiliary basis, or new ones'''
+    data = getattr(dfobj, '_rij_engine', None)
+    if data is not None and data.matches(mol, auxmol, data.direct_scf_tol):
+        return data
+    return _RIJEngineData(mol, auxmol, direct_scf_tol)
+
+
 class _RIJEngineData:
     '''What the J-engine (rij_engine.c) keeps for a molecule and auxiliary basis'''
     def __init__(self, mol, auxmol, direct_scf_tol):
@@ -529,29 +570,9 @@ class _RIJEngineData:
                 and numpy.array_equal(bas, mol._bas) and numpy.array_equal(env, mol._env))
 
     def drv(self, npass, out, dm, cfit, qaux):
-        from pyscf.scf import _vhf
-        order = numpy.asarray(numpy.argsort(-qaux, kind='stable'), dtype=numpy.int32)
-        qaux = numpy.ascontiguousarray(qaux)
-        _vhf.libcvhf.RIJdrv.restype = ctypes.c_int
-        err = _vhf.libcvhf.RIJdrv(
-            ctypes.c_int(npass), out.ctypes.data_as(ctypes.c_void_p),
-            dm.ctypes.data_as(ctypes.c_void_p) if dm is not None else None,
-            cfit.ctypes.data_as(ctypes.c_void_p) if cfit is not None else None,
-            self.pairs.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.pairs.shape[0]),
-            self.qpair.ctypes.data_as(ctypes.c_void_p), ctypes.c_double(self.direct_scf_tol),
-            self.ao_loc.ctypes.data_as(ctypes.c_void_p),
-            self.atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.atm.shape[0]),
-            self.bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.bas.shape[0]),
-            self.env.ctypes.data_as(ctypes.c_void_p),
-            self.auxatm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxatm.shape[0]),
-            self.auxbas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.auxbas.shape[0]),
-            self.auxenv.ctypes.data_as(ctypes.c_void_p),
-            self.aux_loc.ctypes.data_as(ctypes.c_void_p),
-            qaux.ctypes.data_as(ctypes.c_void_p), order.ctypes.data_as(ctypes.c_void_p),
-            self.c2s.ctypes.data_as(ctypes.c_void_p), self.c2s_off.ctypes.data_as(ctypes.c_void_p))
-        if err != 0:
-            raise NotImplementedError('angular momentum beyond the J-engine')
-        return out
+        return _rij_drv(npass, out, dm, cfit, self.pairs, self.qpair, self.direct_scf_tol,
+                        self.ao_loc, self.atm, self.bas, self.env, self.auxatm, self.auxbas,
+                        self.auxenv, self.aux_loc, qaux, self.c2s, self.c2s_off)
 
     def drv_many(self, npass, out, dms, cfit, qaux):
         '''RIJdrv for all the density matrices dms[nset] (pass 1) or fitted

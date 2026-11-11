@@ -240,6 +240,214 @@ def get_jk(mf_grad, mol=None, dm=None, hermi=0, with_j=True, with_k=True,
     if with_j: return vj, vk
     else: return None, vk
 
+def _fac_sp(l):
+    # libcint's factor of the Cartesian s and p functions
+    return (0.282094791773878143, 0.488602511902919921)[l] if l < 2 else 1.
+
+def _cart_powers(l):
+    '''(lx, ly, lz) of the Cartesian functions of l in libcint's order'''
+    return [(lx, ly, l-lx-ly) for lx in range(l, -1, -1) for ly in range(l-lx, -1, -1)]
+
+def _cart_index(lx, ly, lz):
+    n = ly + lz
+    return n * (n + 1) // 2 + lz
+
+def _rij_deriv_ao_shells(bas, env):
+    '''The shells that make the derivatives of the Cartesian functions of bas
+    (one contraction each): d/dx x^a y^b z^c exp(-e r^2) = a x^(a-1) ... - 2e
+    x^(a+1) ..., so after the nb shells of bas come the shell of l+1 of each
+    with the coefficients -2 e c, then the shells of l-1 with c (for l > 0).
+
+    Returns bas, env, and for each Cartesian function of bas and direction
+    the function of the l+1 shell, that of the l-1 shell and its factor a
+    (0, 0 where a = 0), as indices of the Cartesian functions of the new bas.
+    '''
+    nb = len(bas)
+    up = bas.copy()
+    down = []
+    down_of = numpy.full(nb, -1)
+    envs = [env]
+    off = env.size
+    for s in range(nb):
+        l, nprim, pexp, pcoef = bas[s,1], bas[s,2], bas[s,5], bas[s,6]
+        e = env[pexp:pexp+nprim]
+        c = env[pcoef:pcoef+nprim]
+        up[s,1] = l + 1
+        up[s,6] = off
+        envs.append(-2 * e * c * (_fac_sp(l) / _fac_sp(l+1)))
+        off += nprim
+        if l > 0:
+            b = bas[s].copy()
+            b[1] = l - 1
+            b[6] = off
+            envs.append(c * (_fac_sp(l) / _fac_sp(l-1)))
+            off += nprim
+            down_of[s] = 2 * nb + len(down)
+            down.append(b)
+    bas1 = numpy.asarray(numpy.vstack([bas, up] + down), dtype=numpy.int32, order='C')
+    env1 = numpy.hstack(envs)
+    loc = gto.moleintor.make_loc(bas1, 'cart')
+    nao = loc[nb]
+    idx_up = numpy.zeros((nao, 3), dtype=int)
+    idx_down = numpy.zeros((nao, 3), dtype=int)
+    fac_down = numpy.zeros((nao, 3))
+    for s in range(nb):
+        l = bas[s,1]
+        for k, pw in enumerate(_cart_powers(l)):
+            for x in range(3):
+                q = list(pw)
+                q[x] += 1
+                idx_up[loc[s]+k,x] = loc[nb+s] + _cart_index(*q)
+                if pw[x] > 0:
+                    q[x] -= 2
+                    idx_down[loc[s]+k,x] = loc[down_of[s]] + _cart_index(*q)
+                    fac_down[loc[s]+k,x] = pw[x]
+    return bas1, env1, idx_up, idx_down, fac_down
+
+def _rij_deriv_aux_shells(auxbas, auxenv, c2s, c2s_off):
+    '''The auxiliary shells whose Hermite components of order l+1 the J-engine
+    turns into the derivatives of the functions of auxbas with respect to
+    their center: a spherical function of l is S_lm(d/dC) exp(-g r^2) (2g)^-l,
+    so its derivative along x has the Hermite components of order l+1 that
+    are those of the function moved one step along x. Returns the shells with
+    l+1 for l (and the coefficients that keep the prefactor of l), their env,
+    and for x, y, z the tables that stand for c2s: for l+1, the 2l+1
+    derivatives in the first 2l+1 of the 2l+3 columns.
+    '''
+    bas1 = auxbas.copy()
+    envs = [auxenv]
+    off = auxenv.size
+    for s in range(len(auxbas)):
+        l, nprim, pexp, pcoef = auxbas[s,1], auxbas[s,2], auxbas[s,5], auxbas[s,6]
+        e = auxenv[pexp:pexp+nprim]
+        c = auxenv[pcoef:pcoef+nprim]
+        bas1[s,1] = l + 1
+        bas1[s,6] = off
+        envs.append(2 * e * c * (_fac_sp(l) / _fac_sp(l+1)))
+        off += nprim
+    lmax = int(auxbas[:,1].max())
+    tables = []
+    for x in range(3):
+        tabs = [numpy.zeros(1)]
+        for l in range(lmax + 1):
+            ncart = (l + 1) * (l + 2) // 2
+            c = c2s[c2s_off[l]:c2s_off[l]+ncart*(2*l+1)].reshape(ncart, 2*l+1)
+            t = numpy.zeros(((l + 2) * (l + 3) // 2, 2*l+3))
+            for k, pw in enumerate(_cart_powers(l)):
+                q = list(pw)
+                q[x] += 1
+                t[_cart_index(*q),:2*l+1] = c[k]
+            tabs.append(t.ravel())
+        offs = numpy.cumsum([0] + [t.size for t in tabs[:-1]]).astype(numpy.int32)
+        tables.append((numpy.hstack(tabs), offs))
+    return numpy.asarray(bas1, dtype=numpy.int32, order='C'), numpy.hstack(envs), tables
+
+def _get_j_engine(mf_grad, mol, auxmol, dm):
+    '''get_j by the J-engine of df_jk (rij_engine.c), which has no derivative
+    integrals: the derivative of an AO is a combination of the functions of
+    two shells, of l+1 and l-1, and that of an auxiliary function a function
+    whose Hermite components are of order l+1. So
+
+    * (d/dX i j|P) rho_P is the J matrix of the fitted density between the
+      derivative shells and the shells of mol (pass 2 on those pairs),
+    * D_ij (ij|d/dX P) is the pass over the AO pairs of the density (pass 1)
+      with the auxiliary shells of order l+1, once for x, y and z,
+
+    without a (ij|P) array, in place of three passes of libcint's integrals.
+    The numbers are those of get_j to the thresholds of the engine.
+    '''
+    from pyscf.scf import _vhf
+    dfobj = mf_grad.base.with_df
+    tol = getattr(mf_grad.base, 'direct_scf_tol', 1e-13)
+    data = df_jk._rij_engine_data(dfobj, mol, auxmol, tol)
+    cutoff = data.direct_scf_tol
+    nao = mol.nao
+    naux = auxmol.nao
+    dms = numpy.asarray(dm)
+    out_shape = dms.shape[:-2] + (3,) + dms.shape[-2:]
+    dms = dms.reshape(-1,nao,nao)
+    nset = dms.shape[0]
+    c2s = data.c2s_ao
+    nao_cart = data.ao_loc[-1]
+    aux_loc = data.aux_loc
+    nb = len(data.bas)
+
+    # the fitted densities
+    dm_cart = []
+    rhoj = numpy.empty((nset,naux))
+    for i, d in enumerate(dms):
+        d = (d + d.T) * .5
+        d = numpy.ascontiguousarray(lib.ddot(c2s, lib.ddot(d, c2s.T)))
+        dm_cart.append(d)
+        gam = data.drv(1, numpy.empty(naux), d, None, data.qaux)
+        if data.j2c_type == 'cd':
+            rhoj[i] = scipy.linalg.cho_solve(data.j2c, gam)
+        else:
+            rhoj[i] = scipy.linalg.solve(data.j2c, gam)
+
+    # (d/dX i j|P) rho_P
+    bas1, env1, idx_up, idx_down, fac_down = _rij_deriv_ao_shells(data.bas, data.env)
+    loc1 = gto.moleintor.make_loc(bas1, 'cart').astype(numpy.int32)
+    mol1 = mol.copy()
+    mol1._bas = bas1
+    mol1._env = env1
+    mol1.cart = True
+    opt = _vhf._VHFOpt(mol1, 'int2e', 'CVHFnrs8_prescreen', direct_scf_tol=cutoff)
+    opt.init_cvhf_direct(mol1, 'int2e', 'CVHFnr_int2e_q_cond')
+    q_cond = numpy.asarray(opt.q_cond).reshape(len(bas1), len(bas1))[nb:,:nb]
+    opt = None
+    vj = numpy.empty((nset,3,nao,nao))
+    for i in range(nset):
+        rho = numpy.ascontiguousarray(rhoj[i])
+        cmax = numpy.array([abs(rho[i0:i1]).max() for i0, i1 in zip(aux_loc[:-1], aux_loc[1:])])
+        qaux = data.qaux * cmax
+        ish, jsh = numpy.nonzero(q_cond * qaux.max() > cutoff)
+        pairs = numpy.asarray(numpy.vstack((ish + nb, jsh)).T, dtype=numpy.int32, order='C')
+        qpair = numpy.ascontiguousarray(q_cond[ish,jsh])
+        v = df_jk._rij_drv(2, numpy.empty((loc1[-1], loc1[-1])), None, rho, pairs, qpair, cutoff,
+                           loc1, data.atm, bas1, env1, data.auxatm, data.auxbas, data.auxenv,
+                           aux_loc, qaux, data.c2s, data.c2s_off)
+        for x in range(3):
+            vx = v[idx_up[:,x],:nao_cart]
+            vx += fac_down[:,x,None] * v[idx_down[:,x],:nao_cart]
+            vj[i,x] = lib.ddot(c2s.T, lib.ddot(vx, c2s))
+        v = vx = None
+    q_cond = None
+
+    if not mf_grad.auxbasis_response:
+        return -vj.reshape(out_shape)
+
+    # D_ij (ij|d/dX P), the derivative with the center of P
+    auxbas1, auxenv1, tables = _rij_deriv_aux_shells(data.auxbas, data.auxenv, data.c2s, data.c2s_off)
+    aux_loc1 = gto.moleintor.make_loc(auxbas1, 'sph').astype(numpy.int32)
+    aux_idx = numpy.hstack([numpy.arange(p0, p0 + (i1 - i0))
+                            for p0, i0, i1 in zip(aux_loc1[:-1], aux_loc[:-1], aux_loc[1:])])
+    dgam = numpy.empty((nset,3,naux))
+    for i in range(nset):
+        for x in range(3):
+            g = df_jk._rij_drv(1, numpy.empty(aux_loc1[-1]), dm_cart[i], None, data.pairs, data.qpair,
+                               cutoff, data.ao_loc, data.atm, data.bas, data.env, data.auxatm,
+                               auxbas1, auxenv1, aux_loc1, data.qaux, *tables[x])
+            dgam[i,x] = g[aux_idx]
+
+    # (d/dx P|Q) rho_Q, the derivative with the electron of P
+    drho = numpy.empty((nset,3,naux))
+    aux_ao_loc = auxmol.ao_loc
+    blksize = max(1, int(200e6 / (8 * 3 * naux)))
+    for shl0, shl1, nL in balance_partition(aux_ao_loc, blksize):
+        int2c_e1 = auxmol.intor('int2c2e_ip1', shls_slice=(shl0, shl1, 0, auxmol.nbas))
+        p0, p1 = aux_ao_loc[shl0], aux_ao_loc[shl1]
+        drho[:,:,p0:p1] = lib.einsum('xpq,nq->nxp', int2c_e1, rhoj)
+        int2c_e1 = None
+
+    # vjaux[m,n,x,P] = rho_nP D_m,ij (ij|d/dx P) - rho_mP (d/dx P|Q) rho_nQ, d/dx = -d/dX
+    vjaux = -lib.einsum('np,mxp->mnxp', rhoj, dgam)
+    vjaux -= lib.einsum('mp,nxp->mnxp', rhoj, drho)
+    auxslices = auxmol.aoslice_by_atom()
+    vjaux = numpy.array([-vjaux[:,:,:,p0:p1].sum(axis=3) for p0, p1 in auxslices[:,2:]])
+    vjaux = numpy.ascontiguousarray(vjaux.transpose(1,2,0,3))
+    return lib.tag_array(-vj.reshape(out_shape), aux=vjaux)
+
 def get_j(mf_grad, mol=None, dm=None, hermi=0):
     if mol is None: mol = mf_grad.mol
     if dm is None: dm = mf_grad.base.make_rdm1()
@@ -247,6 +455,17 @@ def get_j(mf_grad, mol=None, dm=None, hermi=0):
 
     auxmol = _make_auxmol(mf_grad.base.with_df, mol)
     nbas = mol.nbas
+
+    from pyscf.scf import _vhf
+    if (df_jk.RIJ_ENGINE and hasattr(_vhf.libcvhf, 'RIJdrv') and not mol.cart and not auxmol.cart
+            and mol.omega == 0 and auxmol.omega == 0
+            and getattr(mf_grad.base.with_df, 'omega', None) in (None, 0)):
+        try:
+            vj = _get_j_engine(mf_grad, mol, auxmol, dm)
+            logger.timer(mf_grad, 'df vj (J-engine)', *t0)
+            return vj
+        except NotImplementedError:
+            pass
 
     get_int3c_s2 = _int3c_wrapper(mol, auxmol, 'int3c2e', 's2ij')
     get_int3c_ip1 = _int3c_wrapper(mol, auxmol, 'int3c2e_ip1', 's1')

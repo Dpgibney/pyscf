@@ -73,6 +73,46 @@ class KnownValues(unittest.TestCase):
                   [1   , (0. , 0.757  , 0.587)] ])
         self.assertAlmostEqual((e1-e2)/0.002*lib.param.BOHR, g[0,2], 6)
 
+    def test_get_j_engine(self):
+        # get_j by the J-engine (derivative shells, auxiliary shells of order l+1)
+        # against the passes over libcint's int3c2e_ip1 and int3c2e_ip2
+        from pyscf.df import df_jk
+        from pyscf.df.grad import rhf as df_grad
+        mol1 = gto.M(atom='P 0 0 0.1; O 0 1.2 -0.5; H 0.9 -0.7 -0.6; H -0.9 -0.7 -0.5; F 2.1 0.3 0.4',
+                     basis='def2-tzvp', verbose=0)
+        numpy.random.seed(7)
+        nao = mol1.nao
+        dm = numpy.random.rand(2, nao, nao) * .1
+        dm = dm + dm.transpose(0,2,1)
+        for auxbasis in ('def2-universal-jfit', df.aug_etb(mol1)):
+            mf = dft.UKS(mol1, xc='pbe').density_fit(auxbasis=auxbasis)
+            g = mf.nuc_grad_method()
+            for d in (dm, dm[0]):
+                vj = df_grad.get_j(g, mol1, d)
+                with lib.temporary_env(df_jk, RIJ_ENGINE=False):
+                    ref = df_grad.get_j(g, mol1, d)
+                self.assertEqual(vj.shape, ref.shape)
+                self.assertEqual(vj.aux.shape, ref.aux.shape)
+                self.assertAlmostEqual(abs(vj - ref).max(), 0, 9)
+                # the fit of a random matrix in the nearly dependent even-tempered
+                # basis: the two terms of the auxiliary part cancel to 1e-8 of them
+                self.assertAlmostEqual(abs(vj.aux - ref.aux).max(), 0,
+                                       9 if isinstance(auxbasis, str) else 7)
+            g.auxbasis_response = False
+            vj = df_grad.get_j(g, mol1, dm[0])
+            with lib.temporary_env(df_jk, RIJ_ENGINE=False):
+                ref = df_grad.get_j(g, mol1, dm[0])
+            self.assertFalse(hasattr(vj, 'aux'))
+            self.assertAlmostEqual(abs(vj - ref).max(), 0, 9)
+        # the gradient of a converged RI-J model in the even-tempered basis
+        mf = dft.RKS(mol1, xc='pbe').density_fit(auxbasis=df.aug_etb(mol1))
+        mf.grids.level = 1
+        mf.kernel()
+        de = mf.nuc_grad_method().kernel()
+        with lib.temporary_env(df_jk, RIJ_ENGINE=False):
+            ref = mf.nuc_grad_method().kernel()
+        self.assertAlmostEqual(abs(de - ref).max(), 0, 9)
+
     def test_rks_lda_grad(self):
         gref = mol.RKS(xc='lda,').run().nuc_grad_method().kernel()
         g1 = mol.RKS(xc='lda,').density_fit().run().nuc_grad_method().kernel()
