@@ -23,6 +23,7 @@ from pyscf import lib
 from pyscf.grad import rhf as rhf_grad
 
 from pyscf.solvent import smd
+from pyscf.solvent.pcm import _K_solve
 from pyscf.solvent.grad import pcm as pcm_grad
 from pyscf.lib import logger
 
@@ -30,6 +31,12 @@ def grad_solver(pcmobj, dm):
     '''
     dE = 0.5*v* d(K^-1 R) *v + q*dv
     v^T* d(K^-1 R)v = v^T*K^-1(dR - dK K^-1R)v = v^T K^-1(dR - dK q)
+
+    As the IEF-PCM branch of pcm_grad.grad_solver: the derivatives of S and D
+    are contracted by blocks of rows (pcm_grad._d1_antisym) instead of held as
+    [n,n,3] arrays, which with their temporaries are about 25 [n,n] arrays (45
+    GB for 15000 surface points), and K^-T v comes from the factorization of K
+    that the SCF keeps.
     '''
     mol = pcmobj.mol
     log = logger.new_logger(mol, mol.verbose)
@@ -42,32 +49,30 @@ def grad_solver(pcmobj, dm):
     else:
         pcmobj._get_vind(dm)
 
-    gridslice    = pcmobj.surface['gslice_by_atom']
+    surface      = pcmobj.surface
+    gridslice    = surface['gslice_by_atom']
     v_grids      = pcmobj._intermediates['v_grids']
     A            = pcmobj._intermediates['A']
     D            = pcmobj._intermediates['D']
     S            = pcmobj._intermediates['S']
-    K            = pcmobj._intermediates['K']
     q            = pcmobj._intermediates['q']
 
-    vK_1 = np.linalg.solve(K.T, v_grids)
+    vK_1 = _K_solve(pcmobj, v_grids, trans=True)
 
-    dF, dA = pcm_grad.get_dF_dA(pcmobj.surface)
-    dD, dS, dSii = pcm_grad.get_dD_dS(pcmobj.surface, dF, with_D=True, with_S=True)
-    DA = D*A
+    dF, dA = pcm_grad.get_dF_dA(surface)
+    # the derivative of the diagonal of S; the rest of dS and dD in _d1_antisym
+    dSii = np.expand_dims(-surface['charge_exp'] * (2.0/np.pi)**0.5
+                          / surface['switch_fun']**2, axis=(1,2)) * dF
+    dSii = dSii.transpose([2,0,1])
+    dA = dA.transpose([2,0,1])
 
     solvent_descriptors = pcmobj.solvent_descriptors or smd.solvent_db[pcmobj.solvent]
     epsilon = pcmobj.eps or solvent_descriptors[5]
 
-    #de_dF = v0 * -dSii_dF * q
-    #de += 0.5*numpy.einsum('i,inx->nx', de_dF, dF)
-    # dQ = v^T K^-1 (dR - dK K^-1 R) v
-    de = np.zeros([pcmobj.mol.natm,3])
-    dD = dD.transpose([2,0,1])
-    dS = dS.transpose([2,0,1])
-    dSii = dSii.transpose([2,0,1])
-    dA = dA.transpose([2,0,1])
+    def by_atom(de_grids):
+        return np.asarray([np.sum(de_grids[p0:p1], axis=0) for p0,p1 in gridslice])
 
+    # dQ = v^T K^-1 (dR - dK K^-1 R) v
     # IEF-PCM and SS(V)PE formally are the same in gradient calculation
     # dR = f_eps/(2*pi) * (dD*A + D*dA),
     # dK = dS - f_eps/(2*pi) * (dD*A*S + D*dA*S + D*A*dS)
@@ -75,40 +80,28 @@ def grad_solver(pcmobj, dm):
     fac = f_epsilon/(2.0*np.pi)
 
     Av = A*v_grids
-    de_dR  = 0.5*fac * np.einsum('i,xij,j->ix', vK_1, dD, Av)
-    de_dR -= 0.5*fac * np.einsum('i,xij,j->jx', vK_1, dD, Av)
-    de_dR  = np.asarray([np.sum(de_dR[p0:p1], axis=0) for p0,p1 in gridslice])
+    de_dR = 0.5*fac * by_atom(pcm_grad._d1_antisym(surface, 'D', vK_1, Av))
 
     vK_1_D = vK_1.dot(D)
     vK_1_Dv = vK_1_D * v_grids
     de_dR += 0.5*fac * np.einsum('j,xjn->nx', vK_1_Dv, dA)
 
-    de_dS0  = 0.5*np.einsum('i,xij,j->ix', vK_1, dS, q)
-    de_dS0 -= 0.5*np.einsum('i,xij,j->jx', vK_1, dS, q)
-    de_dS0  = np.asarray([np.sum(de_dS0[p0:p1], axis=0) for p0,p1 in gridslice])
+    de_dS0 = 0.5 * by_atom(pcm_grad._d1_antisym(surface, 'S', vK_1, q))
+    de_dS0 += 0.5*np.einsum('i,xin->nx', vK_1 * q, dSii)
 
-    vK_1_q = vK_1 * q
-    de_dS0 += 0.5*np.einsum('i,xin->nx', vK_1_q, dSii)
-
-    vK_1_DA = np.dot(vK_1, DA)
-    de_dS1  = 0.5*np.einsum('i,xij,j->ix', vK_1_DA, dS, q)
-    de_dS1 -= 0.5*np.einsum('i,xij,j->jx', vK_1_DA, dS, q)
-    de_dS1  = np.asarray([np.sum(de_dS1[p0:p1], axis=0) for p0,p1 in gridslice])
-
-    vK_1_DAq = vK_1_DA*q
-    de_dS1 += 0.5*np.einsum('j,xjn->nx', vK_1_DAq, dSii)
+    # v K^-1 (D*A): the columns of D scaled by the areas
+    vK_1_DA = vK_1_D * A
+    de_dS1 = 0.5 * by_atom(pcm_grad._d1_antisym(surface, 'S', vK_1_DA, q))
+    de_dS1 += 0.5*np.einsum('j,xjn->nx', vK_1_DA * q, dSii)
 
     Sq = np.dot(S,q)
     ASq = A*Sq
-    de_dD  = 0.5*np.einsum('i,xij,j->ix', vK_1, dD, ASq)
-    de_dD -= 0.5*np.einsum('i,xij,j->jx', vK_1, dD, ASq)
-    de_dD  = np.asarray([np.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
+    de_dD = 0.5 * by_atom(pcm_grad._d1_antisym(surface, 'D', vK_1, ASq))
 
-    vK_1_D = np.dot(vK_1, D)
     de_dA = 0.5*np.einsum('j,xjn->nx', vK_1_D*Sq, dA)   # 0.5*cupy.einsum('j,xjn,j->nx', vK_1_D, dA, Sq)
 
     de_dK = de_dS0 - fac * (de_dD + de_dA + de_dS1)
-    de += de_dR - de_dK
+    de = de_dR - de_dK
 
     t1 = log.timer_debug1('grad solver', *t1)
     return de

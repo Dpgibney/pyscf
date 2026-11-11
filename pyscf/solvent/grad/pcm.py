@@ -302,9 +302,6 @@ def grad_solver(pcmobj, dm):
     dSii = numpy.expand_dims(-exponents * (2.0/PI)**0.5 / pcmobj.surface['switch_fun']**2, axis=(1,2)) * dF
     surface = pcmobj.surface
 
-    if pcmobj.method.upper() in ['IEF-PCM', 'IEFPCM', 'SS(V)PE']:
-        DA = D*A
-
     epsilon = pcmobj.eps
 
     #de_dF = v0 * -dSii_dF * q
@@ -342,7 +339,8 @@ def grad_solver(pcmobj, dm):
         vK_1_q = vK_1 * q
         de_dS0 += 0.5*numpy.einsum('i,xin->nx', vK_1_q, dSii)
 
-        vK_1_DA = numpy.dot(vK_1, DA)
+        # v K^-1 (D*A): the columns of D scaled by the areas, without the [n,n] product
+        vK_1_DA = vK_1_D * A
         de_dS1 = 0.5*_d1_antisym(surface, 'S', vK_1_DA, q)
         de_dS1  = numpy.asarray([numpy.sum(de_dS1[p0:p1], axis=0) for p0,p1 in gridslice])
 
@@ -382,7 +380,8 @@ def grad_solver(pcmobj, dm):
         vK_1_q = vK_1 * q
         de_dS0 += 0.5*numpy.einsum('i,xin->nx', vK_1_q, dSii)
 
-        vK_1_DA = numpy.dot(vK_1, DA)
+        # v K^-1 (D*A): the columns of D scaled by the areas, without the [n,n] product
+        vK_1_DA = vK_1_D * A
         de_dS1 = 0.5*_d1_antisym(surface, 'S', vK_1_DA, q)
         de_dS1  = numpy.asarray([numpy.sum(de_dS1[p0:p1], axis=0) for p0,p1 in gridslice])
         vK_1_DAq = vK_1_DA*q

@@ -101,6 +101,40 @@ class KnownValues(unittest.TestCase):
         g = mf.nuc_grad_method().kernel()
         assert numpy.linalg.norm(g - g_ref) < 1e-4
 
+    def test_grad_solver_blocks(self):
+        # grad_solver by blocks of rows against the [n,n,3] derivatives of S and D
+        from pyscf.solvent.grad import pcm as pcm_grad, smd as smd_grad
+        mol1 = gto.M(atom='P 0 0 0.1; O 0 1.2 -0.5; H 0.9 -0.7 -0.6; H -0.9 -0.7 -0.5; F 2.1 0.3 0.4',
+                     basis='sto3g', verbose=0)
+        mf = dft.RKS(mol1, xc='pbe').SMD()
+        mf.with_solvent.solvent = 'toluene'
+        mf.kernel()
+        dm = mf.make_rdm1()
+        solv = mf.with_solvent
+        de = smd_grad.grad_solver(solv, dm)
+        im = solv._intermediates
+        v, q, A, D, S, K = (im[k] for k in ('v_grids', 'q', 'A', 'D', 'S', 'K'))
+        vK_1 = numpy.linalg.solve(K.T, v)
+        dF, dA = pcm_grad.get_dF_dA(solv.surface)
+        dD, dS, dSii = pcm_grad.get_dD_dS(solv.surface, dF, with_D=True, with_S=True)
+        eps = smd.solvent_db['toluene'][5]
+        fac = (eps - 1) / (eps + 1) / (2 * numpy.pi)
+        def by_atom(x):
+            return numpy.array([x[p0:p1].sum(axis=0) for p0, p1 in solv.surface['gslice_by_atom']])
+        def antisym(a, dX, b):
+            return by_atom(numpy.einsum('i,ijx,j->ix', a, dX, b) - numpy.einsum('i,ijx,j->jx', a, dX, b))
+        vK_1_D = vK_1.dot(D)
+        de_dR = .5 * fac * (antisym(vK_1, dD, A * v) + numpy.einsum('j,jnx->nx', vK_1_D * v, dA))
+        de_dS0 = .5 * (antisym(vK_1, dS, q) + numpy.einsum('i,inx->nx', vK_1 * q, dSii))
+        vK_1_DA = vK_1.dot(D * A)
+        de_dS1 = .5 * (antisym(vK_1_DA, dS, q) + numpy.einsum('j,jnx->nx', vK_1_DA * q, dSii))
+        Sq = S.dot(q)
+        de_dD = .5 * antisym(vK_1, dD, A * Sq)
+        de_dA = .5 * numpy.einsum('j,jnx->nx', vK_1_D * Sq, dA)
+        ref = de_dR - (de_dS0 - fac * (de_dD + de_dA + de_dS1))
+        self.assertGreater(abs(ref).max(), 1e-4)
+        self.assertAlmostEqual(abs(de - ref).max(), 0, 12)
+
     def test_grad_solvent(self):
         mf = dft.rks.RKS(mol, xc='b3lyp').SMD()
         mf.grids.atom_grid = (99,590)
