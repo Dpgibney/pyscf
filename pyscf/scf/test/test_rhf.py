@@ -1051,6 +1051,30 @@ H     0    0.757    0.587'''
         mf.two_level = True
         self.assertAlmostEqual(mf.kernel(), scf.RHF(mol).density_fit().kernel(), 9)
 
+    def test_two_level_rijcosx(self):
+        # a model that is RIJCOSX already: the cheap one runs on coarser grids with the
+        # model's SGX object, and only the model's energy goes to the larger SGX grid
+        from pyscf import dft
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*', verbose=0)
+        def make():
+            mf = dft.RKS(mol, xc='b3lyp').RIJCOSX()
+            mf.conv_tol = 1e-10
+            return mf
+        e_ref = make().kernel()
+        mf = make()
+        mf.two_level = True
+        calls = []
+        energy_on_grid = mf._sgx_energy_on_grid.__func__
+        def counted(self, *args):
+            calls.append(type(self))
+            return energy_on_grid(self, *args)
+        with lib.temporary_env(type(mf), _sgx_energy_on_grid=counted):
+            e = mf.kernel()
+        self.assertAlmostEqual(e, e_ref, 8)
+        self.assertTrue(mf.converged)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(mf.with_df.grids_level_energy, 2)
+
     def test_init_guess_pre_scf_grids_and_fit(self):
         from pyscf import dft
         from pyscf.scf import hf

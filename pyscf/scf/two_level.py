@@ -157,7 +157,17 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
     # the cheap model's solution
     cheap.conv_tol = conv_tol * mf.two_level_conv_factor
     cheap.conv_tol_grad = None
-    cheap.kernel(dm0=dm0)
+    # A model that is RIJCOSX already shares its SGX object with the cheap one,
+    # whose energy on the larger SGX grid nothing uses (one more K build)
+    with_df = getattr(cheap, 'with_df', None)
+    level_energy = getattr(with_df, 'grids_level_energy', None)
+    if level_energy is not None:
+        with_df.grids_level_energy = None
+    try:
+        cheap.kernel(dm0=dm0)
+    finally:
+        if level_energy is not None:
+            with_df.grids_level_energy = level_energy
     if not cheap.converged:
         log.warn('two-level SCF: the cheap model did not converge')
     dm = cheap.make_rdm1()
