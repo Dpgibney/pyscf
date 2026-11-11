@@ -54,7 +54,6 @@ def grad_solver(pcmobj, dm):
     v_grids      = pcmobj._intermediates['v_grids']
     A            = pcmobj._intermediates['A']
     D            = pcmobj._intermediates['D']
-    S            = pcmobj._intermediates['S']
     q            = pcmobj._intermediates['q']
 
     vK_1 = _K_solve(pcmobj, v_grids, trans=True)
@@ -94,7 +93,7 @@ def grad_solver(pcmobj, dm):
     de_dS1 = 0.5 * by_atom(pcm_grad._d1_antisym(surface, 'S', vK_1_DA, q))
     de_dS1 += 0.5*np.einsum('j,xjn->nx', vK_1_DA * q, dSii)
 
-    Sq = np.dot(S,q)
+    Sq = np.dot(pcmobj._intermediates['S'], q)
     ASq = A*Sq
     de_dD = 0.5 * by_atom(pcm_grad._d1_antisym(surface, 'D', vK_1, ASq))
 

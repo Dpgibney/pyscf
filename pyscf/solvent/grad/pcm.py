@@ -289,7 +289,6 @@ def grad_solver(pcmobj, dm):
     v_grids      = pcmobj._intermediates['v_grids']
     A            = pcmobj._intermediates['A']
     D            = pcmobj._intermediates['D']
-    S            = pcmobj._intermediates['S']
     q            = pcmobj._intermediates['q']
 
     vK_1 = _K_solve(pcmobj, v_grids, trans=True)
@@ -347,7 +346,7 @@ def grad_solver(pcmobj, dm):
         vK_1_DAq = vK_1_DA*q
         de_dS1 += 0.5*numpy.einsum('j,xjn->nx', vK_1_DAq, dSii)
 
-        Sq = numpy.dot(S,q)
+        Sq = numpy.dot(pcmobj._intermediates['S'], q)
         ASq = A*Sq
         de_dD = 0.5*_d1_antisym(surface, 'D', vK_1, ASq)
         de_dD  = numpy.asarray([numpy.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
@@ -394,12 +393,14 @@ def grad_solver(pcmobj, dm):
         vK_1_ADT_q = vK_1 * ADT_q
         de_dS1_T += 0.5*numpy.einsum('j,xjn->nx', vK_1_ADT_q, dSii)
 
-        Sq = numpy.dot(S,q)
+        S = pcmobj._intermediates['S']
+        Sq = numpy.dot(S, q)
         ASq = A*Sq
         de_dD = 0.5*_d1_antisym(surface, 'D', vK_1, ASq)
         de_dD  = numpy.asarray([numpy.sum(de_dD[p0:p1], axis=0) for p0,p1 in gridslice])
 
         vK_1_S = numpy.dot(vK_1, S)
+        S = None
         vK_1_SA = vK_1_S * A
         # the transpose of dD with a minus sign: the two vectors change places
         de_dD_T = 0.5*_d1_antisym(surface, 'D', q, vK_1_SA)

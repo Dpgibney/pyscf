@@ -77,6 +77,46 @@ class KnownValues(unittest.TestCase):
     def tearDownClass(cls):
         dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = cls.original_grids
 
+    def test_surface_matrices(self):
+        # S, K and R are not kept (pcm._SurfaceMatrices): the charges come from D
+        # and the factors of K, and the matrices made on request are the definitions
+        mol1 = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47; F 2.3 0.2 0.1',
+                     basis='sto3g', charge=-1, verbose=0)
+        numpy.random.seed(3)
+        for method in ('C-PCM', 'COSMO', 'IEF-PCM', 'SS(V)PE'):
+            pcmobj = pcm.PCM(mol1)
+            pcmobj.method = method
+            pcmobj.build()
+            im = pcmobj._intermediates
+            n = len(pcmobj.surface['charge_exp'])
+            D0, S = pcm.get_D_S(pcmobj.surface, with_S=True, with_D=True)
+            A, f = im['A'], im['f_epsilon']
+            if method in ('C-PCM', 'COSMO'):
+                K, R = S, -f * numpy.eye(n)
+                self.assertIsNone(im['R'])
+            else:
+                DA = D0 * A
+                DAS = DA.dot(S)
+                c = f / (2 * numpy.pi)
+                K = S - c * DAS if method == 'IEF-PCM' else S - c / 2 * (DAS + DAS.T)
+                R = -f * (numpy.eye(n) - DA / (2 * numpy.pi))
+                self.assertAlmostEqual(abs(im['D'] - D0).max(), 0, 12)
+                self.assertAlmostEqual(abs(im['R'] - R).max(), 0, 12)
+            self.assertAlmostEqual(abs(im['S'] - S).max(), 0, 12)
+            self.assertAlmostEqual(abs(im['K'] - K).max(), 0, 11)
+            x = numpy.random.rand(3, n)
+            self.assertAlmostEqual(abs(pcm._R_dot(pcmobj, x) - x.dot(R.T)).max(), 0, 11)
+            self.assertAlmostEqual(abs(pcm._R_dot(pcmobj, x, trans=True) - x.dot(R)).max(), 0, 11)
+            self.assertAlmostEqual(abs(pcm._R_dot(pcmobj, x[0]) - R.dot(x[0])).max(), 0, 11)
+            ref = numpy.linalg.solve(K, x.T).T
+            self.assertAlmostEqual(abs(pcm._K_solve(pcmobj, x) - ref).max() / abs(ref).max(), 0, 9)
+            ref = numpy.linalg.solve(K.T, x.T).T
+            self.assertAlmostEqual(abs(pcm._K_solve(pcmobj, x, trans=True) - ref).max() / abs(ref).max(), 0, 9)
+            # nothing of S, K, R among what is kept
+            self.assertFalse({'S', 'K', 'R'} & set(im))
+            self.assertEqual(sum(1 for v in im.values() if getattr(v, 'shape', None) == (n, n)),
+                             0 if method in ('C-PCM', 'COSMO') else 1)
+
     def test_CPCM(self):
         e_tot = _energy_with_solvent(scf.RHF(mol), 'C-PCM')
         print(f"Energy error in RHF with C-PCM: {numpy.abs(e_tot - -71.19244927767662)}")

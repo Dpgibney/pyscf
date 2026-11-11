@@ -268,22 +268,19 @@ class SMD(pcm.PCM):
             ng = self.sasa_ng
 
         self.surface = pcm.gen_surface(mol, rad=radii_table, ng=ng)
-        self._intermediates = {}
+        self._intermediates = pcm._SurfaceMatrices()
         F, A = pcm.get_F_A(self.surface)
-        D, S = pcm.get_D_S(self.surface, with_S=True, with_D=True)
+        D = pcm.get_D_S(self.surface, with_S=False, with_D=True)[0]
 
         epsilon = self.eps or solvent_descriptors[5]
         f_epsilon = (epsilon - 1.0)/(epsilon + 1.0) if epsilon != float('inf') else 1.
-        DA = D*A
-        DAS = np.dot(DA, S)
-        K = S - f_epsilon/(2.0*np.pi) * DAS
-        R = -f_epsilon * (np.eye(K.shape[0]) - 1.0/(2.0*np.pi)*DA)
+        # S, K = S - f/(2 pi) D A S and R = -f (1 - D A/(2 pi)) as for IEF-PCM are
+        # made where they are needed (pcm._SurfaceMatrices)
         intermediates = {
-            'S': S,
+            'surface': self.surface,
             'D': D,
             'A': A,
-            'K': K,
-            'R': R,
+            'K_coeff': (f_epsilon/(2.0*np.pi), False),
             'f_epsilon': f_epsilon
         }
         self._intermediates.update(intermediates)

@@ -258,7 +258,7 @@ def get_D_S(surface, with_S=True, with_D=False):
     R_vdw       = surface['R_vdw']
     ngrids = grid_coords.shape[0]
 
-    S = numpy.empty((ngrids, ngrids))
+    S = numpy.empty((ngrids, ngrids)) if with_S else None
     D = numpy.empty((ngrids, ngrids)) if with_D else None
     # about 128 MB for each of the (rows, ngrids, 3) temporaries
     rows = max(1, int(128e6 / 8 / (ngrids * 3)))
@@ -269,13 +269,16 @@ def get_D_S(surface, with_S=True, with_D=False):
         rij = scipy.spatial.distance.cdist(grid_coords[i0:i1], grid_coords)
         xi_r_ij = xi_ij * rij
         rij[numpy.arange(i1-i0), numpy.arange(i0,i1)] = 1
-        S[i0:i1] = erf(xi_r_ij) / rij
+        s_rows = erf(xi_r_ij) / rij
+        if with_S:
+            S[i0:i1] = s_rows
         if with_D:
             # The diagonal of S is not set yet here; that of D is overwritten below
             drij = numpy.expand_dims(grid_coords[i0:i1], axis=1) - grid_coords
             nrij = numpy.sum(drij * norm_vec, axis=-1)
-            D[i0:i1] = S[i0:i1]*nrij/rij**2 -2.0*xi_r_ij/PI**0.5*numpy.exp(-xi_r_ij**2)*nrij/rij**3
-    numpy.fill_diagonal(S, charge_exp * (2.0 / PI)**0.5 / switch_fun)
+            D[i0:i1] = s_rows*nrij/rij**2 -2.0*xi_r_ij/PI**0.5*numpy.exp(-xi_r_ij**2)*nrij/rij**3
+    if with_S:
+        numpy.fill_diagonal(S, charge_exp * (2.0 / PI)**0.5 / switch_fun)
     if with_D:
         numpy.fill_diagonal(D, -charge_exp * (2.0 / PI)**0.5 / (2.0 * R_vdw))
 
@@ -446,16 +449,67 @@ def _int1e_grids_deriv(mol, surface, intor, comp, dms=None, charges=None,
             outs[k] = v
     return outs
 
+class _SurfaceMatrices(dict):
+    '''The intermediates of a surface. Of its [n,n] matrices only D (for the
+    models with one: IEF-PCM, SS(V)PE, SMD) and the factors of K are kept, the
+    latter made in the memory of K (_K_solve): the charges of a potential are
+    two solves and two products with R = -f (1 - D A / 2 pi), which come from D
+    (_R_dot). S, K = S - c (D A S [+ S A D^T]) and R were kept as well, five
+    arrays with the factors. ['S'], ['K'] and ['R'] make these matrices for
+    the code that works with them (S in the gradients, all three in the
+    Hessians), a new array each time. For C-PCM and COSMO K is S and R is None
+    (-f times the identity).'''
+    def __missing__(self, key):
+        if key == 'S':
+            return get_D_S(self['surface'], with_S=True, with_D=False)[1]
+        if key == 'K' and 'K_coeff' not in self:
+            return self['S']
+        if key == 'R' and 'K_coeff' not in self:
+            return None
+        if key == 'K' and 'K_coeff' in self:
+            return _make_K(self)
+        if key == 'R' and 'K_coeff' in self:
+            f_epsilon = self['f_epsilon']
+            R = self['D'] * (f_epsilon / (2.0*PI) * self['A'])
+            R[numpy.diag_indices_from(R)] -= f_epsilon
+            return R
+        raise KeyError(key)
+
+def _make_K(im):
+    '''K = S - c D A S (IEF-PCM, SMD; c = f/2 pi), or S - c (D A S + S A D^T)
+    (SS(V)PE; c = f/4 pi), by blocks of rows of D A: one [n,n] array'''
+    S, D, A = im['S'], im['D'], im['A']
+    c, symmetrized = im['K_coeff']
+    n = S.shape[0]
+    K = numpy.empty((n,n))
+    blksize = max(1, int(128e6 / (8 * n)))
+    for i0, i1 in lib.prange(0, n, blksize):
+        K[i0:i1] = numpy.dot(D[i0:i1] * A, S)
+    if symmetrized:
+        K = lib.hermi_sum(K, inplace=True)
+    K *= -c
+    K += S
+    return K
+
 def _R_dot(pcmobj, x, trans=False):
-    '''R x (R^T x with trans) over the last axis of x, the surface points.
-    C-PCM and COSMO keep no R: it is -f_epsilon times the identity there.'''
-    R = pcmobj._intermediates['R']
-    if R is None:
-        return -pcmobj._intermediates['f_epsilon'] * x
+    '''R x (R^T x with trans) over the last axis of x, the surface points:
+    -f_epsilon x for C-PCM and COSMO, -f_epsilon (x - D A x / 2 pi) otherwise,
+    from D.'''
+    im = pcmobj._intermediates
+    f_epsilon = im['f_epsilon']
+    if 'K_coeff' not in im:
+        return -f_epsilon * x
+    D, A = im['D'], im['A']
     # one matrix product: numpy.dot of an array of more than two indices with a
     # matrix is a loop of dot products
     x2 = x.reshape(-1, x.shape[-1])
-    return numpy.dot(x2, R if trans else R.T).reshape(x.shape)
+    if trans:
+        y = numpy.dot(x2, D) * A
+    else:
+        y = numpy.dot(x2 * A, D.T)
+    y *= f_epsilon / (2.0*PI)
+    y -= f_epsilon * x2
+    return y.reshape(x.shape)
 
 def _K_solve(pcmobj, b, trans=False):
     '''K^-1 b (K^-T b with trans) over the last axis of b, the surface points,
@@ -463,13 +517,18 @@ def _K_solve(pcmobj, b, trans=False):
     _intermediates: Cholesky for C-PCM and COSMO, whose K = S is symmetric
     positive definite, LU otherwise.'''
     intermediates = pcmobj._intermediates
-    if pcmobj.method.upper() in ['C-PCM', 'CPCM', 'COSMO']:
+    if 'K_coeff' not in intermediates:
         if 'K_cho' not in intermediates:
-            intermediates['K_cho'] = scipy.linalg.cho_factor(intermediates['K'])
+            # K = S is symmetric: its transpose is the Fortran-ordered array LAPACK overwrites
+            K = intermediates['K']
+            intermediates['K_cho'] = scipy.linalg.cho_factor(K.T, overwrite_a=True, check_finite=False)
         return scipy.linalg.cho_solve(intermediates['K_cho'], b.T).T
     if 'K_lu' not in intermediates:
-        intermediates['K_lu'] = scipy.linalg.lu_factor(intermediates['K'])
-    return scipy.linalg.lu_solve(intermediates['K_lu'], b.T, trans=int(trans)).T
+        # the factors of K^T: the transpose of the C-ordered K is the Fortran-ordered
+        # array LAPACK overwrites, so the factors take the place of K
+        K = intermediates['K']
+        intermediates['K_lu'] = scipy.linalg.lu_factor(K.T, overwrite_a=True, check_finite=False)
+    return scipy.linalg.lu_solve(intermediates['K_lu'], b.T, trans=int(not trans)).T
 
 
 class PCM(lib.StreamObject):
@@ -680,46 +739,29 @@ class PCM(lib.StreamObject):
 
         self.surface = gen_surface(mol, rad=radii_table, ng=ng,
                                    surface_discretization_method = self.surface_discretization_method)
-        self._intermediates = {}
+        self._intermediates = _SurfaceMatrices()
         F, A = get_F_A(self.surface)
         # C-PCM and COSMO need no D
         with_D = self.method.upper() not in ['C-PCM', 'CPCM', 'COSMO']
-        D, S = get_D_S(self.surface, with_S=True, with_D=with_D)
+        D = get_D_S(self.surface, with_S=False, with_D=True)[0] if with_D else None
 
         epsilon = self.eps
-        # R is None for C-PCM and COSMO, where it is -f_epsilon times the
-        # identity (see _R_dot)
+        intermediates = {'surface': self.surface, 'D': D, 'A': A}
+        # C-PCM and COSMO: K = S, and R is -f_epsilon times the identity (None).
+        # S, K and R are made where they are needed (_SurfaceMatrices)
         if self.method.upper() in ['C-PCM', 'CPCM']:
             f_epsilon = (epsilon-1.)/epsilon if epsilon != float('inf') else 1.0
-            K = S
-            R = None
         elif self.method.upper() == 'COSMO':
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0/2.0) if epsilon != float('inf') else 1.0
-            K = S
-            R = None
         elif self.method.upper() in ['IEF-PCM', 'IEFPCM']:
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0) if epsilon != float('inf') else 1.0
-            DA = D*A
-            DAS = numpy.dot(DA, S)
-            K = S - f_epsilon/(2.0*PI) * DAS
-            R = -f_epsilon * (numpy.eye(K.shape[0]) - 1.0/(2.0*PI)*DA)
+            intermediates['K_coeff'] = (f_epsilon/(2.0*PI), False)
         elif self.method.upper() == 'SS(V)PE':
             f_epsilon = (epsilon - 1.0)/(epsilon + 1.0) if epsilon != float('inf') else 1.0
-            DA = D*A
-            DAS = numpy.dot(DA, S)
-            K = S - f_epsilon/(4.0*PI) * (DAS + DAS.T)
-            R = -f_epsilon * (numpy.eye(K.shape[0]) - 1.0/(2.0*PI)*DA)
+            intermediates['K_coeff'] = (f_epsilon/(4.0*PI), True)
         else:
             raise RuntimeError(f"Unknown implicit solvent model: {self.method}")
-
-        intermediates = {
-            'S': S,
-            'D': D,
-            'A': A,
-            'K': K,
-            'R': R,
-            'f_epsilon': f_epsilon
-        }
+        intermediates['f_epsilon'] = f_epsilon
         self._intermediates.update(intermediates)
 
         charge_exp  = self.surface['charge_exp']
@@ -760,7 +802,7 @@ class PCM(lib.StreamObject):
         '''The surface charges q = K^-1 R v of the potentials v_grids (one set
         a row), and their symmetrized form (q + R^T K^-T v) / 2'''
         q = _K_solve(self, _R_dot(self, v_grids))
-        if self._intermediates['R'] is None:
+        if 'K_coeff' not in self._intermediates:
             # C-PCM and COSMO: K is symmetric and R = -f_epsilon I
             return q, q
         qt = _R_dot(self, _K_solve(self, v_grids, trans=True), trans=True)
