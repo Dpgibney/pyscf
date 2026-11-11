@@ -288,7 +288,12 @@ class _SGXHF:
             try:
                 will_reset = False
                 self._grids_reset = False
-                if (sgx.grids_level_f != sgx.grids_level_i and
+                if dm_last is not None and dm_last is dm:
+                    # no change of the density: J and K are vhf_last's, whatever the state
+                    # of the incremental builds (scf.two_level, a cheap model with the J
+                    # and K of its model at a reference density)
+                    pass
+                elif (sgx.grids_level_f != sgx.grids_level_i and
                     self._in_scf and
                     dm_last is not None and numpy.linalg.norm(dm - dm_last) < sgx.grids_switch_thrd):
                     self._grids_reset = True

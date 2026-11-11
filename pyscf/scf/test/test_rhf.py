@@ -1051,6 +1051,34 @@ H     0    0.757    0.587'''
         mf.two_level = True
         self.assertAlmostEqual(mf.kernel(), scf.RHF(mol).density_fit().kernel(), 9)
 
+    def test_two_level_second_order(self):
+        # a reference whose energy misses the predicted one by more than conv_tol is
+        # converged all the same when its own orbital gradient leaves less than conv_tol
+        from pyscf import dft
+        from pyscf.scf import two_level
+        self.assertAlmostEqual(two_level._energy_left(1e-5, [-1., -.5, .3, 1.], [2, 2, 0, 0]),
+                               2e-10 / .8, 14)
+        self.assertAlmostEqual(two_level._energy_left(1e-5, [[-1., -.5, .3], [-1., -.2, .5]],
+                                                      [[1, 1, 0], [1, 0, 0]]), 2e-10 / .8, 14)
+        # open shells of ROHF and fractional occupations: no gap, no bound
+        self.assertEqual(two_level._energy_left(1e-5, [-1., -.5, .3], [2, 1, 0]), numpy.inf)
+        self.assertEqual(two_level._energy_left(1e-5, [-1., -.5, .3], [2, 1.5, .5]), numpy.inf)
+        mol = gto.M(atom='O 0 0 0.12; H 0 0.76 -0.47; H 0 -0.76 -0.47', basis='631g*', verbose=0)
+        def run(second_order):
+            mf = dft.RKS(mol, xc='wb97x')
+            mf.conv_tol = 1e-9
+            mf.two_level = True
+            with lib.temporary_env(two_level, SECOND_ORDER_TEST=second_order):
+                e = mf.kernel()
+            self.assertTrue(mf.converged)
+            return e, mf.cycles
+        e_ref = dft.RKS(mol, xc='wb97x').set(conv_tol=1e-11).kernel()
+        e0, n0 = run(False)
+        e1, n1 = run(True)
+        self.assertAlmostEqual(e0, e_ref, 8)
+        self.assertAlmostEqual(e1, e_ref, 8)
+        self.assertLessEqual(n1, n0)
+
     def test_two_level_rijcosx(self):
         # a model that is RIJCOSX already: the cheap one runs on coarser grids with the
         # model's SGX object, and only the model's energy goes to the larger SGX grid
@@ -1068,12 +1096,23 @@ H     0    0.757    0.587'''
         def counted(self, *args):
             calls.append(type(self))
             return energy_on_grid(self, *args)
+        # J and K of the densities: at a reference the cheap model takes those of the
+        # model's own build (an incremental build with no change of the density)
+        dmax = []
+        get_jk = type(mf.with_df).get_jk
+        def counted_jk(self, dm, *args, **kwargs):
+            dmax.append(abs(numpy.asarray(dm)).max())
+            return get_jk(self, dm, *args, **kwargs)
         with lib.temporary_env(type(mf), _sgx_energy_on_grid=counted):
-            e = mf.kernel()
+            with lib.temporary_env(type(mf.with_df), get_jk=counted_jk):
+                e = mf.kernel()
         self.assertAlmostEqual(e, e_ref, 8)
         self.assertTrue(mf.converged)
         self.assertEqual(len(calls), 1)
         self.assertEqual(mf.with_df.grids_level_energy, 2)
+        self.assertEqual(sum(1 for x in dmax if x == 0), mf.cycles - 1)
+        # every build of the model on the final SGX grid
+        self.assertEqual(mf.with_df.grids.level, mf.with_df.grids_level_f)
 
     def test_init_guess_pre_scf_grids_and_fit(self):
         from pyscf import dft

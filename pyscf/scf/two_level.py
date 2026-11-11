@@ -54,6 +54,32 @@ from pyscf.scf import diis as scf_diis
 # conv_tol_grad
 MICRO_ETOL = .1
 MICRO_GTOL = .3
+# The model is also converged at a reference density where 2 |g|^2 / gap, a
+# bound of the energy left in its orbital gradient g at second order (twice
+# that of orbital-energy denominators no smaller than the gap), is below
+# conv_tol. False: only by the energy predicted for that density.
+SECOND_ORDER_TEST = True
+
+
+def _energy_left(norm_gorb, mo_energy, mo_occ):
+    '''2 |g|^2 / gap for the orbital gradient norm of get_grad (twice the Fock
+    matrix elements for restricted orbitals: the bound is four times theirs),
+    numpy.inf where the occupations leave no gap (open shells of ROHF,
+    fractional occupations)'''
+    mo_energy = numpy.asarray(mo_energy)
+    mo_occ = numpy.asarray(mo_occ)
+    if mo_energy.ndim == 1:
+        mo_energy = mo_energy[None]
+        mo_occ = mo_occ[None]
+    gap = numpy.inf
+    for e, occ in zip(mo_energy, mo_occ):
+        filled = occ > 0
+        empty = occ < occ.max()
+        if filled.any() and empty.any():
+            gap = min(gap, e[empty].min() - e[filled].max())
+    if not 1e-3 < gap < numpy.inf:
+        return numpy.inf
+    return 2 * norm_gorb**2 / gap
 
 
 def cheap_scf(mf):
@@ -111,6 +137,23 @@ def _veff(mf, mol, dm):
     return mf.get_veff(mol, dm)
 
 
+def _veff_at_reference(cheap, mf, mol, dm, vref):
+    '''The cheap model's potential of the reference density dm, where the
+    potential of mf is vref. A cheap model that shares the density fitting
+    or SGX object of mf (a model fitted already: only the grids differ) has
+    the J and K of vref: get_veff's incremental build with no change of the
+    density takes them from there and evaluates the XC terms only.'''
+    with_df = getattr(mf, 'with_df', None)
+    if (with_df is not None and getattr(cheap, 'with_df', None) is with_df
+            and getattr(vref, 'vj', None) is not None
+            and getattr(cheap, 'xc', None) == getattr(mf, 'xc', None)
+            and cheap._eri is None and cheap.direct_scf):
+        if hasattr(cheap, '_nsteps_direct'):
+            cheap._nsteps_direct = 0
+        return cheap.get_veff(mol, dm, dm_last=dm, vhf_last=vref)
+    return _veff(cheap, mol, dm)
+
+
 def _tagged(v, like):
     '''The array v with the solvent terms of the potential like, which
     get_fock and energy_elec of a solvated model read from the potential'''
@@ -128,10 +171,13 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
     mf.cycles counts the Fock builds of mf itself.
 
     Converged when, at a reference density, the orbital gradient of mf is below
-    conv_tol_grad and the energy of mf is within conv_tol of the one predicted
-    for that density from the previous reference: its energy there, the change
-    of the cheap model's energy, and the first-order term of the difference of
-    the two potentials. With conv_check the orbitals returned are those of the
+    conv_tol_grad and either the energy of mf is within conv_tol of the one
+    predicted for that density from the previous reference (its energy there,
+    the change of the cheap model's energy, and the first-order term of the
+    difference of the two potentials), or the energy left in that gradient at
+    second order is below conv_tol (_energy_left): the reference build gives
+    the energy and the gradient of mf itself, so a density that fails the
+    first test by its prediction alone needs no further build. With conv_check the orbitals returned are those of the
     last Fock matrix of mf, without DIIS; unlike hf.kernel, no further build
     follows them, and e_tot is the energy of the density that Fock matrix was
     built from.
@@ -155,6 +201,8 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
     mol = mf.mol
 
     # the cheap model's solution
+    # (a looser SCF of the cheap model saves nothing: its last cycles come back as micro
+    # cycles, and SGX's incremental K builds stop 1000 conv_tol from convergence)
     cheap.conv_tol = conv_tol * mf.two_level_conv_factor
     cheap.conv_tol_grad = None
     # A model that is RIJCOSX already shares its SGX object with the cheap one,
@@ -180,6 +228,18 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
     if dump_chk and mf.chkfile:
         chkfile.save_mol(mol, mf.chkfile)
     mf.pre_kernel(locals())
+    # An SGX model goes from its initial grid to the final one when the density
+    # changes little, which the cheap model's thresholds do not guarantee:
+    # from here every build is on the final grid (mf's own, where it shares
+    # the SGX object).
+    for obj in (cheap, mf):
+        sgx = getattr(obj, 'with_df', None)
+        level = getattr(sgx, 'grids_level_f', None)
+        if level is not None and getattr(getattr(sgx, 'grids', None), 'level', level) != level:
+            log.info('two-level SCF: SGX grid of level %d from here', level)
+            sgx.build(level=level)
+        if hasattr(obj, '_in_scf'):
+            obj._in_scf = False
 
     def gnorm(fock):
         return numpy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
@@ -197,13 +257,17 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
         fock = mf.get_fock(h1e, s1e, vref, dm)  # = h1e + vref, no DIIS
         norm_gorb = gnorm(fock)
         mf.cycles = cycle + 1
+        e_left = _energy_left(norm_gorb, mo_energy, mo_occ) if SECOND_ORDER_TEST else numpy.inf
         if e_pred is None:
-            log.info('reference %d  E= %.15g  |g|= %4.3g', cycle+1, e_tot, norm_gorb)
+            log.info('reference %d  E= %.15g  |g|= %4.3g  (2 |g|^2/gap= %4.3g)',
+                     cycle+1, e_tot, norm_gorb, e_left)
         else:
             log.info('reference %d  E= %.15g  E - predicted= %4.3g  |g|= %4.3g  '
-                     '(%d cheap builds)', cycle+1, e_tot, e_tot-e_pred, norm_gorb, ncheap)
-            if abs(e_tot-e_pred) < conv_tol and norm_gorb < conv_tol_grad:
-                scf_conv = True
+                     '(2 |g|^2/gap= %4.3g, %d cheap builds)', cycle+1, e_tot, e_tot-e_pred,
+                     norm_gorb, e_left, ncheap)
+        if norm_gorb < conv_tol_grad and (
+                e_left < conv_tol or (e_pred is not None and abs(e_tot-e_pred) < conv_tol)):
+            scf_conv = True
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
         if callable(callback):
@@ -213,7 +277,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None,
             break
 
         # micro cycles on h + V[D_ref] + (V_cheap[D] - V_cheap[D_ref])
-        vx = _veff(cheap, mol, dm)
+        vx = _veff_at_reference(cheap, mf, mol, dm, vref)
         ncheap += 1
         ex_ref = cheap.energy_tot(dm, h1e, vx)
         dm_ref = dm
