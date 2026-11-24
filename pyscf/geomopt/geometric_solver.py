@@ -118,6 +118,12 @@ def kernel(method, assert_convergence=ASSERT_CONV,
     specified through `kwargs`. For more details of the geomeTRIC options, please
     refer to the geomeTRIC documentation:
     https://geometric.readthedocs.io/en/latest/options.html
+
+    hessian=True computes the analytical Hessian of method (method.Hessian()
+    with its defaults) at the starting geometry. hessian can also be an array,
+    the Hessian at the starting geometry in Eh/Bohr^2 ([natm,natm,3,3] as
+    PySCF's Hessian objects return it, or [3*natm,3*natm]), for a Hessian with
+    other options or from another method.
     '''
     if isinstance(method, lib.GradScanner):
         g_scanner = method
@@ -196,6 +202,17 @@ def _make_hessian(g_scanner, hessian_option, tmpdir):
     Returns the filename in the geomeTRIC supported format, e.g.
     file:/path/to/hessian_file
     '''
+    if isinstance(hessian_option, numpy.ndarray):
+        # a Hessian of the starting geometry from the caller (Eh/Bohr^2), [natm,natm,3,3] as PySCF's Hessian
+        # objects return it, or [3*natm,3*natm]: e.g. with options or at a level that method.Hessian() lacks
+        natm = g_scanner.mol.natm
+        h = hessian_option
+        if h.ndim == 4:
+            h = h.transpose(0,2,1,3)
+        h = h.reshape(3*natm, 3*natm)
+        hessian_file = os.path.join(tmpdir, str(uuid.uuid4()))
+        numpy.savetxt(hessian_file, h)
+        return f'file:{hessian_file}'
     if not isinstance(hessian_option, str):
         if not hessian_option:
             # "None" disables vibrational analysis in geomeTRIC

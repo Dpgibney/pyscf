@@ -79,6 +79,16 @@ class KnownValues(unittest.TestCase):
         conv, mol_eq = geometric_solver.kernel(mf, hessian=True)
         self.assertTrue(conv)
 
+    def test_optimize_with_hessian_array(self):
+        mol = gto.M(atom='O 0 0 0; H 0 .75 .58; H 0 -.75 .58')
+        mf = mol.RHF().run()
+        h = mf.Hessian().kernel()
+        conv, mol_eq = geometric_solver.kernel(mf, hessian=h)
+        self.assertTrue(conv)
+        conv, mol_eq1 = geometric_solver.kernel(mf, hessian=h.transpose(0,2,1,3).reshape(9,9))
+        self.assertTrue(conv)
+        self.assertAlmostEqual(abs(mol_eq.atom_coords() - mol_eq1.atom_coords()).max(), 0, 9)
+
     def test_convergence_fail(self):
         mol = gto.M(atom='O 0 0 0; H 0 .75 .58; H 0 -.75 .58')
         mf_opt = mol.RHF().Gradients().optimizer().run(max_cycle=1)
