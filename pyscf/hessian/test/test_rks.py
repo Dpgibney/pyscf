@@ -72,6 +72,28 @@ def finite_diff(mf):
     e2ref = numpy.asarray(e2ref).reshape(natm,3,natm,3).transpose(0,2,1,3)
     return e2ref
 
+def finite_diff_rows(mf, ia, steps=(5e-4, 1e-3)):
+    '''The rows [natm,3,3] of atom ia of the Hessian: central differences of the gradient with grid_response,
+    extrapolated over the two steps'''
+    mol = mf.mol
+    g = mf.Gradients().set(grid_response=True)
+    if hasattr(g, 'auxbasis_response'):
+        g.auxbasis_response = True
+    gs = g.as_scanner()
+    x0 = mol.atom_coords()
+    rows = []
+    for h in steps:
+        r = numpy.empty((mol.natm,3,3))
+        for x in range(3):
+            de = []
+            for s in (h, -h):
+                xs = x0.copy()
+                xs[ia,x] += s
+                de.append(gs(mol.set_geom_(xs, unit='Bohr', inplace=False))[1])
+            r[:,x] = (de[0] - de[1]) / (2*h)
+        rows.append(r)
+    return (4 * rows[0] - rows[1]) / 3
+
 def finite_partial_diff(mf):
     # \partial^2 E / \partial R \partial R'
     mol = mf.mol
@@ -102,16 +124,64 @@ class KnownValues(unittest.TestCase):
     def tearDownClass(cls):
         dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = cls.original_grids
 
-    def test_unsupported_grid_response(self):
-        for cls in (dft.RKS, dft.UKS):
-            mf = cls(mol)
-            for method in (mf, mf.density_fit()):
-                with self.subTest(method=type(method).__name__):
-                    hess = method.Hessian().set(grid_response=True)
-                    with self.assertRaisesRegex(NotImplementedError, 'grid response'):
-                        hess.partial_hess_elec()
-                    with self.assertRaisesRegex(NotImplementedError, 'grid response'):
-                        hess.make_h1(None, None)
+    def test_grid_response(self):
+        # With grid_response the Hessian is the derivative of the gradient with grid_response: the rows of the
+        # Cl atom against central differences of that gradient (Richardson extrapolation of two steps), on
+        # coarse grids where the terms of the grids are large (up to 30 here without them); LDA, GGA, meta-GGA,
+        # VV10, and density fitting
+        mol1 = gto.M(atom='O 0 0 0.1; H 0 .76 .58; Cl 0.3 -1.2 -0.4', basis='def2-svp', verbose=0)
+        for xc, df in (('lda,vwn', False), ('pbe', True), ('tpss', False), ('wb97m-v', False)):
+            with self.subTest(xc=xc, df=df):
+                mf = dft.RKS(mol1, xc=xc)
+                if df:
+                    mf = mf.density_fit()
+                mf.grids.atom_grid = (30, 110)
+                mf.nlcgrids.atom_grid = (20, 50)
+                mf.conv_tol = 1e-13
+                mf.conv_tol_grad = 1e-10
+                mf.kernel()
+                hobj = mf.Hessian().set(grid_response=True, cphf_residual_tol=1e-8)
+                if df:
+                    hobj.auxbasis_response = 2
+                hess = hobj.kernel()
+                ref = finite_diff_rows(mf, 2)
+                self.assertAlmostEqual(abs(hess[2] - ref).max(), 0, 6)
+                self.assertAlmostEqual(abs(hess.sum(axis=0)).max(), 0, 8)
+                hess0 = mf.Hessian().set(cphf_residual_tol=1e-8).kernel()
+                self.assertTrue(abs(hess0[2] - ref).max() > 1e-2)
+
+    def test_becke_weight_derivs(self):
+        # The first and second derivatives of the Becke weights against central differences of the weights
+        # of the points, which move with their atoms
+        from pyscf.hessian import rks as rks_hess
+        mol1 = gto.M(atom='O 0 0 0; H 0 .76 .58; H 0 -.8 .5; Cl 1.9 0.2 0.1', basis='sto-3g', charge=1,
+                     verbose=0)
+        def build(m):
+            g = dft.gen_grid.Grids(m)
+            g.atom_grid = (20, 50)
+            g.alignment = 0
+            return g.build(sort_grids=False)
+        grids = build(mol1)
+        eps = numpy.random.default_rng(1).standard_normal(grids.weights.size)
+        dw, d2 = rks_hess._becke_weight_derivs(mol1, grids, eps=eps)
+        x0 = mol1.atom_coords()
+        h = 1e-4
+        for ia in (0, 3):
+            for x in range(3):
+                w, d = [], []
+                for s in (h, -h):
+                    xs = x0.copy()
+                    xs[ia,x] += s
+                    m = mol1.set_geom_(xs, unit='Bohr', inplace=False)
+                    g = build(m)
+                    w.append(g.weights)
+                    d.append(numpy.einsum('Byg,g->By', rks_hess._becke_weight_derivs(m, g)[0], eps))
+                fd1 = (w[0] - w[1]) / (2*h)
+                fd2 = (d[0] - d[1]) / (2*h)
+                self.assertAlmostEqual(abs(dw[ia,x] - fd1).max() / abs(fd1).max(), 0, 7)
+                self.assertAlmostEqual(abs(d2[ia,:,x] - fd2).max() / abs(fd2).max(), 0, 6)
+        self.assertAlmostEqual(abs(d2 - d2.transpose(1,0,3,2)).max(), 0, 10)
+        self.assertAlmostEqual(abs(d2.sum(axis=0)).max(), 0, 9)
 
     def test_cphf_xc_lowrank(self):
         # The CPHF operator with the XC response from the factors of the dms

@@ -30,14 +30,13 @@ Non-relativistic UKS analytical Hessian
 import numpy
 from pyscf import lib
 from pyscf.lib import logger
+from pyscf.hessian import rks as rks_hess
 from pyscf.hessian import uks as uks_hess
 from pyscf.df.hessian import uhf as df_uhf_hess
 
 
 def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                       atmlst=None, max_memory=4000, verbose=None):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU UKS Hessian grid response is not implemented')
     log = logger.new_logger(hessobj, verbose)
     time0 = t1 = (logger.process_clock(), logger.perf_counter())
 
@@ -88,12 +87,14 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
+    if hessobj.grid_response:
+        de2 += rks_hess._get_exc_deriv2_grid_response(
+            hessobj, mo_coeff, mo_occ, max_memory, dms=(dm0a, dm0b))[numpy.ix_(atmlst, atmlst)]
+
     log.timer('UKS partial hessian', *time0)
     return de2
 
 def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU UKS Hessian grid response is not implemented')
     mol = hessobj.mol
     mf = hessobj.base
     ni = mf._numint
@@ -125,10 +126,8 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
 
 class Hessian(uks_hess.Hessian):
-    '''Non-relativistic UKS hessian.
-
-    Grid response is not implemented for this CPU Hessian.
-    Setting grid_response=True raises NotImplementedError.
+    '''Non-relativistic UKS hessian with density fitting. grid_response = True adds the
+    response of the XC grids, as in hessian.uks.Hessian.
     '''
 
     _keys = {'auxbasis_response',}

@@ -1297,3 +1297,128 @@ void VXC_vv10nlc_hessian_eval_EUW_with_weight1(double* __restrict__ Ew, double* 
     free(K);
 }
 }
+
+/* VXC_vv10nlc_hessian_eval_EUW_grid_response and, in the same pass over the pairs, the VV10 pair kernel's second
+ * derivative with the motion of both points of each pair (E_gr,gr of Liang, Feng, Liu, Head-Gordon, JCP 158, 204109
+ * (2023), Eq. 36; gpu4pyscf's D_B kernel): for the points i of atom G and the atoms B != G,
+ *     D_B[i] = -3 sum_{j of atom B} E_ij (2 (O^2 + (w_i/g_ij)^2 + (w_j/g_ji)^2 + ((w_i+w_j)/(g_ij+g_ji))^2) r_ji r_ji^T
+ *                                          - O 1),   O = w_i/g_ij + w_j/g_ji + (w_i+w_j)/(g_ij+g_ji),
+ * E_ij = rho_weight_j Phi_ij / 1.5, D_G[i] = -sum_{B != G} D_B[i], and d2e[G,B] += sum_i rho_weight_i D_B[i]. For
+ * points sorted by atom (the points of atom A are atom_offsets[A]:atom_offsets[A+1]): the inner
+ * loops over the points of each other atom are contiguous and without branches. Egr, Ugr, Wgr
+ * [natoms*3,ngrids] (in the sorted order) are overwritten; d2e [natoms,natoms,3,3] is added to, or NULL. */
+void VXC_vv10nlc_hessian_grid_response_sorted(double *Egr, double *Ugr, double *Wgr, double *d2e,
+                                              const double *grid_coord, const double *grid_weight,
+                                              const double *rho, const double *omega, const double *kappa,
+                                              const int *atom_offsets, const int ngrids, const int natoms)
+{
+    if (ngrids <= 0 || natoms <= 0) {
+        return;
+    }
+    const size_t ng = ngrids;
+    const size_t nd = (size_t)natoms * natoms * 9;
+    double *rw = malloc(sizeof(double) * ngrids);
+    double *xs = malloc(sizeof(double) * ngrids * 3);
+    double *ys = xs + ngrids;
+    double *zs = ys + ngrids;
+    for (int j = 0; j < ngrids; j++) {
+        rw[j] = grid_weight[j] * rho[j];
+        xs[j] = grid_coord[j*3+0];
+        ys[j] = grid_coord[j*3+1];
+        zs[j] = grid_coord[j*3+2];
+    }
+#pragma omp parallel
+{
+    double *acc = malloc(sizeof(double) * natoms * 16);
+    double *dacc = (d2e != NULL) ? calloc(nd, sizeof(double)) : NULL;
+#pragma omp for schedule(dynamic, 32)
+    for (int i = 0; i < ngrids; i++) {
+        int G = 0;
+        while (atom_offsets[G+1] <= i) {
+            G++;
+        }
+        const double omega_i = omega[i];
+        const double kappa_i = kappa[i];
+        const double xi = xs[i], yi = ys[i], zi = zs[i];
+        for (int B = 0; B < natoms; B++) {
+            double *a = acc + B * 16;
+            for (int k = 0; k < 16; k++) {
+                a[k] = 0;
+            }
+            if (B == G) {
+                continue;
+            }
+            double ex = 0, ey = 0, ez = 0, ux = 0, uy = 0, uz = 0, wx = 0, wy = 0, wz = 0;
+            double dxx = 0, dxy = 0, dxz = 0, dyy = 0, dyz = 0, dzz = 0, did = 0;
+            const int j0 = atom_offsets[B];
+            const int j1 = atom_offsets[B+1];
+#pragma omp simd reduction(+:ex,ey,ez,ux,uy,uz,wx,wy,wz,dxx,dxy,dxz,dyy,dyz,dzz,did)
+            for (int j = j0; j < j1; j++) {
+                const double rx = xs[j] - xi;
+                const double ry = ys[j] - yi;
+                const double rz = zs[j] - zi;
+                const double r2 = rx * rx + ry * ry + rz * rz;
+                const double g_ij = omega_i * r2 + kappa_i;
+                const double g_ji = omega[j] * r2 + kappa[j];
+                const double g_sum = g_ij + g_ji;
+                const double inv = 1 / (g_ij * g_ji * g_sum);  // one division for the three inverses
+                const double g_ij_1 = g_ji * g_sum * inv;
+                const double g_ji_1 = g_ij * g_sum * inv;
+                const double g_sum_1 = g_ij * g_ji * inv;
+                const double Ep = -rw[j] * inv;  // E_ij / 1.5
+                const double oi = omega_i * g_ij_1;
+                const double oj = omega[j] * g_ji_1;
+                const double os = (omega_i + omega[j]) * g_sum_1;
+                const double O = oi + oj + os;
+                const double P = g_sum_1 + g_ij_1;
+                const double Q2 = oi * g_ij_1 + os * g_sum_1;
+                const double E = 1.5 * Ep * O;
+                const double U = 1.5 * Ep * (O * P + Q2);
+                const double W = 1.5 * Ep * (r2 * (O * P + Q2) - P);
+                ex += E * rx; ey += E * ry; ez += E * rz;
+                ux += U * rx; uy += U * ry; uz += U * rz;
+                wx += W * rx; wy += W * ry; wz += W * rz;
+                const double outer = 2 * Ep * (O * O + oi * oi + oj * oj + os * os);
+                dxx += outer * rx * rx; dxy += outer * rx * ry; dxz += outer * rx * rz;
+                dyy += outer * ry * ry; dyz += outer * ry * rz; dzz += outer * rz * rz;
+                did -= Ep * O;
+            }
+            a[0] = ex; a[1] = ey; a[2] = ez; a[3] = ux; a[4] = uy; a[5] = uz; a[6] = wx; a[7] = wy; a[8] = wz;
+            a[9] = dxx; a[10] = dxy; a[11] = dxz; a[12] = dyy; a[13] = dyz; a[14] = dzz; a[15] = did;
+        }
+        double *own = acc + G * 16;
+        for (int B = 0; B < natoms; B++) {
+            if (B != G) {
+                for (int k = 0; k < 16; k++) {
+                    own[k] -= acc[B*16+k];
+                }
+            }
+        }
+        for (int B = 0; B < natoms; B++) {
+            const double *a = acc + B * 16;
+            for (int x = 0; x < 3; x++) {
+                Egr[(B*3+x) * ng + i] = -2 * a[x];
+                Ugr[(B*3+x) * ng + i] =  2 * a[3+x];
+                Wgr[(B*3+x) * ng + i] =  2 * a[6+x];
+            }
+            if (dacc != NULL) {
+                const double fac = -3 * rw[i];
+                double *d = dacc + ((size_t)G * natoms + B) * 9;
+                d[0] += fac * (a[9] + a[15]);  d[1] += fac * a[10];           d[2] += fac * a[11];
+                d[3] += fac * a[10];           d[4] += fac * (a[12] + a[15]); d[5] += fac * a[13];
+                d[6] += fac * a[11];           d[7] += fac * a[13];           d[8] += fac * (a[14] + a[15]);
+            }
+        }
+    }
+    if (dacc != NULL) {
+#pragma omp critical
+        for (size_t k = 0; k < nd; k++) {
+            d2e[k] += dacc[k];
+        }
+        free(dacc);
+    }
+    free(acc);
+}
+    free(rw);
+    free(xs);
+}

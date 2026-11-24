@@ -234,6 +234,320 @@ void VXCbecke_weight_derivative(double* __restrict__ dwdG, const double* __restr
     }
 }
 
+/*
+ * The first and second derivatives of the Becke weights w_g = q_g P_G(r_g) / Z(r_g), Z = sum_C P_C, of the
+ * points g of atom G = atm_idx[g], which move with G, with respect to the atom coordinates. The partition is
+ * that of VXCgen_grid: the pairs i > j with nu = mu_ij + a_ij (1 - mu_ij^2), s_ij = (1 - f3(nu)) / 2 and
+ * s_ji = (1 + f3(nu)) / 2, P_C = prod_D s_CD. With L_C = log P_C, at fixed r_g and for atoms A, B != G,
+ *     dw/dA = w t_A,  t = dL_G - dZ/Z,
+ *     d2w/dAdB = w (t_A t_B + d2L_G - d2Z/Z + dZ dZ/Z^2),  dZ = sum_C P_C dL_C,  d2Z = sum_C P_C (dL_C dL_C + d2L_C);
+ * the rows and columns of G follow from translational invariance. Only the C with P_C > BECKE_P_TOL Z, and of
+ * their pairs (C,D) those whose log s_CD has a derivative above BECKE_L_TOL, are visited.
+ *   dwdA [natm,3,ngrids]: the first derivatives (all atoms written), or NULL
+ *   d2e [natm,3,natm,3]: d2e += sum_g eps[g] d2w_g/dAdB, or NULL (eps is then not read)
+ *   a_factor [natm,natm]: the radii adjustment a_ij of VXCgen_grid's radii_table, or NULL
+ */
+#define BECKE_P_TOL 1e-15
+#define BECKE_L_TOL 1e-15
+
+void VXCbecke_weight_derivs(double *dwdA, double *d2e, const double *eps,
+                            const double *coords, const double *qweights, const int *atm_idx,
+                            const double *atm_coords, const double *a_factor,
+                            const int ngrids, const int natm)
+{
+    if (ngrids <= 0 || natm <= 0) {
+        return;
+    }
+    const size_t ng = ngrids;
+    const int n3 = natm * 3;
+    double *inv_R = malloc(sizeof(double) * natm * natm);
+    for (int i = 0; i < natm; i++) {
+        for (int j = 0; j < natm; j++) {
+            const double dx = atm_coords[i*3+0] - atm_coords[j*3+0];
+            const double dy = atm_coords[i*3+1] - atm_coords[j*3+1];
+            const double dz = atm_coords[i*3+2] - atm_coords[j*3+2];
+            inv_R[i*natm+j] = (i == j) ? 0 : 1 / sqrt(dx*dx + dy*dy + dz*dz);
+        }
+    }
+#pragma omp parallel
+{
+    double *rA = malloc(sizeof(double) * natm * 5);
+    double *uA = rA + natm;
+    double *P = uA + natm * 3;
+    double *dl = malloc(sizeof(double) * natm * natm * 2);
+    double *d2l = dl + natm * natm;
+    int *slot = malloc(sizeof(int) * natm * 3);
+    int *satom = slot + natm;
+    int *active = satom + natm;
+    const size_t nmax = n3;
+    double *aC = malloc(sizeof(double) * (nmax * 4 + nmax * nmax * 3));
+    double *aG = aC + nmax;
+    double *ZX = aG + nmax;
+    double *t = ZX + nmax;
+    double *bC = t + nmax;
+    double *bG = bC + nmax * nmax;
+    double *ZXY = bG + nmax * nmax;
+    double *acc = NULL;
+    if (d2e != NULL) {
+        acc = calloc((size_t)n3 * n3, sizeof(double));
+    }
+
+#pragma omp for schedule(dynamic, 16)
+    for (size_t g = 0; g < ng; g++) {
+        const int G = atm_idx[g];
+        if (dwdA != NULL) {
+            for (int k = 0; k < n3; k++) {
+                dwdA[k * ng + g] = 0;
+            }
+        }
+        if (G < 0 || qweights[g] == 0) {
+            continue;
+        }
+        const double rx = coords[g*3+0];
+        const double ry = coords[g*3+1];
+        const double rz = coords[g*3+2];
+        for (int A = 0; A < natm; A++) {
+            const double dx = atm_coords[A*3+0] - rx;
+            const double dy = atm_coords[A*3+1] - ry;
+            const double dz = atm_coords[A*3+2] - rz;
+            const double r = sqrt(dx*dx + dy*dy + dz*dz);
+            const double r_1 = (r > 1e-14) ? 1 / r : 0;
+            rA[A] = r;
+            uA[A*3+0] = dx * r_1;
+            uA[A*3+1] = dy * r_1;
+            uA[A*3+2] = dz * r_1;
+            P[A] = 1;
+        }
+        for (int i = 0; i < natm; i++) {
+            for (int j = 0; j < i; j++) {
+                const double mu = (rA[i] - rA[j]) * inv_R[i*natm+j];
+                const double a = (a_factor != NULL) ? a_factor[i*natm+j] : 0;
+                const double nu = mu + a * (1 - mu * mu);
+                const double nu_m = 1 - 2 * a * mu;
+                const double nu_mm = -2 * a;
+                const double f1 = (3 - nu * nu) * nu * .5;
+                const double f2 = (3 - f1 * f1) * f1 * .5;
+                const double F = (3 - f2 * f2) * f2 * .5;
+                const double d1 = 1.5 * (1 - nu * nu);
+                const double d2 = 1.5 * (1 - f1 * f1);
+                const double d3 = 1.5 * (1 - f2 * f2);
+                const double F_nu = d3 * d2 * d1;
+                const double F_nunu = -3 * f2 * (d2 * d1) * (d2 * d1) + d3 * (-3 * f1 * d1 * d1 + d2 * -3 * nu);
+                const double F_m = F_nu * nu_m;
+                const double F_mm = F_nunu * nu_m * nu_m + F_nu * nu_mm;
+                const double sm = .5 * (1 - F);
+                const double sp = .5 * (1 + F);
+                P[i] *= sm;
+                P[j] *= sp;
+                double l1 = 0, l2 = 0;
+                if (sm > 0) {
+                    l1 = -.5 * F_m / sm;
+                    l2 = -.5 * F_mm / sm - l1 * l1;
+                }
+                dl[i*natm+j] = l1;
+                d2l[i*natm+j] = l2;
+                l1 = l2 = 0;
+                if (sp > 0) {
+                    l1 = .5 * F_m / sp;
+                    l2 = .5 * F_mm / sp - l1 * l1;
+                }
+                dl[j*natm+i] = l1;
+                d2l[j*natm+i] = l2;
+            }
+        }
+        double Z = 0;
+        for (int C = 0; C < natm; C++) {
+            Z += P[C];
+        }
+        if (!(P[G] > BECKE_P_TOL * Z)) {
+            continue;
+        }
+        const double w = qweights[g] * P[G] / Z;
+        const double Z_1 = 1 / Z;
+
+        // the atoms of the derivatives (G excluded)
+        int nact = 0, nS = 0;
+        for (int A = 0; A < natm; A++) {
+            slot[A] = -1;
+        }
+        for (int C = 0; C < natm; C++) {
+            if (!(P[C] > BECKE_P_TOL * Z)) {
+                continue;
+            }
+            active[nact++] = C;
+            for (int D = 0; D < natm; D++) {
+                if (D == C || (fabs(dl[C*natm+D]) <= BECKE_L_TOL && fabs(d2l[C*natm+D]) <= BECKE_L_TOL)) {
+                    continue;
+                }
+                if (C != G && slot[C] < 0) {
+                    slot[C] = nS;
+                    satom[nS++] = C;
+                }
+                if (D != G && slot[D] < 0) {
+                    slot[D] = nS;
+                    satom[nS++] = D;
+                }
+            }
+        }
+        if (nS == 0) {
+            continue;
+        }
+        const int n = nS * 3;
+        for (int p = 0; p < n; p++) {
+            ZX[p] = 0;
+            aG[p] = 0;
+        }
+        if (d2e != NULL) {
+            for (int p = 0; p < n * n; p++) {
+                ZXY[p] = 0;
+                bG[p] = 0;
+            }
+        }
+
+        for (int ic = 0; ic < nact; ic++) {
+            const int C = active[ic];
+            for (int p = 0; p < n; p++) {
+                aC[p] = 0;
+            }
+            if (d2e != NULL) {
+                for (int p = 0; p < n * n; p++) {
+                    bC[p] = 0;
+                }
+            }
+            for (int D = 0; D < natm; D++) {
+                const double l1 = dl[C*natm+D];
+                const double l2 = d2l[C*natm+D];
+                if (D == C || (fabs(l1) <= BECKE_L_TOL && fabs(l2) <= BECKE_L_TOL)) {
+                    continue;
+                }
+                // mu_ij of the pair, (i,j) = (max, min)(C,D), and its derivatives
+                const int i = (C > D) ? C : D;
+                const int j = (C > D) ? D : C;
+                const double R_1 = inv_R[i*natm+j];
+                const double R_2 = R_1 * R_1;
+                const double mu = (rA[i] - rA[j]) * R_1;
+                const double e[3] = {(atm_coords[i*3+0] - atm_coords[j*3+0]) * R_1,
+                                     (atm_coords[i*3+1] - atm_coords[j*3+1]) * R_1,
+                                     (atm_coords[i*3+2] - atm_coords[j*3+2]) * R_1};
+                const double *ui = uA + i * 3;
+                const double *uj = uA + j * 3;
+                double mi[3], mj[3];
+                for (int x = 0; x < 3; x++) {
+                    mi[x] = ( ui[x] - mu * e[x]) * R_1;
+                    mj[x] = (-uj[x] + mu * e[x]) * R_1;
+                }
+                const int si = slot[i];
+                const int sj = slot[j];
+                if (si >= 0) {
+                    for (int x = 0; x < 3; x++) {
+                        aC[si*3+x] += l1 * mi[x];
+                    }
+                }
+                if (sj >= 0) {
+                    for (int x = 0; x < 3; x++) {
+                        aC[sj*3+x] += l1 * mj[x];
+                    }
+                }
+                if (d2e == NULL) {
+                    continue;
+                }
+                const double ri_1 = (rA[i] > 1e-14) ? 1 / rA[i] : 0;
+                const double rj_1 = (rA[j] > 1e-14) ? 1 / rA[j] : 0;
+                for (int x = 0; x < 3; x++) {
+                    for (int y = 0; y < 3; y++) {
+                        const double delta = (x == y) ? 1 : 0;
+                        const double common = (-mu * (delta - e[x] * e[y]) + 2 * mu * e[x] * e[y]) * R_2;
+                        if (si >= 0) {
+                            const double mii = (delta - ui[x] * ui[y]) * ri_1 * R_1
+                                - (ui[x] * e[y] + e[x] * ui[y]) * R_2 + common;
+                            bC[(si*3+x)*n + si*3+y] += l2 * mi[x] * mi[y] + l1 * mii;
+                        }
+                        if (sj >= 0) {
+                            const double mjj = -(delta - uj[x] * uj[y]) * rj_1 * R_1
+                                - (uj[x] * e[y] + e[x] * uj[y]) * R_2 + common;
+                            bC[(sj*3+x)*n + sj*3+y] += l2 * mj[x] * mj[y] + l1 * mjj;
+                        }
+                        if (si >= 0 && sj >= 0) {
+                            const double mij = (ui[x] * e[y] + e[x] * uj[y]) * R_2 - common;
+                            const double v = l2 * mi[x] * mj[y] + l1 * mij;
+                            bC[(si*3+x)*n + sj*3+y] += v;
+                            bC[(sj*3+y)*n + si*3+x] += v;
+                        }
+                    }
+                }
+            }
+            const double PC = P[C];
+            for (int p = 0; p < n; p++) {
+                ZX[p] += PC * aC[p];
+            }
+            if (C == G) {
+                for (int p = 0; p < n; p++) {
+                    aG[p] = aC[p];
+                }
+            }
+            if (d2e != NULL) {
+                for (int p = 0; p < n; p++) {
+                    for (int q = 0; q < n; q++) {
+                        ZXY[p*n+q] += PC * (aC[p] * aC[q] + bC[p*n+q]);
+                    }
+                }
+                if (C == G) {
+                    for (int p = 0; p < n * n; p++) {
+                        bG[p] = bC[p];
+                    }
+                }
+            }
+        }
+
+        for (int p = 0; p < n; p++) {
+            t[p] = aG[p] - ZX[p] * Z_1;
+        }
+        if (dwdA != NULL) {
+            for (int s = 0; s < nS; s++) {
+                const int A = satom[s];
+                for (int x = 0; x < 3; x++) {
+                    const double v = w * t[s*3+x];
+                    dwdA[(A*3+x) * ng + g] = v;
+                    dwdA[(G*3+x) * ng + g] -= v;
+                }
+            }
+        }
+        if (d2e != NULL) {
+            const double fac = w * eps[g];
+            for (int sp_ = 0; sp_ < nS; sp_++) {
+                const int A = satom[sp_];
+                for (int sq = 0; sq < nS; sq++) {
+                    const int B = satom[sq];
+                    for (int x = 0; x < 3; x++) {
+                        for (int y = 0; y < 3; y++) {
+                            const int p = sp_*3+x, q = sq*3+y;
+                            const double h = fac * (t[p] * t[q] + bG[p*n+q] - ZXY[p*n+q] * Z_1
+                                                    + ZX[p] * ZX[q] * Z_1 * Z_1);
+                            acc[(A*3+x)*n3 + B*3+y] += h;
+                            acc[(G*3+x)*n3 + B*3+y] -= h;
+                            acc[(A*3+x)*n3 + G*3+y] -= h;
+                            acc[(G*3+x)*n3 + G*3+y] += h;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (d2e != NULL) {
+#pragma omp critical
+        for (size_t k = 0; k < (size_t)n3 * n3; k++) {
+            d2e[k] += acc[k];
+        }
+        free(acc);
+    }
+    free(rA);
+    free(dl);
+    free(slot);
+    free(aC);
+}
+    free(inv_R);
+}
+
 inline double _lko_sat_func(double x) {
     int m;
     double tot = 0;
@@ -578,4 +892,91 @@ void VXCgen_grid_lko_deriv(double *out, double *dw, double *coords, double *atm_
     free(dadx);
     free(dady);
     free(dadz);
+}
+
+/*
+ * The potential u times the motion of the points applied to the orbital response of the density (the d2rho
+ * terms of the Hessian's grid response, hessian.rks._grid_d2rho_dot): for X[c] = ao[c] dm and each AO mu,
+ *   q[mu,D,d] = sum_g  2 (d_dD mu Vg + d_D mu W_d + Phi3_dD X0 + Phi2_D X_d)
+ *                    + u_tau sum_x (d_dDx mu X_x + d_Dx mu X_dx)          (meta-GGA)
+ * with Vg = u0 X0 + sum_x u_x X_x, W_d = u0 X_d + sum_x u_x X_dx, Phi2_D = sum_x u_x d_Dx mu,
+ * Phi3_dD = sum_x u_x d_dDx mu; for LDA q = 2 sum_g u0 (d_dD mu X0 + d_D mu X_d).
+ *   ao [ncomp_ao,ngrids,nao] (to third derivatives, PySCF's order), X [nX,ngrids,nao] (4 for LDA, else 10),
+ *   u [ncomp,ngrids], xctype 0 LDA, 1 GGA, 2 meta-GGA; q [nao,3,3] is added to.
+ */
+static const int D2IDX[3][3] = {{4, 5, 6}, {5, 7, 8}, {6, 8, 9}};
+static const int D3IDX[3][3][3] = {
+    {{10, 11, 12}, {11, 13, 14}, {12, 14, 15}},
+    {{11, 13, 14}, {13, 16, 17}, {14, 17, 18}},
+    {{12, 14, 15}, {14, 17, 18}, {15, 18, 19}}};
+
+void VXCgrid_d2rho_dot(double *q, const double *ao, const double *X, const double *u,
+                       const int xctype, const int ngrids, const int nao)
+{
+    const size_t Ng = ngrids;
+    const size_t stride = Ng * nao;
+    const int GBLK = 64;
+#pragma omp parallel
+{
+    double *qt = calloc((size_t)nao * 9, sizeof(double));
+#pragma omp for schedule(dynamic, 1)
+    for (int g0 = 0; g0 < ngrids; g0 += GBLK) {
+        const int g1 = (g0 + GBLK < ngrids) ? g0 + GBLK : ngrids;
+        for (int g = g0; g < g1; g++) {
+            const size_t off = (size_t)g * nao;
+            const double u0 = u[g];
+            const double *X0 = X + off;
+            if (xctype == 0) {
+                for (int D = 0; D < 3; D++) {
+                    const double *aD = ao + (1+D) * stride + off;
+                    for (int d = 0; d < 3; d++) {
+                        const double *adD = ao + D2IDX[d][D] * stride + off;
+                        const double *Xd = X + (1+d) * stride + off;
+                        double *qq = qt + D * 3 + d;
+#pragma omp simd
+                        for (int m = 0; m < nao; m++) {
+                            qq[m*9] += 2 * u0 * (adD[m] * X0[m] + aD[m] * Xd[m]);
+                        }
+                    }
+                }
+                continue;
+            }
+            const double ux[3] = {u[Ng+g], u[2*Ng+g], u[3*Ng+g]};
+            const double ut = (xctype == 2) ? u[4*Ng+g] : 0;
+            const double *X1[3] = {X + stride + off, X + 2*stride + off, X + 3*stride + off};
+            for (int D = 0; D < 3; D++) {
+                const double *aD = ao + (1+D) * stride + off;
+                const double *aDx[3] = {ao + D2IDX[D][0] * stride + off, ao + D2IDX[D][1] * stride + off,
+                                        ao + D2IDX[D][2] * stride + off};
+                for (int d = 0; d < 3; d++) {
+                    const double *adD = ao + D2IDX[d][D] * stride + off;
+                    const double *adDx[3] = {ao + D3IDX[d][D][0] * stride + off, ao + D3IDX[d][D][1] * stride + off,
+                                             ao + D3IDX[d][D][2] * stride + off};
+                    const double *Xd = X1[d];
+                    const double *Xdx[3] = {X + D2IDX[d][0] * stride + off, X + D2IDX[d][1] * stride + off,
+                                            X + D2IDX[d][2] * stride + off};
+                    double *qq = qt + D * 3 + d;
+#pragma omp simd
+                    for (int m = 0; m < nao; m++) {
+                        const double Vg = u0 * X0[m] + ux[0] * X1[0][m] + ux[1] * X1[1][m] + ux[2] * X1[2][m];
+                        const double Wd = u0 * Xd[m] + ux[0] * Xdx[0][m] + ux[1] * Xdx[1][m] + ux[2] * Xdx[2][m];
+                        const double phi2 = ux[0] * aDx[0][m] + ux[1] * aDx[1][m] + ux[2] * aDx[2][m];
+                        const double phi3 = ux[0] * adDx[0][m] + ux[1] * adDx[1][m] + ux[2] * adDx[2][m];
+                        double v = 2 * (adD[m] * Vg + aD[m] * Wd + phi3 * X0[m] + phi2 * Xd[m]);
+                        if (xctype == 2) {
+                            v += ut * (adDx[0][m] * X1[0][m] + adDx[1][m] * X1[1][m] + adDx[2][m] * X1[2][m]
+                                       + aDx[0][m] * Xdx[0][m] + aDx[1][m] * Xdx[1][m] + aDx[2][m] * Xdx[2][m]);
+                        }
+                        qq[m*9] += v;
+                    }
+                }
+            }
+        }
+    }
+#pragma omp critical
+    for (size_t k = 0; k < (size_t)nao * 9; k++) {
+        q[k] += qt[k];
+    }
+    free(qt);
+}
 }

@@ -105,6 +105,29 @@ class KnownValues(unittest.TestCase):
     def tearDownClass(cls):
         dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = cls.original_grids
 
+    def test_grid_response(self):
+        # As test_rks.test_grid_response for a radical
+        from pyscf.hessian.test.test_rks import finite_diff_rows
+        mol1 = gto.M(atom='C 0 0 0; H 0 0.93 0.45; H 0.1 -0.93 0.5; Cl 0 0.1 -1.75', basis='def2-svp', spin=1,
+                     verbose=0)
+        for xc, df in (('b3lyp', False), ('m06l', True), ('wb97m-v', False)):
+            with self.subTest(xc=xc, df=df):
+                mf = dft.UKS(mol1, xc=xc)
+                if df:
+                    mf = mf.density_fit()
+                mf.grids.atom_grid = (30, 110)
+                mf.nlcgrids.atom_grid = (20, 50)
+                mf.conv_tol = 1e-13
+                mf.conv_tol_grad = 1e-10
+                mf.kernel()
+                hobj = mf.Hessian().set(grid_response=True, cphf_residual_tol=1e-8)
+                if df:
+                    hobj.auxbasis_response = 2
+                hess = hobj.kernel()
+                ref = finite_diff_rows(mf, 3)
+                self.assertAlmostEqual(abs(hess[3] - ref).max(), 0, 6)
+                self.assertAlmostEqual(abs(hess.sum(axis=0)).max(), 0, 8)
+
     def test_cphf_xc_lowrank(self):
         # The CPHF operator with the XC response from the factors of the dms
         # (vind_mo of the response function, either path) against the one from

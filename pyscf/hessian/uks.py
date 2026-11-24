@@ -34,8 +34,6 @@ _get_jk = rhf_hess._get_jk
 
 def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                       atmlst=None, max_memory=4000, verbose=None):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU UKS Hessian grid response is not implemented')
     log = logger.new_logger(hessobj, verbose)
     time0 = t1 = (logger.process_clock(), logger.perf_counter())
 
@@ -88,6 +86,11 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
+    if hessobj.grid_response:
+        de2 += rks_hess._get_exc_deriv2_grid_response(hessobj, mo_coeff, mo_occ, max_memory,
+                                                      dms=(dm0a, dm0b))[numpy.ix_(atmlst, atmlst)]
+        t1 = log.timer_debug1('grid response of the XC energy', *t1)
+
     if mf.do_nlc():
         mo_sf, occ_sf = _total_density_orbitals(mo_coeff, mo_occ)
         de2 += rks_hess._get_enlc_deriv2(hessobj, mo_sf, occ_sf, max_memory)
@@ -104,8 +107,6 @@ def _total_density_orbitals(mo_coeff, mo_occ):
     return mocc, numpy.full(mocc.shape[1], 2.)
 
 def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU UKS Hessian grid response is not implemented')
     mol = hessobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
@@ -657,12 +658,25 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
     vmat = numpy.zeros((2,mol.natm,3,nao,nao))
     vmata, vmatb = vmat
     max_memory = max(2000, max_memory-vmat.size*8/1e6)
+    # the grid response of each spin's potentials (see rks_hess._grid_response_wv_, _grid_motion_vmat_)
+    grid_response = getattr(hessobj, 'grid_response', False)
+    if grid_response:
+        table = rks_hess._becke_radii_table(mol, grids)
+        def grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, fac):
+            own = grids.atm_idx[ip0:ip1]
+            dw = rks_hess._becke_weight_derivs(mol, grids, ip0, ip1, None, True, table)[0]
+            idx = rks_hess._nonzero_aos(mol, mask, nao)
+            for s in range(2):
+                rks_hess._grid_response_wv_(wv[s], vxc[s], own, dw, fac)
+                rks_hess._grid_motion_vmat_(vmat[s], mol, ao, wv0[s], xctype, own, idx)
+    ip1 = 0
     if xctype == 'LDA':
         ao_deriv = 1
         vipa = numpy.zeros((3,nao,nao))
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[0], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[0], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 2, xctype=xctype)[1:3]
@@ -684,6 +698,8 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 w  = wf[0,:,None] * rho1a
                 w += wf[1,:,None] * rho1b
                 wv[:,ia,:,0] = w
+            if grid_response:
+                grid_terms(wv, vxc, (weight * vxc[:,0])[:,None], ao, mask, ip0, ip1, .5)
             # vmat[s,ia,i] += (ao[0]*wv[s,ia,i]).T.dot(ao[0]) for both spins and all atoms
             numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,1,weight.size),
                                     mask, ao_loc)
@@ -702,6 +718,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[:4], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:4], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 2, xctype=xctype)[1:3]
@@ -713,6 +730,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             ao_dm0a = [numint._dot_ao_dm(mol, ao[i], dm0a, mask, shls_slice, ao_loc) for i in range(4)]
             ao_dm0b = [numint._dot_ao_dm(mol, ao[i], dm0b, mask, shls_slice, ao_loc) for i in range(4)]
             wf = weight * fxc
+            wv0 = wv
             wv = numpy.empty((2,mol.natm,3,4,weight.size))
             for ia in range(mol.natm):
                 dR_rho1a = rks_hess._make_dR_rho1(ao, ao_dm0a, ia, aoslices, xctype)
@@ -720,6 +738,8 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 w  = numpy.einsum('xbyg,sxg->bsyg', wf[0], dR_rho1a)
                 w += numpy.einsum('xbyg,sxg->bsyg', wf[1], dR_rho1b)
                 wv[:,ia] = w
+            if grid_response:
+                grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, 1.)
             wv[:,:,:,0] *= .5
             # vmat[s,ia,i] += einsum('xgp,xg->gp', ao[:4], wv[s,ia,i]).T.dot(ao[0])
             numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,4,weight.size),
@@ -740,6 +760,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
                 in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+            ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[:10], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:10], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 2, xctype=xctype)[1:3]
@@ -755,6 +776,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             ao_dm0a = [numint._dot_ao_dm(mol, ao[i], dm0a, mask, shls_slice, ao_loc) for i in range(4)]
             ao_dm0b = [numint._dot_ao_dm(mol, ao[i], dm0b, mask, shls_slice, ao_loc) for i in range(4)]
             wf = weight * fxc
+            wv0 = wv
             wv = numpy.empty((2,mol.natm,3,5,weight.size))
             for ia in range(mol.natm):
                 dR_rho1a = rks_hess._make_dR_rho1(ao, ao_dm0a, ia, aoslices, xctype)
@@ -762,6 +784,8 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 w  = numpy.einsum('xbyg,sxg->bsyg', wf[0], dR_rho1a)
                 w += numpy.einsum('xbyg,sxg->bsyg', wf[1], dR_rho1b)
                 wv[:,ia] = w
+            if grid_response:
+                grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, 1.)
             wv[:,:,:,0] *= .5
             wv[:,:,:,4] *= .25
             # vmat[s,ia,i] += einsum('xgp,xg->gp', ao[:4], wv[s,ia,i,:4]).T.dot(ao[0])
@@ -783,8 +807,8 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
 class Hessian(rhf_hess.HessianBase):
     '''Non-relativistic UKS hessian.
 
-    Grid response is not implemented for this CPU Hessian.
-    Setting grid_response=True raises NotImplementedError.
+    grid_response = True adds the response of the XC (and VV10) grids, as in
+    hessian.rks.Hessian.
     '''
 
     _keys = {'grids', 'grid_response'}

@@ -45,8 +45,6 @@ contract = numpy.einsum
 
 def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                       atmlst=None, max_memory=4000, verbose=None):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU RKS Hessian grid response is not implemented')
     log = logger.new_logger(hessobj, verbose)
     time0 = t1 = (logger.process_clock(), logger.perf_counter())
 
@@ -91,6 +89,10 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
         for j0 in range(i0):
             de2[j0,i0] = de2[i0,j0].T
 
+    if hessobj.grid_response:
+        de2 += _get_exc_deriv2_grid_response(hessobj, mo_coeff, mo_occ, max_memory)[numpy.ix_(atmlst, atmlst)]
+        t1 = log.timer_debug1('grid response of the XC energy', *t1)
+
     if mf.do_nlc():
         de2 += _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
 
@@ -111,8 +113,6 @@ def _make_h1_split(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose
     return make_h1(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose, _split=True)
 
 def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None, _split=False):
-    if hessobj.grid_response:
-        raise NotImplementedError('CPU RKS Hessian grid response is not implemented')
     mol = hessobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
@@ -1112,6 +1112,57 @@ class _VV10HessData:
                     zip((mol._atm, mol._bas, mol._env), self.mol_data)) and
                 numpy.array_equal(dm0, self.dm0))
 
+    def grid_response_pair(self, natm, with_d2e=False, keep=False):
+        '''E, U, W [natm*3,ngrids] of the motion of the other point of each pair (as
+        VXC_vv10nlc_hessian_eval_EUW_grid_response), and with_d2e the term of the motion of both points, d2e
+        [natm,natm,3,3], in the same pass over the pairs (points sorted by atom). keep: hand E, U, W to the next
+        call without with_d2e (the Fock matrix derivative after the energy terms of a Hessian).'''
+        euw = self.__dict__.pop('_euw_grid_response', None)
+        if euw is not None and not with_d2e:
+            return euw
+        valid = numpy.nonzero(self.atm_idx >= 0)[0]
+        idx = valid[numpy.argsort(self.atm_idx[valid], kind='stable')]
+        offsets = numpy.zeros(natm+1, dtype=numpy.int32)
+        offsets[1:] = numpy.cumsum(numpy.bincount(self.atm_idx[idx], minlength=natm))
+        n = idx.size
+        sorted_ = [numpy.ascontiguousarray(x[idx]) for x in
+                   (self.coords, self.weights, self.rho, self.omega, self.kappa)]
+        E, U, W = [numpy.empty((natm*3,n)) for i in range(3)]
+        d2e = numpy.zeros((natm,natm,3,3)) if with_d2e else None
+        libdft.VXC_vv10nlc_hessian_grid_response_sorted(
+            *[x.ctypes.data_as(ctypes.c_void_p) for x in (E, U, W)],
+            lib.c_null_ptr() if d2e is None else d2e.ctypes.data_as(ctypes.c_void_p),
+            *[x.ctypes.data_as(ctypes.c_void_p) for x in sorted_],
+            offsets.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(n), ctypes.c_int(natm))
+        euw = []
+        for x in (E, U, W):
+            y = numpy.zeros((natm*3,self.ngrids))
+            y[:,idx] = x
+            euw.append(y)
+        if keep:
+            self._euw_grid_response = [x.copy() for x in euw]
+        if with_d2e:
+            return euw + [d2e]
+        return euw
+
+    def weight1_pair(self, dw, keep=False):
+        '''Ew, Uw, Ww [nderivative,ngrids] of the weight derivatives dw [nderivative,ngrids] of the other point
+        of each pair (VXC_vv10nlc_hessian_eval_EUW_with_weight1); keep: hand them to the next call'''
+        euw = self.__dict__.pop('_euw_weight1', None)
+        if euw is not None and euw[0].shape == dw.shape:
+            return euw
+        dw = numpy.ascontiguousarray(dw)
+        nd = dw.shape[0]
+        euw = [numpy.empty((nd,self.ngrids)) for i in range(3)]
+        libdft.VXC_vv10nlc_hessian_eval_EUW_with_weight1(
+            *[x.ctypes.data_as(ctypes.c_void_p) for x in euw],
+            self.coords.ctypes.data_as(ctypes.c_void_p), dw.ctypes.data_as(ctypes.c_void_p),
+            self.rho.ctypes.data_as(ctypes.c_void_p), self.omega.ctypes.data_as(ctypes.c_void_p),
+            self.kappa.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(self.ngrids), ctypes.c_int(nd))
+        if keep:
+            self._euw_weight1 = [x.copy() for x in euw]
+        return euw
+
     def full(self, x):
         '''x on the points of the mask, zero elsewhere: x[...,ngrids] -> [...,ngrids_full]'''
         out = numpy.zeros(x.shape[:-1] + (self.ngrids_full,))
@@ -1291,7 +1342,9 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
         VV10-containing density functionals: Theory, efficient implementation, and
         benchmark assessments. J Chem Phys. 2023 May 28;158(20):204109. doi: 10.1063/5.0152838.
 
-        The VV10 energy second derivative without grid response: f_rho d2rho/dAdB + f_gamma d2gamma/dAdB,
+        The VV10 energy second derivative (with hessobj.grid_response, the response of the points and the
+        weights of the grids is added: the density responses below include the motion of the points, and
+        _vv10_grid_response_terms adds the rest). Without it: f_rho d2rho/dAdB + f_gamma d2gamma/dAdB,
         whose AO-diagonal terms (A = B) and the pair terms take the GGA kernels of the XC Hessian
         (_get_vxc_diag, _get_vxc_deriv2_dm), and the kernel terms of drho/dA and dgamma/dA.
     """
@@ -1308,6 +1361,7 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
     dm0 = 2 * mocc @ mocc.T
     vv = _vv10_hess_data(mf, mol, dm0, max_memory)
     grids = mf.nlcgrids
+    grid_response = getattr(hessobj, 'grid_response', False)
     fused = numint._fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (), radial_cache=False)
 
     # The ground-state potential in the GGA convention (d/d rho, 2 d/d gamma nabla rho), weighted
@@ -1343,6 +1397,8 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
         _d1d2_dot_(ipip, mol, aow, ao[1:4], mask, ao_loc, False)
         aow = None
         drho, d2rho = _vv10_drho_dA(mol, ao, dm0, mask, aoslices)
+        if grid_response:
+            _vv10_add_grid_response_(drho, d2rho, grids.atm_idx[p0:p1])
         drho_dA[:,:,p0:p1] = drho
         dgamma_dA[:,:,p0:p1] = 2 * numpy.einsum('axig,ig->axg', d2rho, nabla_rho[:,p0:p1])
         t = d2rho.reshape(natm*3, -1)
@@ -1366,6 +1422,74 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
     d2e_k = lib.dot(drho_dA, (f_rho_A * vv.weights).T)
     d2e_k += lib.dot(dgamma_dA, (f_gamma_A * vv.weights).T)
     d2e += d2e_k.reshape(natm,3,natm,3).transpose(0,2,1,3)
+    f_rho_A = f_gamma_A = d2e_k = None
+    if grid_response:
+        d2e += _vv10_grid_response_terms(mf, mol, grids, vv, dm0, drho_dA, dgamma_dA, wv[0], max_memory)
+    return d2e
+
+def _vv10_grid_response_terms(mf, mol, grids, vv, dm0, drho_dA, dgamma_dA, u, max_memory):
+    '''The terms of the VV10 energy's second derivative that the Becke weights and the motion of the points add
+    to those of _get_enlc_deriv2 with the full density responses drho_dA, dgamma_dA [natm*3,ngrids of the
+    mask] (the orbital response and the motion of the points): Liang, Feng, Liu, Head-Gordon, JCP 158, 204109
+    (2023), Eqs. 32-37, as gpu4pyscf's _get_enlc_deriv2 with grid_response. u [4,ngrids_full]: the weighted
+    ground-state potential (f_rho, 2 f_gamma nabla rho).'''
+    natm = mol.natm
+    nao = mol.nao
+    ng = vv.ngrids
+    def pair(a, b):
+        '''sum_g a[A,d,g] b[B,D,g] + the transpose, [natm,natm,3,3]'''
+        m = lib.dot(a, b.T).reshape(natm,3,natm,3).transpose(0,2,1,3)
+        return m + m.transpose(1,0,3,2)
+
+    # E_ww: the second derivatives of the weights, and the first derivatives of the weights of both points
+    table = _becke_radii_table(mol, grids)
+    dw, d2e = _becke_weight_derivs(mol, grids, 0, None, vv.full(vv.rho * (vv.beta + vv.E)), True, table)
+    dw = numpy.ascontiguousarray(dw[:,:,vv.mask]).reshape(natm*3,ng)
+    # the pair terms of the weights and of the motion of the points are those of the VV10 Fock matrix
+    # derivative too (_get_vnlc_deriv1, after this in hess_elec): kept for it if they fit in memory
+    keep = 6 * dw.nbytes / 1e6 < .5 * max(0, mf.max_memory - lib.current_memory()[0])
+    logger.debug1(mf, 'VV10 pair terms of the grid response kept for the Fock matrix derivative: %s', keep)
+    Ew, Uw, Ww = vv.weight1_pair(dw, keep)
+    d2e += lib.dot(dw, (Ew * vv.rho).T).reshape(natm,3,natm,3).transpose(0,2,1,3)
+    # E_Gw: the weights with the density responses
+    d2e += pair(dw, drho_dA * vv.f_rho + dgamma_dA * vv.f_gamma)
+    d2e += pair(drho_dA, (Ew + (Uw * vv.dkappa_drho + Ww * vv.domega_drho) * vv.rho) * vv.weights)
+    d2e += pair(dgamma_dA, Ww * (vv.domega_dgamma * vv.rho * vv.weights))
+    Ew = Uw = Ww = None
+
+    # E_wgr, E_Ggr: the motion of the other point of a pair with the weights and the density responses
+    Eg, Ug, Wg, d2gr = vv.grid_response_pair(natm, with_d2e=True, keep=keep)
+    d2e += pair(dw, Eg * vv.rho)
+    d2e += pair(drho_dA, (Eg + (Ug * vv.dkappa_drho + Wg * vv.domega_drho) * vv.rho) * vv.weights)
+    d2e += pair(dgamma_dA, Wg * (vv.domega_dgamma * vv.rho * vv.weights))
+    Eg = Ug = Wg = dw = None
+
+    # E_grgr: the motion of both points of a pair
+    d2e += d2gr
+
+    # the potential u with the motion of the points applied to the orbital response (d2rho, d2 nabla rho)
+    ni = mf._numint
+    ao_atm = numpy.empty(nao, dtype=int)
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:,2:]):
+        ao_atm[p0:p1] = ia
+    block_memory = _xc_block_memory(mf, max_memory, 3, 36*nao + natm*9)
+    p1 = 0
+    for ao, mask, weight, coords in ni.block_loop(mol, grids, nao, 3, block_memory):
+        p0, p1 = p1, p1 + weight.size
+        idx = _nonzero_aos(mol, mask, nao)
+        own = grids.atm_idx[p0:p1]
+        if idx.size == 0 or not numpy.any(u[0,p0:p1]):
+            continue
+        ao_s = ao[:,:,idx]
+        seg = _AtomSegments(ao_atm[idx], natm)
+        dm_s = numpy.asarray(dm0[idx[:,None],idx], order='C')
+        X = numpy.array([lib.dot(ao_s[c], dm_s) for c in range(10)])
+        for G in numpy.unique(own[own >= 0]):
+            sel = own == G
+            S = _grid_d2rho_dot(ao_s[:,sel], X[:,sel], u[:,p0:p1][:,sel], 'GGA', seg)
+            d2e[G] += S.transpose(0,2,1)
+            d2e[:,G] += S
+            d2e[G,G] -= S.sum(axis=0).T
     return d2e
 
 def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
@@ -1398,6 +1522,15 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
 
     v_ip = numpy.zeros((3,nao,nao))
     vmat = numpy.zeros((mol.natm,3,nao,nao))
+    # the grid response (see _grid_response_wv_, _grid_motion_vmat_)
+    grid_response = getattr(hessobj, 'grid_response', False)
+    if grid_response:
+        table = _becke_radii_table(mol, grids)
+        def grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, fac):
+            own = grids.atm_idx[ip0:ip1]
+            dw = _becke_weight_derivs(mol, grids, ip0, ip1, None, True, table)[0]
+            _grid_response_wv_(wv, vxc, own, dw, fac)
+            _grid_motion_vmat_(vmat, mol, ao, wv0, xctype, own, _nonzero_aos(mol, mask, nao))
     fused = mocc = None
     if occ_out is not None:
         fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (),
@@ -1449,6 +1582,8 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
 # First order density = rho1 * 2.  *2 is not applied because + c.c. in the end
                 rho1 = numpy.einsum('xpi,pi->xp', ao[1:,:,p0:p1], ao_dm0[:,p0:p1])
                 wv[ia,:,0] = wf * rho1
+            if grid_response:
+                grid_terms(wv, vxc, (weight * vxc[0])[None], ao, mask, ip0, ip1, .5)
             # vmat[ia,i] += (ao[0]*wv[ia,i]).T.dot(ao[0]) for all atoms at once
             if fused is not None:
                 # LDA: vmat holds half of the matrix, dot_ao_mo gives the whole one
@@ -1472,10 +1607,13 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
             ao_dm0 = [numint._dot_ao_dm(mol, ao[i], dm0, mask, shls_slice, ao_loc)
                       for i in range(4)]
             wf = weight * fxc
+            wv0 = wv
             wv = numpy.empty((mol.natm,3,4,weight.size))
             for ia in range(mol.natm):
                 dR_rho1 = _make_dR_rho1(ao, ao_dm0, ia, aoslices, xctype)
                 wv[ia] = numpy.einsum('xyg,sxg->syg', wf, dR_rho1)
+            if grid_response:
+                grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, 1.)
             wv[:,:,0] *= .5
             # vmat[ia,i] += einsum('xgp,xg->gp', ao[:4], wv[ia,i]).T.dot(ao[0])
             if not add_potentials(wv, ip0, ip1):
@@ -1499,10 +1637,13 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
 
             ao_dm0 = [numint._dot_ao_dm(mol, ao[i], dm0, mask, shls_slice, ao_loc) for i in range(4)]
             wf = weight * fxc
+            wv0 = wv
             wv = numpy.empty((mol.natm,3,5,weight.size))
             for ia in range(mol.natm):
                 dR_rho1 = _make_dR_rho1(ao, ao_dm0, ia, aoslices, xctype)
                 wv[ia] = numpy.einsum('xyg,sxg->syg', wf, dR_rho1)
+            if grid_response:
+                grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, 1.)
             wv[:,:,0] *= .5
             wv[:,:,4] *= .25
             # vmat[ia,i] += einsum('xgp,xg->gp', ao[:4], wv[ia,i,:4]).T.dot(ao[0])
@@ -1567,40 +1708,9 @@ def _get_vnlc_deriv1_numerical(hessobj, mo_coeff, mo_occ, max_memory):
     return vmat
 
 def get_dweight_dA(mol, grids):
-    ngrids = grids.coords.shape[0]
-    assert grids.atm_idx.shape[0] == ngrids
-    assert grids.quadrature_weights.shape[0] == ngrids
-    atm_coords = numpy.asarray(mol.atom_coords(), order = "C")
-
-    from pyscf.dft.gen_grid import original_becke
-    assert grids.becke_scheme is original_becke
-
-    radii_adjust = grids.radii_adjust
-    atomic_radii = grids.atomic_radii
-    if callable(radii_adjust) and atomic_radii is not None:
-        f_radii_adjust = radii_adjust(mol, atomic_radii)
-        f_radii_table = numpy.asarray([f_radii_adjust(i, j, 0)
-                                        for i in range(mol.natm)
-                                        for j in range(mol.natm)])
-    else:
-        f_radii_table = numpy.zeros([mol.natm, mol.natm])
-
-    dweight_dA = numpy.zeros([mol.natm, 3, ngrids], order = "C")
-    libdft.VXCbecke_weight_derivative(
-        dweight_dA.ctypes.data_as(ctypes.c_void_p),
-        grids.coords.ctypes.data_as(ctypes.c_void_p),
-        grids.quadrature_weights.ctypes.data_as(ctypes.c_void_p),
-        atm_coords.ctypes.data_as(ctypes.c_void_p),
-        f_radii_table.ctypes.data_as(ctypes.c_void_p),
-        grids.atm_idx.ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int(ngrids),
-        ctypes.c_int(mol.natm),
-    )
-    dweight_dA[grids.atm_idx, 0, numpy.arange(ngrids)] = -numpy.sum(dweight_dA[:, 0, :], axis=0)
-    dweight_dA[grids.atm_idx, 1, numpy.arange(ngrids)] = -numpy.sum(dweight_dA[:, 1, :], axis=0)
-    dweight_dA[grids.atm_idx, 2, numpy.arange(ngrids)] = -numpy.sum(dweight_dA[:, 2, :], axis=0)
-
-    return dweight_dA
+    '''The derivatives of the Becke weights of all points of grids with respect to the atom coordinates,
+    [natm,3,ngrids], the points moving with their atoms (_becke_weight_derivs)'''
+    return _becke_weight_derivs(mol, grids)[0]
 
 def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=None):
     """
@@ -1672,14 +1782,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=No
 
     # The grid response of E, U and W, of the points, which move with their atoms, and of their weights,
     # each added to the kernel terms in turn
-    E, U, W = [numpy.empty((natm,3,ngrids)) for i in range(3)]
-    libdft.VXC_vv10nlc_hessian_eval_EUW_grid_response(
-        E.ctypes.data_as(ctypes.c_void_p), U.ctypes.data_as(ctypes.c_void_p),
-        W.ctypes.data_as(ctypes.c_void_p),
-        vv.coords.ctypes.data_as(ctypes.c_void_p), vv.weights.ctypes.data_as(ctypes.c_void_p),
-        vv.rho.ctypes.data_as(ctypes.c_void_p), vv.omega.ctypes.data_as(ctypes.c_void_p),
-        vv.kappa.ctypes.data_as(ctypes.c_void_p), vv.atm_idx.ctypes.data_as(ctypes.c_void_p),
-        ctypes.c_int(ngrids), ctypes.c_int(natm))
+    E, U, W = [x.reshape(natm,3,ngrids) for x in vv.grid_response_pair(natm)]
     for step in range(2):
         f_gamma_A += W * (vv.domega_dgamma * vv.rho)
         U *= vv.dkappa_drho * vv.rho
@@ -1689,12 +1792,7 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=No
         f_rho_A += W
         if step == 0:
             dw = numpy.ascontiguousarray(get_dweight_dA(mol, grids)[:,:,mask])
-            libdft.VXC_vv10nlc_hessian_eval_EUW_with_weight1(
-                E.ctypes.data_as(ctypes.c_void_p), U.ctypes.data_as(ctypes.c_void_p),
-                W.ctypes.data_as(ctypes.c_void_p),
-                vv.coords.ctypes.data_as(ctypes.c_void_p), dw.ctypes.data_as(ctypes.c_void_p),
-                vv.rho.ctypes.data_as(ctypes.c_void_p), vv.omega.ctypes.data_as(ctypes.c_void_p),
-                vv.kappa.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(ngrids), ctypes.c_int(natm*3))
+            E, U, W = [x.reshape(natm,3,ngrids) for x in vv.weight1_pair(dw.reshape(natm*3,ngrids))]
     E = U = W = None
 
     # The potentials of the 3*natm perturbations: a0 is the rho part, a1 the coefficient of nabla rho
@@ -1967,11 +2065,270 @@ def _check_mgga_grids(grids):
                     f'grids.level {grids.level} may not be dense enough.')
 
 
+# The grid response of the XC terms (Hessian.grid_response = True). The points of an atom's grid move with
+# it, and the Becke weights depend on all atom positions. These terms are added to those of the AO
+# derivatives (the orbital response) that the functions above compute: in the energy's second derivative at
+# fixed orbitals by _get_exc_deriv2_grid_response, in the Fock matrix derivative within _get_vxc_deriv1.
+# Translational invariance gives the response of a point's own atom: the motion of the point changes the
+# density there by nabla rho = minus the sum over the atoms of the orbital response, and the derivatives of a
+# weight (and of each of its first derivatives) sum to zero over the atoms.
+
+def _d3_index(x, y, z):
+    return {(0,0,0): XXX, (0,0,1): XXY, (0,0,2): XXZ, (0,1,1): XYY, (0,1,2): XYZ,
+            (0,2,2): XZZ, (1,1,1): YYY, (1,1,2): YYZ, (1,2,2): YZZ, (2,2,2): ZZZ}[tuple(sorted((x, y, z)))]
+# _D3[x][y][z]: index of the AO component d_x d_y d_z ao
+_D3 = [[[_d3_index(x, y, z) for z in range(3)] for y in range(3)] for x in range(3)]
+
+def _becke_radii_table(mol, grids):
+    '''The a_ij of the Becke partition of grids (VXCgen_grid's radii_table), or None without radii adjustment'''
+    from pyscf.dft import radi
+    if grids.becke_scheme is not gen_grid.original_becke:
+        raise NotImplementedError(f'Hessian grid response with becke_scheme {grids.becke_scheme}')
+    radii_adjust = grids.radii_adjust
+    if not callable(radii_adjust) or grids.atomic_radii is None:
+        return None
+    if radii_adjust not in (radi.treutler_atomic_radii_adjust, radi.becke_atomic_radii_adjust):
+        raise NotImplementedError(f'Hessian grid response with radii_adjust {radii_adjust}')
+    f = radii_adjust(mol, grids.atomic_radii)
+    return numpy.asarray([f(i, j, 0) for i in range(mol.natm) for j in range(mol.natm)])
+
+def _becke_weight_derivs(mol, grids, p0=0, p1=None, eps=None, with_dw=True, table=False):
+    '''Of the points p0:p1 of grids, which move with their atoms (grids.atm_idx): dw [natm,3,p1-p0], the
+    derivatives of the Becke weights with respect to the atom coordinates (if with_dw), and
+    d2e [natm,natm,3,3] = sum_g eps[g] d2w_g/dAdB (if eps is given). table: _becke_radii_table(mol, grids)'''
+    if p1 is None:
+        p1 = grids.weights.size
+    if table is False:
+        table = _becke_radii_table(mol, grids)
+    natm = mol.natm
+    n = p1 - p0
+    coords = numpy.asarray(grids.coords[p0:p1], order='C')
+    qweights = numpy.asarray(grids.quadrature_weights[p0:p1], order='C')
+    atm_idx = numpy.asarray(grids.atm_idx[p0:p1], dtype=numpy.int32, order='C')
+    atm_coords = numpy.asarray(mol.atom_coords(), order='C')
+    dw = d2e = None
+    null = lib.c_null_ptr()
+    if with_dw:
+        dw = numpy.empty((natm,3,n))
+    if eps is not None:
+        eps = numpy.asarray(eps, dtype=numpy.double, order='C')
+        d2e = numpy.zeros((natm,3,natm,3))
+    libdft.VXCbecke_weight_derivs(
+        null if dw is None else dw.ctypes.data_as(ctypes.c_void_p),
+        null if d2e is None else d2e.ctypes.data_as(ctypes.c_void_p),
+        null if eps is None else eps.ctypes.data_as(ctypes.c_void_p),
+        coords.ctypes.data_as(ctypes.c_void_p), qweights.ctypes.data_as(ctypes.c_void_p),
+        atm_idx.ctypes.data_as(ctypes.c_void_p), atm_coords.ctypes.data_as(ctypes.c_void_p),
+        null if table is None else table.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(n), ctypes.c_int(natm))
+    if d2e is not None:
+        d2e = d2e.transpose(0,2,1,3)
+    return dw, d2e
+
+def _nonzero_aos(mol, mask, nao):
+    '''The AOs of the shells that mask (a block's non0tab) keeps on some point of the block'''
+    if mask is None:
+        return numpy.arange(nao)
+    shls = numpy.nonzero(numpy.asarray(mask).any(axis=0))[0]
+    ao_loc = mol.ao_loc_nr()
+    if shls.size == 0:
+        return numpy.zeros(0, dtype=int)
+    return numpy.hstack([numpy.arange(ao_loc[i], ao_loc[i+1]) for i in shls])
+
+class _AtomSegments:
+    '''Sums over the AOs of each atom, for AOs idx sorted by atom'''
+    def __init__(self, ao_atm, natm):
+        self.natm = natm
+        self.starts = numpy.hstack(([0], numpy.nonzero(numpy.diff(ao_atm))[0] + 1))
+        self.atoms = ao_atm[self.starts]
+
+    def rows(self, x):
+        '''(ng, nao) -> (natm, ng)'''
+        out = numpy.zeros((self.natm, x.shape[0]))
+        out[self.atoms] = numpy.add.reduceat(x, self.starts, axis=1).T
+        return out
+
+    def vec(self, x):
+        '''(nao,) -> (natm,)'''
+        out = numpy.zeros(self.natm)
+        out[self.atoms] = numpy.add.reduceat(x, self.starts)
+        return out
+
+def _orbital_response_rho(ao, X, xctype, seg):
+    '''drho/dR [natm,3,ncomp,ng] of the AO derivatives (the atoms' AOs move) for X[c] = ao[c] dm'''
+    ncomp = {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype]
+    ng = ao.shape[1]
+    out = numpy.empty((seg.natm,3,ncomp,ng))
+    for D in range(3):
+        out[:,D,0] = seg.rows(ao[1+D] * X[0]) * -2
+        if ncomp > 1:
+            for x in range(3):
+                out[:,D,1+x] = seg.rows(ao[_D2[D][x]] * X[0] + ao[1+D] * X[1+x]) * -2
+        if xctype == 'MGGA':
+            out[:,D,4] = -seg.rows(sum(ao[_D2[D][x]] * X[1+x] for x in range(3)))
+    return out
+
+def _grid_d2rho_dot(ao, X, u, xctype, seg):
+    '''Q[B,D,d] = sum_g sum_k u[k,g] d/dr_d (drho_k/dR_B,D)(g): the potential u times the motion of the points
+    (d) applied to the orbital response of atom B (D), for X[c] = ao[c] dm on the points of ao
+    (VXCgrid_d2rho_dot)'''
+    ao = numpy.asarray(ao, dtype=numpy.double, order='C')
+    X = numpy.asarray(X, dtype=numpy.double, order='C')
+    u = numpy.asarray(u, dtype=numpy.double, order='C')
+    ng, nao = ao.shape[1:]
+    q = numpy.zeros((nao,3,3))
+    libdft.VXCgrid_d2rho_dot(
+        q.ctypes.data_as(ctypes.c_void_p), ao.ctypes.data_as(ctypes.c_void_p),
+        X.ctypes.data_as(ctypes.c_void_p), u.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int({'LDA': 0, 'GGA': 1, 'MGGA': 2}[xctype]), ctypes.c_int(ng), ctypes.c_int(nao))
+    Q = numpy.zeros((seg.natm,3,3))
+    Q[seg.atoms] = -numpy.add.reduceat(q, seg.starts, axis=0)
+    return Q
+
+def _get_exc_deriv2_grid_response(hessobj, mo_coeff, mo_occ, max_memory, dms=None):
+    '''The grid response of the XC energy's second derivative at fixed orbitals, [natm,natm,3,3], for RKS (the
+    density of mo_coeff, mo_occ) or, with dms [2,nao,nao], for the spin densities of UKS. With
+    E = sum_g w_g eps(rho(r_g)), the terms
+
+        sum_g d2w eps + (dw x vxc drho + transpose) + w fxc (drho drho - drho_AO drho_AO)
+        + w vxc (d2rho - d2rho_AO)
+
+    where drho = drho_AO + the motion of the point (nabla rho, on its atom), and the terms with drho_AO and
+    d2rho_AO alone are those of _get_vxc_diag and _get_vxc_deriv2_dm.'''
+    mol = hessobj.mol
+    mf = hessobj.base
+    grids = hessobj.grids if hessobj.grids is not None else mf.grids
+    if grids.coords is None:
+        grids.build(with_non0tab=True)
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    natm = mol.natm
+    nao = mol.nao
+    de2 = numpy.zeros((natm,natm,3,3))
+    if xctype not in ('LDA', 'GGA', 'MGGA'):
+        return de2
+    if dms is None:
+        dms = mf.make_rdm1(mo_coeff, mo_occ)[None]
+        spin = 0
+    else:
+        spin = 1
+    nspin = len(dms)
+    ncomp = {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype]
+    ao_deriv = 2 if xctype == 'LDA' else 3
+    nX = 4 if xctype == 'LDA' else 10
+    table = _becke_radii_table(mol, grids)
+    ao_atm = numpy.empty(nao, dtype=int)
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:,2:]):
+        ao_atm[p0:p1] = ia
+    comp = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
+    max_memory = _xc_block_memory(mf, max_memory, ao_deriv, (comp + nX*nspin + 6) * nao
+                                  + natm*3*(ncomp*nspin*2 + 4))
+    p1 = 0
+    for ao, mask, weight, coords \
+            in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+        p0, p1 = p1, p1 + weight.size
+        idx = _nonzero_aos(mol, mask, nao)
+        if idx.size == 0:
+            continue
+        ng = weight.size
+        ao_s = ao[:,:,idx]
+        seg = _AtomSegments(ao_atm[idx], natm)
+        X = []
+        rho = numpy.empty((nspin,ncomp,ng))
+        for s, dm in enumerate(dms):
+            dm_s = numpy.asarray(dm[idx[:,None],idx], order='C')
+            Xs = numpy.empty((nX,ng,idx.size))
+            for c in range(nX):
+                Xs[c] = lib.dot(ao_s[c], dm_s)
+            rho[s,0] = numpy.einsum('gm,gm->g', ao_s[0], Xs[0])
+            if ncomp > 1:
+                for x in range(3):
+                    rho[s,1+x] = numpy.einsum('gm,gm->g', ao_s[1+x], Xs[0]) * 2
+            if xctype == 'MGGA':
+                rho[s,4] = sum(numpy.einsum('gm,gm->g', ao_s[1+x], Xs[1+x]) for x in range(3)) * .5
+            X.append(Xs)
+        rho_in = rho[0] if spin == 0 else rho
+        if xctype == 'LDA':
+            rho_in = rho_in[...,0,:]
+        exc, vxc, fxc = ni.eval_xc_eff(mf.xc, rho_in, 2, xctype=xctype, spin=spin)[:3]
+        vxc = vxc.reshape(nspin,ncomp,ng)
+        fxc = fxc.reshape(nspin,ncomp,nspin,ncomp,ng)
+        eps = exc.ravel() * rho[:,0].sum(axis=0)
+
+        # sum_g d2w eps, and the derivatives of the weights
+        dw, d2w = _becke_weight_derivs(mol, grids, p0, p1, eps, True, table)
+        de2 += d2w
+
+        # the orbital response and the motion of the points
+        O = numpy.array([_orbital_response_rho(ao_s, X[s], xctype, seg) for s in range(nspin)])
+        T = -O.sum(axis=1)
+        own = grids.atm_idx[p0:p1]
+        owners = [(G, own == G) for G in numpy.unique(own[own >= 0])]
+
+        # dw x vxc drho + transpose
+        F = numpy.einsum('sBDkg,skg->BDg', O, vxc)
+        FT = numpy.einsum('sDkg,skg->Dg', T, vxc)
+        for G, sel in owners:
+            F[G][:,sel] += FT[:,sel]
+        M = lib.dot(dw.reshape(natm*3,ng), F.reshape(natm*3,ng).T).reshape(natm,3,natm,3)
+        de2 += M.transpose(0,2,1,3) + M.transpose(2,0,3,1)
+        F = FT = M = dw = None
+
+        # w fxc: the motion of the points of G with the orbital response of B, of G (and the transposes);
+        # w vxc: the motion of the points of G applied to the orbital response of B
+        u = vxc * weight
+        Y = numpy.einsum('tdkg,tkslg->sdlg', T, fxc * weight)
+        for G, sel in owners:
+            S = numpy.einsum('sdlg,sBDlg->BDd', Y[:,:,:,sel], O[:,:,:,:,sel])
+            ao_g = ao_s[:,sel]
+            for s in range(nspin):
+                S += _grid_d2rho_dot(ao_g, X[s][:,sel], u[s][:,sel], xctype, seg)
+            de2[G] += S.transpose(0,2,1)
+            de2[:,G] += S
+            de2[G,G] -= S.sum(axis=0).T
+        O = T = Y = X = None
+    return de2
+
+def _grid_response_wv_(wv, vxc, own, dw, fac):
+    '''Adds to wv [natm,3,ncomp,ng], fac times minus the potentials of the orbital response (as _get_vxc_deriv1
+    holds them: fac .5 for LDA, 1 otherwise), those of the grid response: of the motion of the points (on their
+    atoms, minus the sum over the atoms of the orbital response) and of the weights, dw [natm,3,ng] times vxc
+    [ncomp,ng]'''
+    s = wv.sum(axis=0)
+    for G in numpy.unique(own[own >= 0]):
+        sel = own == G
+        wv[G][:,:,sel] -= s[:,:,sel]
+    wv -= fac * dw[:,:,None,:] * vxc
+    return wv
+
+def _grid_motion_vmat_(vmat, mol, ao, wv, xctype, own, idx):
+    '''vmat[G] -= the AO-derivative matrix of the gradient (v_ip of _get_vxc_deriv1) of the potential wv on the
+    points of atom G alone, for each atom G of the points of ao (own), on the AOs idx: the derivative of the AO
+    products with the ground-state potential as the points move'''
+    for G in numpy.unique(own[own >= 0]):
+        sel = own == G
+        ao_g = numpy.asarray(ao[:,sel][:,:,idx], order='C')
+        wv_g = numpy.asarray(wv[:,sel], order='C')
+        v = numpy.zeros((3,idx.size,idx.size))
+        if xctype == 'LDA':
+            aow = numint._scale_ao(ao_g[0], wv_g[0])
+            rks_grad._d1_dot_(v, mol, ao_g[1:4], aow, None, None, True)
+        else:
+            rks_grad._gga_grad_sum_(v, mol, ao_g, wv_g, None, None)
+            if xctype == 'MGGA':
+                rks_grad._tau_grad_dot_(v, mol, ao_g, wv_g[4], None, None, True)
+        vmat[G][:,idx[:,None],idx] -= v
+
+
 class Hessian(rhf_hess.HessianBase):
     '''Non-relativistic RKS hessian.
 
-    Grid response is not implemented for this CPU Hessian.
-    Setting grid_response=True raises NotImplementedError.
+    grid_response = True adds the response of the XC (and VV10) grids: their points
+    move with their atoms and their Becke weights depend on all atom positions. The
+    Hessian is then the second derivative of the energy as computed (that of the
+    gradient with grid_response = True); without it, the terms of the grids are left
+    out, which for meta-GGAs on heavier atoms can be several percent of the force
+    constants at production grids.
     '''
 
     _keys = {'grids', 'grid_response'}
