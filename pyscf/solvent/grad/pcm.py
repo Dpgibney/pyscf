@@ -162,19 +162,45 @@ def _d1_block_rows(n):
     # a row of the 3 components and the temporaries of get_dD_dS
     return max(1, int(D1_BLOCK_MEMORY * 1e6 / (8 * n * 3 * 8)))
 
-def _map_row_blocks(n, blksize, fn):
+def _map_row_blocks(n, blksize, fn, consume=None):
     '''[fn(i0, i1) for the blocks of rows], over the threads: the kernels of the
     surface matrices are numpy functions of large arrays, which release the
-    interpreter lock. The blocks share the memory of one block of blksize rows.'''
+    interpreter lock. The blocks share the memory of one block of blksize rows.
+
+    With consume, consume(fn(i0, i1)) is called for the blocks in their order, as
+    the threads return them (a few times the number of threads at a time), and
+    nothing is returned. For results that are arrays: the list of all of them,
+    one per block of blksize/nthreads rows, grows with the number of threads and
+    as n^2 times the size of a result (22 GB for the [3,n,natm] arrays of 13000
+    points and 57 atoms on 8 threads).'''
     nthreads = max(1, min(lib.num_threads(), (n + blksize - 1) // blksize))
     blksize = max(1, blksize // nthreads)
     tasks = list(lib.prange(0, n, blksize))
     if nthreads == 1:
-        return [fn(i0, i1) for i0, i1 in tasks]
+        if consume is None:
+            return [fn(i0, i1) for i0, i1 in tasks]
+        for i0, i1 in tasks:
+            consume(fn(i0, i1))
+        return None
     from concurrent.futures import ThreadPoolExecutor
     with lib.with_omp_threads(1):
         with ThreadPoolExecutor(nthreads) as pool:
-            return list(pool.map(lambda t: fn(*t), tasks))
+            if consume is None:
+                return list(pool.map(lambda t: fn(*t), tasks))
+            for k in range(0, len(tasks), 4*nthreads):
+                for x in pool.map(lambda t: fn(*t), tasks[k:k+4*nthreads]):
+                    consume(x)
+
+def _sum_row_blocks(n, blksize, fn):
+    '''sum(_map_row_blocks(n, blksize, fn)) without the list of the blocks' results'''
+    total = []
+    def add(x):
+        if total:
+            total[0] += x
+        else:
+            total.append(numpy.array(x))
+    _map_row_blocks(n, blksize, fn, add)
+    return total[0]
 
 def _d1_antisym(surface, kind, v, q):
     '''v[i] dX[x,i,j] q[j] summed over j, for each point i, minus the same summed
@@ -187,8 +213,7 @@ def _d1_antisym(surface, kind, v, q):
         dX = dD if kind == 'D' else dS
         out[i0:i1] = v[i0:i1, None] * numpy.einsum('ijx,j->ix', dX, q)
         return numpy.einsum('i,ijx->jx', v[i0:i1], dX)
-    cols = _map_row_blocks(n, _d1_block_rows(n), block)
-    out -= sum(cols) * q[:, None]
+    out -= _sum_row_blocks(n, _d1_block_rows(n), block) * q[:, None]
     return out
 
 def grad_nuc(pcmobj, dm, q_sym = None):

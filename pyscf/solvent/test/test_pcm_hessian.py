@@ -441,6 +441,54 @@ class KnownValues(unittest.TestCase):
                     hs.append(hobj.kernel())
             self.assertAlmostEqual(abs(hs[0] - hs[1]).max(), 0, 9)
 
+    def test_row_blocks_threads(self):
+        # the derivatives of S and D contracted by blocks of rows on several threads, their results
+        # taken as they come (many small blocks: the list of them is what must not be kept),
+        # against the whole arrays
+        from pyscf.solvent.grad import pcm as pcm_grad
+        from pyscf.solvent.hessian import pcm as pcm_hess
+        pcmobj = pcm.PCM(mol)
+        pcmobj.method = 'IEF-PCM'
+        pcmobj.lebedev_order = lebedev_order
+        pcmobj.build()
+        surface = pcmobj.surface
+        gridslice = surface['gslice_by_atom']
+        n = surface['charge_exp'].shape[0]
+        natm = mol.natm
+        rng = np.random.default_rng(3)
+        v, q = rng.random(n) - .5, rng.random(n) - .5
+        dD, dS, _ = pcm_grad.get_dD_dS(surface, None, with_S=True, with_D=True)
+        d2D, d2S = pcm_hess.get_d2D_d2S(surface, with_S=True, with_D=True)
+        dSii0 = np.zeros((n, natm, 3))
+        d2Sii0 = np.zeros((natm, natm, 3, 3, n))
+        atmlst = range(natm)
+        ref = [pcm_hess.get_dD_dot_q(dD, q, atmlst, gridslice, n),
+               pcm_hess.get_dDT_dot_q(dD, q, atmlst, gridslice, n),
+               pcm_hess.get_dS_dot_q(dS, dSii0, q, atmlst, gridslice),
+               pcm_hess.get_v_dot_d2S_dot_q(d2S, d2Sii0, v, q, natm, gridslice),
+               pcm_hess.get_v_dot_d2D_dot_q(d2D, v, q, natm, gridslice),
+               v[:,None] * np.einsum('ijx,j->ix', dD, q) - q[:,None] * np.einsum('j,jix->ix', v, dD),
+               v[:,None] * np.einsum('ijx,j->ix', dS, q) - q[:,None] * np.einsum('j,jix->ix', v, dS)]
+        # 40 rows a block, 10 for each of 4 threads
+        with lib.with_omp_threads(4), \
+                lib.temporary_env(pcm_grad, D1_BLOCK_MEMORY=40 * 192 * n / 1e6), \
+                lib.temporary_env(pcm_hess, D2_BLOCK_MEMORY=40 * 576 * n / 1e6):
+            self.assertEqual(pcm_grad._d1_block_rows(n), 40)
+            lazyD, lazyS = pcm_hess._LazyD1(surface, 'D'), pcm_hess._LazyD1(surface, 'S')
+            gS, gD = pcm_hess._d2_contract(surface, natm, gridslice, S_pairs=[(v, q)], D_pairs=[(v, q)])
+            out = [pcm_hess.get_dD_dot_q(lazyD, q, atmlst, gridslice, n),
+                   pcm_hess.get_dDT_dot_q(lazyD, q, atmlst, gridslice, n),
+                   pcm_hess.get_dS_dot_q(lazyS, dSii0, q, atmlst, gridslice),
+                   gS[0], gD[0],
+                   pcm_grad._d1_antisym(surface, 'D', v, q),
+                   pcm_grad._d1_antisym(surface, 'S', v, q)]
+            blocks = []
+            total = pcm_grad._sum_row_blocks(n, 40, lambda i0, i1: blocks.append((i0, i1)) or np.ones(3) * (i1 - i0))
+        for x, y in zip(out, ref):
+            self.assertAlmostEqual(abs(x - y).max(), 0, 12)
+        self.assertEqual(len(blocks), (n + 9) // 10)
+        self.assertAlmostEqual(abs(total - n).max(), 0, 12)
+
 if __name__ == "__main__":
     print("Full Tests for Hessian of PCMs")
     unittest.main()
