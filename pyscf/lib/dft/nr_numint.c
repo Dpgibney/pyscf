@@ -962,6 +962,17 @@ void VXC_vv10nlc_hessian_eval_omega_derivative(double* __restrict__ domega_drho,
 #define VV10_BI 128
 #define VV10_BJ 256
 
+/* The progress of the pair kernel in flight (eval_f_t, eval_EUW_with_weight1, grid_response_sorted), for a
+ * caller's other thread: the points i done and all of them (0, 0 before the first call). */
+static volatile int _vv10_hess_done = 0;
+static volatile int _vv10_hess_total = 0;
+
+void VXC_vv10nlc_hessian_progress(int *done_total)
+{
+    done_total[0] = _vv10_hess_done;
+    done_total[1] = _vv10_hess_total;
+}
+
 /* f_rho_t[t,i] = sum_j w_j (f_rho_rho_ij rho_t[t,j] + f_rho_gamma_ij gamma_t[t,j]) + the local terms at i, and
  * f_gamma_t[t,i] alike (Liang, Feng, Liu, Head-Gordon, JCP 158, 204109 (2023)), for the ntrial trial densities
  * rho_t, gamma_t [ntrial,ngrids]. The four pair kernels of a block, weighted by w_j, go to K[4][bj][bi]. */
@@ -982,6 +993,8 @@ void VXC_vv10nlc_hessian_eval_f_t(double* __restrict__ f_rho_t, double* __restri
     const int ld = ngrids;
     const int nt = ntrial;
     const size_t nblk = VV10_BI * VV10_BJ;
+    _vv10_hess_done = 0;
+    _vv10_hess_total = ngrids;
 
 #pragma omp parallel
 {
@@ -1104,6 +1117,8 @@ void VXC_vv10nlc_hessian_eval_f_t(double* __restrict__ f_rho_t, double* __restri
                 f_gamma_t[(size_t)t * ld + i] += (f_gamma_rho_ii * rho_t_i + f_gamma_gamma_ii * gamma_t_i);
             }
         }
+#pragma omp atomic
+        _vv10_hess_done += bi;
     }
     free(K);
 }
@@ -1225,6 +1240,8 @@ void VXC_vv10nlc_hessian_eval_EUW_with_weight1(double* __restrict__ Ew, double* 
     const int ld = ngrids;
     const int nd = nderivative;
     const size_t nblk = VV10_BI * VV10_BJ;
+    _vv10_hess_done = 0;
+    _vv10_hess_total = ngrids;
 
 #pragma omp parallel
 {
@@ -1293,6 +1310,8 @@ void VXC_vv10nlc_hessian_eval_EUW_with_weight1(double* __restrict__ Ew, double* 
             dgemm_(&TRANS_N, &TRANS_N, &bi, &nd, &bj, &DM1, KU, &bi, grid_weight1 + j0, &ld, &D1, Uw + i0, &ld);
             dgemm_(&TRANS_N, &TRANS_N, &bi, &nd, &bj, &DM1, KW, &bi, grid_weight1 + j0, &ld, &D1, Ww + i0, &ld);
         }
+#pragma omp atomic
+        _vv10_hess_done += bi;
     }
     free(K);
 }
@@ -1327,6 +1346,8 @@ void VXC_vv10nlc_hessian_grid_response_sorted(double *Egr, double *Ugr, double *
         ys[j] = grid_coord[j*3+1];
         zs[j] = grid_coord[j*3+2];
     }
+    _vv10_hess_done = 0;
+    _vv10_hess_total = ngrids;
 #pragma omp parallel
 {
     double *acc = malloc(sizeof(double) * natoms * 16);
@@ -1409,6 +1430,8 @@ void VXC_vv10nlc_hessian_grid_response_sorted(double *Egr, double *Ugr, double *
                 d[6] += fac * a[11];           d[7] += fac * a[13];           d[8] += fac * (a[14] + a[15]);
             }
         }
+#pragma omp atomic
+        _vv10_hess_done += 1;
     }
     if (dacc != NULL) {
 #pragma omp critical

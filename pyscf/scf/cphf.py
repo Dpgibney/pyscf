@@ -246,6 +246,19 @@ def _combine_blocks(c, blocks):
         p0 = p1
     return out
 
+def _cycle_line(log, t0, cycle, rmax, nleft, nset):
+    '''The line of a cycle of solve_residual: for Logger.debug, and for
+    Logger.info, as a progress line (lib.logger.Progress), once the solver has
+    run for PROGRESS_AFTER seconds: a cycle of a large molecule is one response
+    of many densities'''
+    dt = logger.perf_counter() - t0[1]
+    if dt >= logger.PROGRESS_AFTER and log.verbose < logger.DEBUG:
+        log.info('    CPHF cycle %d after %d s: max residual %g, %d of %d perturbations left',
+                 cycle, dt, rmax, nleft, nset)
+    else:
+        log.debug('CPHF cycle %d: max residual %g, %d of %d perturbations left',
+                  cycle, rmax, nleft, nset)
+
 def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
                    verbose=logger.WARN, level_shift=0, scale_trials=False):
     '''The equations of solve_withs1 for real orbitals and perturbations, solved
@@ -328,8 +341,7 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
     for cycle in range(max_cycle+1):
         rnorm = numpy.linalg.norm(r / precond, axis=1)
         active = rnorm > tol
-        log.debug('CPHF cycle %d: max residual %g, %d of %d perturbations left',
-                  cycle, rnorm.max(initial=0), active.sum(), nset)
+        _cycle_line(log, t0, cycle, rnorm.max(initial=0), active.sum(), nset)
         if not active.any():
             break
         if cycle == max_cycle:

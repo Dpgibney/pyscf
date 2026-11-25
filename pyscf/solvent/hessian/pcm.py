@@ -1123,6 +1123,7 @@ def analytical_grad_vmat(pcmobj, dm, atmlst=None, verbose=None):
     nao = mol.nao
     log = logger.new_logger(mol, mol.verbose)
     t1 = (logger.process_clock(), logger.perf_counter())
+    prog = logger.Progress(pcmobj, "the solvent's Fock matrix derivatives", 0)
 
     if atmlst is None:
         atmlst = range(mol.natm)
@@ -1171,6 +1172,7 @@ def analytical_grad_vmat(pcmobj, dm, atmlst=None, verbose=None):
         dv[i0:i1] += _int1e_grids_dot(mol, pcmobj.surface, charges=dqdx[i0:i1])
 
     t1 = log.timer_debug1('computing solvent grad veff', *t1)
+    prog.done(always=True)
     return dV_on_molecule_dx
 
 def make_hess_object(base_method):

@@ -167,7 +167,8 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None, 
                 vhfopt_lr = rhf_hess._make_h1_vhfopt(mol, [dm0a, dm0b], 'k')
     else:
         vhfopt = rhf_hess._make_h1_vhfopt(mol, dm0, 'j')
-    for i0, ia in enumerate(atmlst):
+    prog = logger.Progress(hessobj, 'J and K Fock matrix derivatives', len(atmlst), 'atoms')
+    for i0, ia in enumerate(prog.items(atmlst)):
         shl0, shl1, p0, p1 = aoslices[ia]
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
         if hybrid:
@@ -234,6 +235,7 @@ def _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory):
     xctype = ni._xc_type(mf.xc)
     shls_slice = (0, mol.nbas)
     ao_loc = mol.ao_loc_nr()
+    prog = logger.Progress(hessobj, 'XC second derivatives, diagonal terms', grids.weights.size)
 
     vmat = numpy.zeros((2,6,nao,nao))
     vmata, vmatb = vmat
@@ -244,7 +246,7 @@ def _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory):
     if make_rho is not None:
         # The AO values of the products computed in the kernels (numint._FusedXC)
         terms = numint._xc_hess_diag_terms(xctype)
-        for ip0, ip1 in fused.blocks:
+        for ip0, ip1 in prog.ranges(fused.blocks):
             weight = grids.weights[ip0:ip1]
             rhoa, rhob = make_rho(ip0, ip1)
             wv = weight * ni.eval_xc_eff(mf.xc, (rhoa, rhob), 1, xctype=xctype)[1]
@@ -255,7 +257,7 @@ def _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory):
     elif xctype == 'LDA':
         ao_deriv = 2
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             rhoa = ni.eval_rho2(mol, ao[0], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[0], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 1, xctype=xctype)[1]
@@ -276,7 +278,7 @@ def _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory):
 
         ao_deriv = 3
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             rhoa = ni.eval_rho2(mol, ao[:4], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:4], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 1, xctype=xctype)[1]
@@ -309,7 +311,7 @@ def _get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory):
 
         ao_deriv = 3
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             rhoa = ni.eval_rho2(mol, ao[:10], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:10], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 1, xctype=xctype)[1]
@@ -557,6 +559,7 @@ def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
     natm = mol.natm
     shls_slice = (0, mol.nbas)
     ao_loc = mol.ao_loc_nr()
+    prog = logger.Progress(hessobj, 'XC second derivatives, pair terms', grids.weights.size)
     dm0a, dm0b = mf.make_rdm1(mo_coeff, mo_occ)
     _atom_pair_sum = rks_hess._atom_pair_sum
     _D2 = rks_hess._D2
@@ -581,7 +584,7 @@ def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
     if xctype == 'LDA':
         ao_deriv = 1
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             rhoa = ni.eval_rho2(mol, ao[0], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[0], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 2, xctype=xctype)[1:3]
@@ -617,7 +620,7 @@ def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
         else:
             ncomp, nrho = 5, 10
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             rhoa = ni.eval_rho2(mol, ao[:nrho], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:nrho], mo_coeff[1], mo_occ[1], mask, xctype)
             vxc, fxc = ni.eval_xc_eff(mf.xc, (rhoa, rhob), 2, xctype=xctype)[1:3]
@@ -695,6 +698,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
     aoslices = mol.aoslice_by_atom()
     shls_slice = (0, mol.nbas)
     ao_loc = mol.ao_loc_nr()
+    prog = logger.Progress(hessobj, 'XC Fock matrix derivatives', grids.weights.size)
     dm0a, dm0b = mf.make_rdm1(mo_coeff, mo_occ)
 
     # vmat[0] for alpha, vmat[1] for beta
@@ -761,7 +765,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
         vipa = numpy.zeros((3,nao,nao))
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[0], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[0], mo_coeff[1], mo_occ[1], mask, xctype)
@@ -807,7 +811,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
         vipa = numpy.zeros((3,nao,nao))
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[:4], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:4], mo_coeff[1], mo_occ[1], mask, xctype)
@@ -850,7 +854,7 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
         vipa = numpy.zeros((3,nao,nao))
         vipb = numpy.zeros((3,nao,nao))
         for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+                in prog.blocks(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
             ip0, ip1 = ip1, ip1 + weight.size
             rhoa = ni.eval_rho2(mol, ao[:10], mo_coeff[0], mo_occ[0], mask, xctype)
             rhob = ni.eval_rho2(mol, ao[:10], mo_coeff[1], mo_occ[1], mask, xctype)

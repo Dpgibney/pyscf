@@ -848,9 +848,10 @@ class PCM(lib.StreamObject):
         '''
         from pyscf.solvent.hessian.pcm import (
             analytical_hess_nuc, analytical_hess_qv, analytical_hess_solver)
-        de_solvent  =    analytical_hess_nuc(self, dm, verbose=self.verbose)
-        de_solvent +=     analytical_hess_qv(self, dm, verbose=self.verbose)
-        de_solvent += analytical_hess_solver(self, dm, verbose=self.verbose)
+        with logger.Progress(self, "the solvent's second derivatives", 0):
+            de_solvent  =    analytical_hess_nuc(self, dm, verbose=self.verbose)
+            de_solvent +=     analytical_hess_qv(self, dm, verbose=self.verbose)
+            de_solvent += analytical_hess_solver(self, dm, verbose=self.verbose)
         return de_solvent
 
     def _B_dot_x(self, dms):

@@ -1407,12 +1407,13 @@ class _FusedXC:
         cost_lr = (nset * (c_rho*r + c_v*nq) + npass * c_pass*nq) * ns.sum()
         return w_lr * cost_lr < cost_dm
 
-    def rks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out, one_pass=None):
+    def rks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out, one_pass=None, progress=None):
         '''out[k] += P^T v1[k] Q for the XC responses v1[k] that nr_rks_fxc
         computes with the kernel fxc for the symmetric dms A[k] B^T + B A[k]^T.
         Where Q is B (one_pass=None) one kernel takes the densities, potentials
         and v1 Q of each group of points (VXCfused_fxc_lowrank); otherwise
-        rho_lowrank, _fxc_wv and dot_ao_mo do in turn on blocks of points.'''
+        rho_lowrank, _fxc_wv and dot_ao_mo do in turn on blocks of points.
+        progress: a lib.logger.Progress of the nset densities.'''
         nset = len(A)
         nq = Q.shape[1]
         nrho = _FUSED_NRHO[xctype]
@@ -1420,6 +1421,9 @@ class _FusedXC:
         ngemm = BLKSIZE * GEMM_NBLK  # the GEMM groups (GEMM_NGRIDS) of the kernels
         nchunk = self.mo_chunk(nset, nq)
         fxc = numpy.ascontiguousarray(fxc)
+        chunks = lib.prange(0, nset, nchunk)
+        if progress is not None:
+            chunks = progress.ranges(chunks)
         if one_pass is None:
             one_pass = Q is B
         if one_pass:
@@ -1427,7 +1431,7 @@ class _FusedXC:
             A = numpy.asarray(A, dtype=numpy.double, order='C')
             B = numpy.asarray(B, dtype=numpy.double, order='C')
             weights = numpy.asarray(self.grids.weights, dtype=numpy.double, order='C')
-            for k0, k1 in lib.prange(0, nset, nchunk):
+            for k0, k1 in chunks:
                 vq = numpy.zeros((k1-k0, self.nao, nq))
                 libdft.VXCfused_fxc_lowrank(
                     vq.ctypes.data_as(ctypes.c_void_p), A[k0:k1].ctypes.data_as(ctypes.c_void_p),
@@ -1437,7 +1441,7 @@ class _FusedXC:
                     *self._args(0, ngrids, 0 if xctype == 'LDA' else 1))
                 out[k0:k1] += lib.einsum('pa,kpi->kai', P, vq)
             return out
-        for k0, k1 in lib.prange(0, nset, nchunk):
+        for k0, k1 in chunks:
             n = k1 - k0
             # rho1 and wv of a block in a quarter of max_memory
             blksize = int(self.max_memory*.25e6 / (16*n*nrho*ngemm))
@@ -1454,7 +1458,7 @@ class _FusedXC:
             out[k0:k1] += lib.einsum('pa,kpi->kai', P, vq)
         return out
 
-    def uks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out):
+    def uks_fxc_mo(self, ni, xctype, fxc, A, B, P, Q, out, progress=None):
         '''rks_fxc_mo for UKS: out[s][k] += P[s]^T v1[s][k] Q[s] (s = alpha,
         beta) for the XC responses v1 that nr_uks_fxc computes with the kernel
         fxc (cache_xc_kernel with spin=1) for the symmetric spin dms
@@ -1470,7 +1474,11 @@ class _FusedXC:
         nchunk = self.mo_chunk(nset, sum(nq))
         fxc = numpy.ascontiguousarray(fxc)
         weights = numpy.asarray(self.grids.weights, dtype=numpy.double, order='C')
-        for k0, k1 in lib.prange(0, nset, nchunk):
+        chunks = lib.prange(0, nset, nchunk)
+        if progress is not None:
+            # a lib.logger.Progress of the nset densities
+            chunks = progress.ranges(chunks)
+        for k0, k1 in chunks:
             vq = [numpy.zeros((k1-k0, self.nao, n)) for n in nq]
             libdft.VXCfused_fxc_lowrank_uks(
                 vq[0].ctypes.data_as(ctypes.c_void_p), vq[1].ctypes.data_as(ctypes.c_void_p),

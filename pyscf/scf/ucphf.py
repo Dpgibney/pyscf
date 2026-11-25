@@ -268,8 +268,7 @@ def solve_residual(fvind, mo_energy, mo_occ, h1, s1, max_cycle=50, tol=1e-4,
     for cycle in range(max_cycle+1):
         rnorm = numpy.linalg.norm(r / precond, axis=1)
         active = rnorm > tol
-        log.debug('CPHF cycle %d: max residual %g, %d of %d perturbations left',
-                  cycle, rnorm.max(initial=0), active.sum(), nset)
+        cphf._cycle_line(log, t0, cycle, rnorm.max(initial=0), active.sum(), nset)
         if not active.any():
             break
         if cycle == max_cycle:

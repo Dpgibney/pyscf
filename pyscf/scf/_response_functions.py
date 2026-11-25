@@ -27,6 +27,30 @@ from pyscf import lib
 from pyscf.lib import logger
 from pyscf.scf import hf, rohf, uhf, ghf, dhf, _vhf
 
+class _Terms:
+    '''Lines for the terms of one response of many densities (vind_mo, of the
+    CPHF equations of a Hessian), with Logger.info and in the form of
+    lib.logger.Progress: done(what) for a term that has just ended, written if
+    it took PROGRESS_AFTER seconds or more; progress(what) is the Progress of a
+    term made for chunks of the densities.'''
+    def __init__(self, mf, nset):
+        self.mf = mf
+        self.nset = nset
+        self.t0 = logger.perf_counter()
+
+    def label(self, what):
+        return 'response of %d densities, %s' % (self.nset, what)
+
+    def done(self, what=None):
+        t1 = logger.perf_counter()
+        if what is not None and t1 - self.t0 >= logger.PROGRESS_AFTER:
+            logger.info(self.mf, '    %s: done in %d s', self.label(what), t1 - self.t0)
+        self.t0 = t1
+
+    def progress(self, what):
+        self.t0 = logger.perf_counter()
+        return logger.Progress(self.mf, self.label(what), self.nset, 'densities')
+
 def _cphf_chunk(mf, nset, nao, with_j, with_k, direct=None):
     '''The dms that a CPHF response holds at a time for a J/K call (with_j,
     with_k) of direct SCF: as many whole batches of that call as their dms and
@@ -266,7 +290,7 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
             fused = numint._fused_xc_mo(ni, mol, grids, xctype, max_memory)
         if fused is not None:
             fxc_mo = None
-            def xc_lowrank(a, P, Q):
+            def xc_lowrank(a, P, Q, progress=None):
                 '''w[k] = P^T v_xc[k] Q for the XC responses of the dms whose
                 symmetric parts are a[k] Q^T + Q a[k]^T, None where this path
                 is not the cheaper one'''
@@ -283,7 +307,7 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                     else:
                         fxc_mo = fxc[0,:,0] - fxc[0,:,1]
                 w = numpy.zeros((len(a), P.shape[1], Q.shape[1]))
-                fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w)
+                fused.rks_fxc_mo(ni, xctype, fxc_mo, a, Q, P, Q, w, progress=progress)
                 return w
 
             def vind_lowrank(dm1, a, P, Q):
@@ -318,13 +342,14 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                     nset = len(x)
                     nao = mo_coeff.shape[0]
                     a = lib.einsum('pa,kai->kpi', mo_coeff, x)
-                    v1mo = xc_lowrank(a, mo_coeff, mocc)
+                    terms = _Terms(mf, nset)
+                    v1mo = xc_lowrank(a, mo_coeff, mocc, terms.progress('XC'))
                     with_xc = v1mo is None
                     if with_xc:
                         v1mo = numpy.zeros((nset,nmo,nocc))
 
-                    def by_chunks(chunk, response):
-                        for p0, p1 in lib.prange(0, nset, chunk):
+                    def by_chunks(chunk, response, what):
+                        for p0, p1 in terms.progress(what).ranges(lib.prange(0, nset, chunk)):
                             if dm1 is None:
                                 d = numpy.matmul(a[p0:p1], mocc.T)
                                 d = d + d.transpose(0,2,1)
@@ -336,17 +361,20 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                                 v1mo[p0:p1] += numpy.matmul(mo_coeff.T, numpy.matmul(v1, mocc))
                             v1 = None
 
+                    terms.done()
                     vk_mo = k_mo_from_factors(a, mocc)
                     k_done = vk_mo is not None
                     if k_done:
                         v1mo += vk_mo
                         vk_mo = None
+                        terms.done('exchange')
 
                     nlc_done = False
                     if with_nlc and mf.do_nlc() and a.dtype == numpy.double:
                         from pyscf.hessian.rks import get_vnlc_resp_mo
                         nlc_done = get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory,
                                                     v1mo) is not None
+                        terms.done('VV10' if nlc_done else None)
 
                     def k_nlc_xc(d):
                         v1 = None if k_done else vind_k(d)
@@ -366,13 +394,14 @@ def _gen_rhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                             # pass, so chunks here cost no integrals either
                             left = (mf.max_memory - lib.current_memory()[0]) * .5e6
                             chunk = min(nset, max(16, int(left / (4 * 8 * nao**2))))
-                        by_chunks(chunk, lambda d: mf.get_j(mol, d, hermi=hermi))
+                        by_chunks(chunk, lambda d: mf.get_j(mol, d, hermi=hermi), 'Coulomb')
                     else:
-                        by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j)
+                        by_chunks(_cphf_chunk(mf, nset, nao, True, jk_together), vind_j,
+                                  'Coulomb and exchange' if jk_together else 'Coulomb')
                     if (k_alone and not k_done) or with_xc or (
                             with_nlc and mf.do_nlc() and not nlc_done):
                         by_chunks(_cphf_chunk(mf, nset, nao, False, True, k_done or None),
-                                  k_nlc_xc)
+                                  k_nlc_xc, 'the terms from the density matrices')
                     return v1mo
                 vind.vind_mo = vind_mo
 
@@ -526,7 +555,7 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 # no occupied orbitals)
                 s0 = int(numpy.prod(shapes[1]) > numpy.prod(shapes[0]))
 
-                def xc_from_factors(a, v1mo):
+                def xc_from_factors(a, v1mo, progress=None):
                     """v1mo[s] += the XC response from the factors, where that path
                     is the cheaper one; whether it was"""
                     nset = len(a[0])
@@ -535,7 +564,8 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                                                   mocc[0].shape[1] + mocc[1].shape[1], nset,
                                                   nspin=2)):
                         return False
-                    fused.uks_fxc_mo(ni, xctype, fxc, a, mocc, mo_coeff, mocc, v1mo)
+                    fused.uks_fxc_mo(ni, xctype, fxc, a, mocc, mo_coeff, mocc, v1mo,
+                                     progress=progress)
                     return True
 
                 def k_from_factors(a, v1mo):
@@ -620,9 +650,15 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                     a = [lib.einsum('pa,kai->kpi', mo_coeff[s], x[s].reshape(nset, *shapes[s]))
                          for s in range(2)]
                     v1mo = [numpy.zeros((nset, *shapes[s])) for s in range(2)]
-                    with_xc = not xc_from_factors(a, v1mo)
+                    terms = _Terms(mf, nset)
+                    with_xc = not xc_from_factors(a, v1mo, terms.progress('XC'))
+                    terms.done()
                     k_done = k_from_factors(a, v1mo)
-                    nlc_done = not (with_nlc and mf.do_nlc()) or nlc_from_factors(a, v1mo)
+                    terms.done('exchange' if k_done else None)
+                    nlc_done = not (with_nlc and mf.do_nlc())
+                    if not nlc_done:
+                        nlc_done = nlc_from_factors(a, v1mo)
+                        terms.done('VV10' if nlc_done else None)
 
                     def spin_dms(p0, p1):
                         if dm1 is not None:
@@ -658,7 +694,8 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                             else:
                                 # RI-J: chunks cost no integrals
                                 chunk = min(nset, max(16, int(left / (4 * 8 * nao**2))))
-                            for p0, p1 in lib.prange(0, nset, chunk):
+                            prog = terms.progress('Coulomb')
+                            for p0, p1 in prog.ranges(lib.prange(0, nset, chunk)):
                                 add(p0, p1, mf.get_j(mol, total_dms(p0, p1), hermi=hermi))
                         rest = with_xc or not nlc_done
                     else:
@@ -669,7 +706,8 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                             chunk = min(nset, max(8, int(left / (6 * 8 * nao**2))))
                         else:
                             chunk = max(1, _cphf_chunk(mf, 2*nset, nao, with_j, True) // 2)
-                        for p0, p1 in lib.prange(0, nset, chunk):
+                        prog = terms.progress('the terms from the density matrices')
+                        for p0, p1 in prog.ranges(lib.prange(0, nset, chunk)):
                             d = spin_dms(p0, p1)
                             v1 = numpy.zeros_like(d)
                             if with_xc:

@@ -534,7 +534,8 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
     aoslices = mol.aoslice_by_atom()
     h1ao = [None] * mol.natm
-    for i0, ia in enumerate(atmlst):
+    prog = logger.Progress(hessobj, 'J and K Fock matrix derivatives', len(atmlst), 'atoms')
+    for i0, ia in enumerate(prog.items(atmlst)):
         shl0, shl1, p0, p1 = aoslices[ia]
         shls_slice = (shl0, shl1) + (0, mol.nbas)*3
         vj1, vj2, vk1, vk2 = _get_jk(mol, 'int2e_ip1', 3, 's2kl',

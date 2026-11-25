@@ -412,6 +412,29 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(e2-e2ref).max(), 0, 6)
 
 
+    def test_progress_lines(self):
+        # The progress lines of the steps that take long (lib.logger.Progress, the CPHF cycles): with
+        # Logger.info, once a step has run for PROGRESS_AFTER seconds, so none for a small molecule
+        # unless forced; the Hessian is the same either way
+        import io
+        hess = {}
+        text = {}
+        for after in (lib.logger.PROGRESS_AFTER, 0.):
+            mol1 = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587', basis='6-31g', verbose=0)
+            mol1.stdout = io.StringIO()
+            mol1.verbose = 4
+            mf = dft.RKS(mol1, xc='b3lyp').run(conv_tol=1e-12)
+            mol1.stdout.truncate(0)
+            with lib.temporary_env(lib.logger, PROGRESS_AFTER=after):
+                hess[after] = mf.Hessian().kernel()
+            text[after] = mol1.stdout.getvalue()
+        self.assertNotIn('% of the', text[lib.logger.PROGRESS_AFTER])
+        self.assertNotIn('CPHF cycle', text[lib.logger.PROGRESS_AFTER])
+        self.assertIn('    J and K Fock matrix derivatives: 33% of the atoms after ', text[0.])
+        self.assertIn('    J and K Fock matrix derivatives: done in ', text[0.])
+        self.assertIn('    CPHF cycle 0 after ', text[0.])
+        self.assertAlmostEqual(abs(hess[0.] - hess[lib.logger.PROGRESS_AFTER]).max(), 0, 12)
+
 if __name__ == "__main__":
     print("Full Tests for RKS Hessian")
     unittest.main()

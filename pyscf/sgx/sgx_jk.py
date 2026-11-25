@@ -1297,7 +1297,8 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
     drv = _vhf.libcvhf.SGXnr_direct_k_many_groups
     c_nsets = (ctypes.c_int * ngroup)(*nsets_pad)
     t_ao = t_f = t_drv = t_k = 0
-    for i0, i1 in lib.prange(0, ngrids, blksize):
+    prog = logger.Progress(sgx, 'seminumerical K of many densities', ngrids)
+    for i0, i1 in prog.ranges(lib.prange(0, ngrids, blksize)):
         assert i0 % SGX_BLKSIZE == 0
         coords = grids.coords[i0:i1]
         weights = grids.weights[i0:i1]
