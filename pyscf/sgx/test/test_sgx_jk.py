@@ -367,6 +367,39 @@ class ManyDensities(unittest.TestCase):
         with lib.temporary_env(sgx_obj, optk=False):
             self.assertIsNone(sgx_obj.get_k_mo(a, mocc, mo_coeff))
 
+    def test_get_k_mo_groups(self):
+        # the K of two groups of densities with orbitals of their own (the spins of an unrestricted
+        # response) from one evaluation of the integrals, against the K of their dms
+        mol = gto.M(atom=WATER_CLUSTER, basis='def2-svp', verbose=0)
+        numpy.random.seed(7)
+        nao = mol.nao
+        nocc = (mol.nelectron // 2 + 1, mol.nelectron // 2 - 1)
+        mo_coeff = [numpy.linalg.qr(numpy.random.rand(nao, nao))[0] for s in range(2)]
+        mocc = [mo_coeff[s][:,:nocc[s]] for s in range(2)]
+        a = [numpy.random.rand(11, nao, nocc[s]) - .5 for s in range(2)]
+        d = [numpy.matmul(a[s], mocc[s].T) for s in range(2)]
+        d = numpy.array([x + x.transpose(0,2,1) for x in d])
+        mf = dft.RKS(mol, xc='wb97x').RIJCOSX()
+        sgx_obj = mf.with_df
+        sgx_obj.build(level=1)
+        for omega, mix in ((None, None), (.3, None), (.3, (.2, .8))):
+            if mix is not None and not sgx_obj.mixed_range_ok():
+                continue
+            # the dms of both groups in one call, as the screening takes them together
+            ref = sgx_obj.get_jk(d.reshape(-1,nao,nao), 1, with_j=False, omega=omega, mix=mix)[1]
+            ref = ref.reshape(2, 11, nao, nao)
+            vk = sgx_obj.get_k_mo(a, mocc, mo_coeff, omega=omega, mix=mix)
+            self.assertEqual(len(vk), 2)
+            for s in range(2):
+                r = numpy.matmul(mo_coeff[s].T, numpy.matmul(ref[s], mocc[s]))
+                self.assertEqual(vk[s].shape, r.shape)
+                self.assertLess(abs(vk[s] - r).max() / abs(r).max(), 1e-11, (omega, mix, s))
+        # one group of a list is that group alone
+        one = sgx_obj.get_k_mo([a[0]], [mocc[0]], [mo_coeff[0]])
+        self.assertLess(abs(one[0] - sgx_obj.get_k_mo(a[0], mocc[0], mo_coeff[0])).max(), 1e-13)
+        # too few densities in all
+        self.assertIsNone(sgx_obj.get_k_mo([a[0][:3], a[1][:4]], mocc, mo_coeff))
+
 if __name__ == "__main__":
     print("Full Tests for sgx_jk")
     unittest.main()

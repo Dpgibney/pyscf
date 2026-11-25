@@ -52,15 +52,28 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     de2 = hessobj.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst,
                                     max_memory, log)
 
+    # h1occ: a part of H1 of each spin kept as its products with the occupied orbitals, where the
+    # make_h1 of hessobj has such a form (as hessian.rhf.hess_elec)
+    h1occ = None
     if h1ao is None:
-        h1ao = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        split = rhf_hess._MAKE_H1_SPLIT.get(getattr(hessobj.make_h1, '__func__', None))
+        if split is None:
+            h1ao = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        else:
+            h1ao, h1occ = split(hessobj, mo_coeff, mo_occ, None, atmlst, log)
+        h1ao = tuple(rhf_hess._h1ao_out_of_core(h, mf.max_memory, log) for h in h1ao)
         t1 = log.timer_debug1('making H1', *time0)
     if mo1 is None or mo_e1 is None:
-        mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
-                                       None, atmlst, max_memory, log)
+        if h1occ is None:
+            mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
+                                           None, atmlst, max_memory, log)
+        else:
+            mo1, mo_e1 = hessobj.solve_mo1(mo_energy, mo_coeff, mo_occ, h1ao,
+                                           None, atmlst, max_memory, log, h1occ=h1occ)
         t1 = log.timer_debug1('solving MO1', *t1)
 
     h1aoa, h1aob = h1ao
+    h1occa, h1occb = (None, None) if h1occ is None else h1occ
     mo1a, mo1b = mo1
     mo_e1a, mo_e1b = mo_e1
 
@@ -71,9 +84,9 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     s1a = -mol.intor('int1e_ipovlp', comp=3)
 
     de2_mo1 = rhf_hess._hess_elec_mo1(mol, atmlst, h1aoa, mo1a, mo_e1a, mocca, mo_ea, s1a,
-                                      max_memory)
+                                      max_memory, h1occ=h1occa)
     de2_mo1 += rhf_hess._hess_elec_mo1(mol, atmlst, h1aob, mo1b, mo_e1b, moccb, mo_eb, s1a,
-                                       max_memory)
+                                       max_memory, h1occ=h1occb)
     de2_mo1 *= 2
     for i0 in range(len(atmlst)):
         de2[i0,:i0+1] += de2_mo1[i0,:i0+1]
@@ -112,7 +125,6 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     dme0 = numpy.einsum('pi,qi,i->pq', mocca, mocca, mo_ea)
     dme0+= numpy.einsum('pi,qi,i->pq', moccb, moccb, mo_eb)
 
-    hcore_deriv = hessobj.hcore_generator(mol)
     s1aa, s1ab, s1a = rhf_hess.get_ovlp(mol)
 
     # Skip the K-type contractions when no exact exchange is needed (with_k=False)
@@ -123,6 +135,10 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     aoslices = mol.aoslice_by_atom()
     natm = len(atmlst)
     e1 = numpy.zeros((natm, natm, 3, 3))  # (A,B,dR_A,dR_B)
+    # the core Hamiltonian's second derivatives with dm0, from the blocks of each pair of atoms
+    hcore_deriv = None
+    if not rhf_hess._hcore_deriv2_dm_(e1, hessobj, mol, dm0, atmlst):
+        hcore_deriv = hessobj.hcore_generator(mol)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
         e1[i0,i0] -= numpy.einsum('xypq,pq->xy', s1aa[:,:,p0:p1], dme0[p0:p1])*2
@@ -131,12 +147,14 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
             q0, q1 = aoslices[ja][2:]
             e1[i0,j0] -= numpy.einsum('xypq,pq->xy', s1ab[:,:,p0:p1,q0:q1], dme0[p0:p1,q0:q1])*2
 
-            h1ao = hcore_deriv(ia, ja)
-            e1[i0,j0] += numpy.einsum('xypq,pq->xy', h1ao, dm0)
+            if hcore_deriv is not None:
+                h1ao = hcore_deriv(ia, ja)
+                e1[i0,j0] += numpy.einsum('xypq,pq->xy', h1ao, dm0)
 
         for j0 in range(i0):
             e1[j0,i0] = e1[i0,j0].T
 
+    t1 = log.timer_debug1('one-electron terms', *t1)
     log.timer('UHF partial hessian', *time0)
     return e1, ej, ek
 
@@ -179,7 +197,11 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
 def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
               fx=None, atmlst=None, max_memory=4000, verbose=None,
-              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False):
+              max_cycle=50, level_shift=0, residual_tol=None, scale_trials=False,
+              h1occ=None):
+    '''As hessian.rhf.solve_mo1 for the orbitals of each spin. h1occ = (h1occa, h1occb): a part of
+    H1 of each spin as its products with the occupied orbitals, [natm,3,nao,nocc_s], added to those
+    of h1ao.'''
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
     if atmlst is None: atmlst = range(mol.natm)
@@ -221,6 +243,9 @@ def solve_mo1(mf, mo_energy, mo_coeff, mo_occ, h1ao,
             s1vob.append(_ao2mo(s1ao, mo_coeff[1], moccb))
             h1voa.append(_ao2mo(h1aoa[ia], mo_coeff[0], mocca))
             h1vob.append(_ao2mo(h1aob[ia], mo_coeff[1], moccb))
+            if h1occ is not None:
+                h1voa[-1] += lib.einsum('pq,xpi->xqi', mo_coeff[0], h1occ[0][ia])
+                h1vob[-1] += lib.einsum('pq,xpi->xqi', mo_coeff[1], h1occ[1][ia])
 
         h1vo = (numpy.vstack(h1voa), numpy.vstack(h1vob))
         s1vo = (numpy.vstack(s1voa), numpy.vstack(s1vob))
@@ -263,6 +288,13 @@ def gen_vind(mf, mo_coeff, mo_occ):
     def fx(mo1):
         mo1 = mo1.reshape(-1,nmoa*nocca+nmob*noccb)
         nset = len(mo1)
+        if vind_mo is not None:
+            # the dms are made from mo1 where their AO matrices are needed, a chunk at a time
+            v1a, v1b = vind_mo(None, (mo1[:,:nmoa*nocca], mo1[:,nmoa*nocca:]))
+            v1vo = numpy.empty_like(mo1)
+            v1vo[:,:nmoa*nocca] = v1a.reshape(nset,-1)
+            v1vo[:,nmoa*nocca:] = v1b.reshape(nset,-1)
+            return v1vo
         dm1 = numpy.empty((2,nset,nao,nao))
         for i, x in enumerate(mo1):
             xa = x[:nmoa*nocca].reshape(nmoa,nocca)
@@ -271,12 +303,6 @@ def gen_vind(mf, mo_coeff, mo_occ):
             dmb = reduce(numpy.dot, (mo_coeff[1], xb, moccb.T))
             dm1[0,i] = dma + dma.T
             dm1[1,i] = dmb + dmb.T
-        if vind_mo is not None:
-            v1a, v1b = vind_mo(dm1, (mo1[:,:nmoa*nocca], mo1[:,nmoa*nocca:]))
-            v1vo = numpy.empty_like(mo1)
-            v1vo[:,:nmoa*nocca] = v1a.reshape(nset,-1)
-            v1vo[:,nmoa*nocca:] = v1b.reshape(nset,-1)
-            return v1vo
         v1 = vresp(dm1)
         v1vo = numpy.empty_like(mo1)
         for i in range(nset):
@@ -371,7 +397,7 @@ class Hessian(rhf_hess.HessianBase):
     gen_hop = gen_hop
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao,
-                  fx=None, atmlst=None, max_memory=4000, verbose=None):
+                  fx=None, atmlst=None, max_memory=4000, verbose=None, h1occ=None):
         # as rhf.HessianBase.solve_mo1
         residual_tol = rhf_hess._cphf_residual_tol(self)
         scale_trials = (fx is None and not self.sgx_response
@@ -384,7 +410,7 @@ class Hessian(rhf_hess.HessianBase):
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1ao,
                          fx, atmlst, max_memory, verbose,
                          max_cycle=self.max_cycle, level_shift=self.level_shift,
-                         residual_tol=residual_tol, scale_trials=scale_trials)
+                         residual_tol=residual_tol, scale_trials=scale_trials, h1occ=h1occ)
 
 from pyscf import scf
 scf.uhf.UHF.Hessian = lib.class_as_method(Hessian)

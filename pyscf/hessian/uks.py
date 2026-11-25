@@ -106,7 +106,16 @@ def _total_density_orbitals(mo_coeff, mo_occ):
     mocc = numpy.hstack([mo_coeff[0][:,mo_occ[0]>0], mo_coeff[1][:,mo_occ[1]>0]]) * .5**.5
     return mocc, numpy.full(mocc.shape[1], 2.)
 
-def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+def _make_h1_split(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+    '''make_h1 for hess_elec, as hessian.rks._make_h1_split: ((h1aoa, h1aob), (h1occa, h1occb)) with
+    h1ao[s][ia] mocc[s] + h1occ[s][ia] = the Fock derivative of spin s times its occupied orbitals.
+    h1occ[s] [natm,3,nao,nocc_s] holds the potential matrices of the 3*natm density derivatives of
+    the XC and VV10 kernels, made as such products.'''
+    if not rks_hess.H1_OCC:
+        return make_h1(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose), None
+    return make_h1(hessobj, mo_coeff, mo_occ, chkfile, atmlst, verbose, _split=True)
+
+def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None, _split=False):
     mol = hessobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
@@ -128,15 +137,28 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
 
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory*.9-mem_now)
-    h1aoa, h1aob = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+    h1occ = None
+    if _split:
+        h1occ = (numpy.zeros((mol.natm, 3, nao, mocca.shape[1])),
+                 numpy.zeros((mol.natm, 3, nao, moccb.shape[1])))
+    h1aoa, h1aob = _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=h1occ)
     if mf.do_nlc():
         # the same potential for both spins
         mo_sf, occ_sf = _total_density_orbitals(mo_coeff, mo_occ)
-        vnlc = rks_hess._get_vnlc_deriv1(hessobj, mo_sf, occ_sf, max_memory)
+        occ_sf_out = None
+        if _split:
+            occ_sf_out = numpy.zeros((mol.natm, 3, nao, mo_sf.shape[1]))
+        vnlc = rks_hess._get_vnlc_deriv1(hessobj, mo_sf, occ_sf, max_memory, occ_out=occ_sf_out)
         for ia in range(mol.natm):
             h1aoa[ia] += vnlc[ia]
             h1aob[ia] += vnlc[ia]
         vnlc = None
+        if _split:
+            # the products with mo_sf = (mocca, moccb) / sqrt(2)
+            na = mocca.shape[1]
+            h1occ[0][:] += occ_sf_out[:,:,:,:na] * 2**.5
+            h1occ[1][:] += occ_sf_out[:,:,:,na:] * 2**.5
+            occ_sf_out = None
     aoslices = mol.aoslice_by_atom()
     if hybrid:
         vhfopt = rhf_hess._make_h1_vhfopt(mol, [dm0, dm0a, dm0b], 'jk')
@@ -185,7 +207,11 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
         h1aoa[ia] += h1 + veffa + veffa.transpose(0,2,1)
         h1aob[ia] += h1 + veffb + veffb.transpose(0,2,1)
 
+    if _split:
+        return (h1aoa, h1aob), h1occ
     return h1aoa, h1aob
+
+rhf_hess._MAKE_H1_SPLIT[make_h1] = _make_h1_split
 
 XX, XY, XZ = 4, 5, 6
 YX, YY, YZ = 5, 7, 8
@@ -541,6 +567,17 @@ def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
     vxc_dm = numpy.zeros((2,natm,natm,3,3))
     ipipa = numpy.zeros((3,3,nao,nao))
     ipipb = numpy.zeros((3,3,nao,nao))
+    # The arrays of a block beside the AO values, as in rks_hess._get_vxc_deriv2_dm with the AO-density
+    # products and the vectors of both spins (the weighted AOs of one spin at a time): without them in the
+    # block size, a block of the meta-GGA held 2.2 times the memory block_loop was given.
+    held = (ipipa.nbytes + ipipb.nbytes) / 1e6
+    if xctype == 'LDA':
+        max_memory = rks_hess._xc_block_memory(mf, max_memory, 1, 5*nao + 12*natm, held)
+    elif xctype == 'GGA':
+        max_memory = rks_hess._xc_block_memory(mf, max_memory, 2, 11*nao + 48*natm, held)
+    else:
+        max_memory = rks_hess._xc_block_memory(mf, max_memory, 2, 17*nao + 60*natm, held)
+    max_memory = max(1000, max_memory)
     if xctype == 'LDA':
         ao_deriv = 1
         for ao, mask, weight, coords \
@@ -636,7 +673,13 @@ def _get_vxc_deriv2_dm(hessobj, mo_coeff, mo_occ, max_memory):
                     vxc_dm[s,ia,ja] += numpy.einsum('yxqp,pq->xy', ipip[:,:,p0:p1,q0:q1], dm0[q0:q1,p0:p1])
     return vxc_dm[0], vxc_dm[1]
 
-def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
+def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
+    '''The XC part of the Fock matrix derivatives of both spins, each [natm,3,nao,nao].
+
+    With occ_out = (occ_a, occ_b), occ_s [natm,3,nao,nocc_s]: as hessian.rks._get_vxc_deriv1, the
+    potential matrices of the 3*natm density derivatives (the kernel term) are added to occ_out as
+    products with the occupied orbitals of each spin and left out of the matrices returned, where
+    the fused XC kernels apply.'''
     mol = hessobj.mol
     mf = hessobj.base
     if hessobj.grids is not None:
@@ -657,7 +700,17 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
     # vmat[0] for alpha, vmat[1] for beta
     vmat = numpy.zeros((2,mol.natm,3,nao,nao))
     vmata, vmatb = vmat
-    max_memory = max(2000, max_memory-vmat.size*8/1e6)
+    # The arrays of a block beside the AO values (as in rks_hess._get_vxc_deriv1): the AO-density products of
+    # both spins and the potentials of the 3*natm perturbations of both
+    ncomp = {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype]
+    if xctype == 'LDA':
+        max_memory = rks_hess._xc_block_memory(mf, max_memory, 1, 4*nao + 12*mol.natm, vmat.nbytes/1e6)
+    else:
+        max_memory = rks_hess._xc_block_memory(mf, max_memory, 2, 13*nao + 12*ncomp*mol.natm,
+                                               vmat.nbytes/1e6)
+    # at least 2000 MB, as before: with less, the sets of perturbations a pass of the fused kernels takes
+    # (mo_chunk) become few and the passes many
+    max_memory = max(2000, max_memory)
     # the grid response of each spin's potentials (see rks_hess._grid_response_wv_, _grid_motion_vmat_)
     grid_response = getattr(hessobj, 'grid_response', False)
     if grid_response:
@@ -665,10 +718,43 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
         def grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, fac):
             own = grids.atm_idx[ip0:ip1]
             dw = rks_hess._becke_weight_derivs(mol, grids, ip0, ip1, None, True, table)[0]
-            idx = rks_hess._nonzero_aos(mol, mask, nao)
+            if wv0_all is None:
+                idx = rks_hess._nonzero_aos(mol, mask, nao)
             for s in range(2):
                 rks_hess._grid_response_wv_(wv[s], vxc[s], own, dw, fac)
-                rks_hess._grid_motion_vmat_(vmat[s], mol, ao, wv0[s], xctype, own, idx)
+                if wv0_all is not None:
+                    # the motion of the points after the loop, from the potential of all points
+                    wv0_all[s][:,ip0:ip1] = wv0[s]
+                else:
+                    rks_hess._grid_motion_vmat_(vmat[s], mol, ao, wv0[s], xctype, own, idx)
+    fused = wv0_all = None
+    if occ_out is not None:
+        fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (),
+                                 match_block_loop=False)
+        mocc = [numpy.asarray(mo_coeff[s][:,mo_occ[s]>0], order='C') for s in range(2)]
+        occ_sets = [occ_out[s].reshape(mol.natm*3, nao, mocc[s].shape[1]) for s in range(2)]
+        if grid_response and fused is not None:
+            wv0_all = numpy.zeros((2, {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype], grids.weights.size))
+
+    def add_potentials(wv, p0, p1):
+        '''The potential matrices of wv[2,natm,3,ncomp,p1-p0] (as rks_hess._get_vxc_deriv1's
+        add_potentials): times the occupied orbitals of each spin into occ_out, with the sign vmat
+        gets at the end. False, nothing done, without the fused kernels.'''
+        if fused is None:
+            return False
+        nset = wv.shape[1] * wv.shape[2]
+        for s in range(2):
+            nocc = mocc[s].shape[1]
+            if nocc == 0:
+                continue
+            w = wv[s].reshape(nset, wv.shape[3], p1-p0)
+            if w.shape[1] == 5:
+                w[:,4] *= 2  # dot_ao_mo takes the factor 1/2 of tau alone
+            w *= -1  # the sign of vmat, so that the kernel adds to occ_out itself
+            chunk = fused.mo_chunk(nset, nocc)
+            for k0, k1 in lib.prange(0, nset, chunk):
+                fused.dot_ao_mo(p0, p1, w[k0:k1], xctype, mocc[s], occ_sets[s][k0:k1])
+        return True
     ip1 = 0
     if xctype == 'LDA':
         ao_deriv = 1
@@ -701,8 +787,12 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             if grid_response:
                 grid_terms(wv, vxc, (weight * vxc[:,0])[:,None], ao, mask, ip0, ip1, .5)
             # vmat[s,ia,i] += (ao[0]*wv[s,ia,i]).T.dot(ao[0]) for both spins and all atoms
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,1,weight.size),
-                                    mask, ao_loc)
+            if fused is not None:
+                # LDA: vmat holds half of the matrix, dot_ao_mo gives the whole one
+                wv *= 2
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,1,weight.size),
+                                        mask, ao_loc)
             ao_dm0a = ao_dm0b = aow = wv = None
 
         for ia in range(mol.natm):
@@ -742,8 +832,9 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
                 grid_terms(wv, vxc, wv0, ao, mask, ip0, ip1, 1.)
             wv[:,:,:,0] *= .5
             # vmat[s,ia,i] += einsum('xgp,xg->gp', ao[:4], wv[s,ia,i]).T.dot(ao[0])
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,4,weight.size),
-                                    mask, ao_loc)
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,4,weight.size),
+                                        mask, ao_loc)
             ao_dm0a = ao_dm0b = wv = None
 
         for ia in range(mol.natm):
@@ -790,8 +881,9 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             wv[:,:,:,4] *= .25
             # vmat[s,ia,i] += einsum('xgp,xg->gp', ao[:4], wv[s,ia,i,:4]).T.dot(ao[0])
             #               + sum_j (ao[j]*wv[s,ia,i,4]).T.dot(ao[j])
-            numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,5,weight.size),
-                                    mask, ao_loc)
+            if not add_potentials(wv, ip0, ip1):
+                numint._dot_sets_aow_ao(vmat.reshape(-1,nao,nao), ao, wv.reshape(-1,5,weight.size),
+                                        mask, ao_loc)
             ao_dm0a = ao_dm0b = wv = None
 
         for ia in range(mol.natm):
@@ -801,6 +893,14 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory):
             vmata[ia] = -vmata[ia] - vmata[ia].transpose(0,2,1)
             vmatb[ia] = -vmatb[ia] - vmatb[ia].transpose(0,2,1)
 
+    if wv0_all is not None:
+        # The points of atom G move with it (see rks_hess._get_vxc_deriv1): v_G + v_G^T of each spin's
+        # ground-state potential on the points of G, times the occupied orbitals
+        terms = numint._xc_grad_terms(xctype)
+        for s in range(2):
+            if mocc[s].shape[1] > 0:
+                fused.dot_terms_owner_mo(wv0_all[s], terms, grids.atm_idx, mol.natm, mocc[s],
+                                         occ_out[s])
     return vmata, vmatb
 
 

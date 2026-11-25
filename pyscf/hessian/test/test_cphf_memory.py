@@ -247,6 +247,148 @@ class KnownValues(unittest.TestCase):
         self.assertLess(abs(h - ref).max(), 1e-8)
 
 
+    def test_vnlc_deriv1_kept_kernel_terms(self):
+        # the kernel terms of the density responses that the VV10 energy's second derivative hands to
+        # the VV10 Fock matrix derivative with the grid response (_VV10HessData._f_t_dA), against the
+        # derivative that makes its own
+        mf1 = dft.RKS(mol, xc='wb97m-v')
+        mf1.nlcgrids.level = 0
+        mf1.conv_tol = 1e-11
+        mf1.kernel()
+        hobj = mf1.Hessian()
+        vv = rks_hess._vv10_hess_data(mf1, mol, mf1.make_rdm1(), 2000)
+        ref = rks_hess._get_vnlc_deriv1(hobj, mf1.mo_coeff, mf1.mo_occ, 2000)
+        # without the grid response the energy term's density responses are not those of the derivative
+        rks_hess._get_enlc_deriv2(hobj, mf1.mo_coeff, mf1.mo_occ, 2000)
+        self.assertFalse(hasattr(vv, '_f_t_dA'))
+        hobj.grid_response = True
+        rks_hess._get_enlc_deriv2(hobj, mf1.mo_coeff, mf1.mo_occ, 2000)
+        self.assertIs(rks_hess._vv10_hess_data(mf1, mol, mf1.make_rdm1(), 2000), vv)
+        self.assertEqual(vv._f_t_dA[0].shape, (mol.natm*3, vv.ngrids))
+        with mock.patch.object(rks_hess._VV10HessData, 'f_t', side_effect=AssertionError):
+            v = rks_hess._get_vnlc_deriv1(hobj, mf1.mo_coeff, mf1.mo_occ, 2000)
+        self.assertFalse(hasattr(vv, '_f_t_dA'))
+        self.assertAlmostEqual(abs(v - ref).max(), 0, 11)
+
+class UKSKnownValues(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mol = gto.M(atom='O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692',
+                        basis='def2-svp', charge=1, spin=1, verbose=0)
+
+    def _mf(self, xc):
+        mf1 = dft.UKS(self.mol, xc=xc)
+        mf1.nlcgrids.level = 0
+        mf1.conv_tol = 1e-11
+        return mf1.run()
+
+    def test_h1_split(self):
+        # as test_h1_split for the orbitals of each spin (uks._make_h1_split), with and without the
+        # grid response: the same H1 mocc, and the same Hessian
+        from pyscf.hessian import uks as uks_hess
+        mol = self.mol
+        for xc, grid_response in (('lda,vwn', True), ('pbe', False), ('r2scan', True),
+                                  ('wb97m-v', True), ('wb97m-v', False)):
+            mf1 = self._mf(xc)
+            mocc = [mf1.mo_coeff[s][:,mf1.mo_occ[s]>0] for s in range(2)]
+            hobj = mf1.Hessian()
+            hobj.grid_response = grid_response
+            h1ao = hobj.make_h1(mf1.mo_coeff, mf1.mo_occ)
+            h1ao_s, h1occ = uks_hess._make_h1_split(hobj, mf1.mo_coeff, mf1.mo_occ)
+            for s in range(2):
+                self.assertEqual(h1occ[s].shape, (mol.natm, 3, mol.nao, mocc[s].shape[1]))
+                self.assertGreater(abs(h1occ[s]).max(), 1e-3)
+                ref = lib.einsum('axpq,qi->axpi', numpy.asarray(h1ao[s]), mocc[s])
+                new = lib.einsum('axpq,qi->axpi', numpy.asarray(h1ao_s[s]), mocc[s]) + h1occ[s]
+                self.assertAlmostEqual(abs(new - ref).max(), 0, 10)
+            with lib.temporary_env(rks_hess, H1_OCC=False):
+                hobj = mf1.Hessian()
+                hobj.grid_response = grid_response
+                hobj.cphf_residual_tol = 1e-7
+                h_ref = hobj.kernel()
+                self.assertIsNone(uks_hess._make_h1_split(hobj, mf1.mo_coeff, mf1.mo_occ)[1])
+            hobj = mf1.Hessian()
+            hobj.grid_response = grid_response
+            hobj.cphf_residual_tol = 1e-7
+            self.assertAlmostEqual(abs(hobj.kernel() - h_ref).max(), 0, 9)
+        self.assertIs(rhf_hess._MAKE_H1_SPLIT[uks_hess.make_h1], uks_hess._make_h1_split)
+
+    def test_vind_mo_chunks(self):
+        # the UKS response in the MO basis from the factors of the dms and by chunks of their AO
+        # matrices, without the dms (dm1=None), against the AO matrices of all of them
+        rng = numpy.random.default_rng(3)
+        for xc in ('pbe', 'b3lyp', 'wb97m-v'):
+            mf1 = self._mf(xc)
+            mo, occ = mf1.mo_coeff, mf1.mo_occ
+            mocc = [mo[s][:,occ[s]>0] for s in range(2)]
+            x = [rng.random((9, mo[s].shape[1], mocc[s].shape[1])) - .5 for s in range(2)]
+            dm1 = numpy.array([[mo[s] @ xk @ mocc[s].T for xk in x[s]] for s in range(2)])
+            dm1 = dm1 + dm1.transpose(0,1,3,2)
+            for mfr in (mf1, rhf_hess._sgx_response_scf(mf1, 1)):
+                vresp = mfr.gen_response(mo, occ, hermi=1)
+                v = vresp(dm1)
+                ref = [numpy.array([mo[s].T @ vk @ mocc[s] for vk in v[s]]) for s in range(2)]
+                for dm in (None, dm1):
+                    new = vresp.vind_mo(dm, x)
+                    for s in range(2):
+                        self.assertAlmostEqual(abs(new[s] - ref[s]).max(), 0, 8)
+                # a chunk at a time: no AO array of all dms
+                with mock.patch.object(_response_functions, '_cphf_chunk', return_value=2), \
+                        lib.temporary_env(mfr, max_memory=lib.current_memory()[0] + 1):
+                    new = vresp.vind_mo(None, x)
+                for s in range(2):
+                    self.assertAlmostEqual(abs(new[s] - ref[s]).max(), 0, 8)
+
+    def test_hcore_deriv2_blocks(self):
+        # the second derivatives of the core Hamiltonian with the density, from the blocks of each
+        # pair of atoms, against the matrices of hcore_generator
+        mol = self.mol
+        mf1 = self._mf('pbe')
+        dm0 = mf1.make_rdm1().sum(axis=0)
+        hobj = mf1.Hessian()
+        natm = mol.natm
+        e1 = numpy.zeros((natm, natm, 3, 3))
+        self.assertTrue(rhf_hess._hcore_deriv2_dm_(e1, hobj, mol, dm0, range(natm)))
+        hcore_deriv = hobj.hcore_generator(mol)
+        for ia in range(natm):
+            for ja in range(ia+1):
+                ref = numpy.einsum('xypq,pq->xy', hcore_deriv(ia, ja), dm0)
+                self.assertAlmostEqual(abs(e1[ia,ja] - ref).max(), 0, 10)
+        # a subset of the atoms, in another order
+        e1 = numpy.zeros((2, 2, 3, 3))
+        rhf_hess._hcore_deriv2_dm_(e1, hobj, mol, dm0, [2, 0])
+        self.assertAlmostEqual(abs(e1[1,0] - numpy.einsum('xypq,pq->xy', hcore_deriv(0, 2), dm0)).max(),
+                               0, 10)
+        # not with ECPs
+        mol1 = gto.M(atom='Zn 0 0 0; H 0 0 1.6', basis='lanl2dz', ecp='lanl2dz', spin=1, verbose=0)
+        mf2 = dft.UKS(mol1, xc='pbe')
+        self.assertFalse(rhf_hess._hcore_deriv2_dm_(numpy.zeros((2,2,3,3)), mf2.Hessian(), mol1,
+                                                    numpy.eye(mol1.nao), range(2)))
+
+    def test_grid_motion_owner_mo(self):
+        # the gradient-type matrices of the points of each atom times the orbitals, for all atoms in
+        # one pass (numint._FusedXC.dot_terms_owner_mo), against dot_terms for each atom's points
+        mol = self.mol
+        mf1 = self._mf('pbe')
+        grids = mf1.grids
+        nao = mol.nao
+        rng = numpy.random.default_rng(2)
+        q = rng.random((nao, 4)) - .5
+        for xctype, nwv in (('LDA', 1), ('GGA', 4), ('MGGA', 5)):
+            fused = numint._fused_xc(mf1._numint, mol, grids, nao, xctype, 2000, (),
+                                     match_block_loop=False)
+            self.assertIsNotNone(fused)
+            wv = rng.random((nwv, grids.weights.size)) * grids.weights
+            terms = numint._xc_grad_terms(xctype)
+            out = numpy.zeros((mol.natm, 3, nao, 4))
+            fused.dot_terms_owner_mo(wv, terms, grids.atm_idx, mol.natm, q, out)
+            for ia in range(mol.natm):
+                v = numpy.zeros((1, 3, nao, nao))
+                fused.dot_terms(0, grids.weights.size, ((grids.atm_idx == ia) * wv)[None], terms, v)
+                ref = lib.einsum('xpq,qi->xpi', v[0] + v[0].transpose(0,2,1), q)
+                self.assertAlmostEqual(abs(out[ia] - ref).max() / abs(ref).max(), 0, 12)
+
+
 if __name__ == '__main__':
     print('Full Tests for the memory of the CPHF response')
     unittest.main()

@@ -1250,6 +1250,30 @@ class _FusedXC:
             Q.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(Q.shape[2]),
             *self._args(ip0, ip1, deriv))
 
+    def dot_terms_owner_mo(self, wv, terms, owner, natm, Q, out):
+        '''out[A,o] += (v_A[o] + v_A[o]^T) Q for the matrices v_A[o] that dot_terms
+        adds for the weights wv[nwv,ngrids] on the points of atom A alone
+        (owner[g] == A), over the whole grid in one pass for all atoms
+        (VXCfused_dot_terms_owner_mo). Q[nao,nq] real, out[natm,nout,nao,nq].'''
+        kets, bras, deriv = terms
+        wv = numpy.asarray(wv, order='C', dtype=numpy.double)
+        Q = numpy.asarray(Q, order='C', dtype=numpy.double)
+        owner = numpy.asarray(owner, order='C', dtype=numpy.int32)
+        ngrids = self.grids.weights.size
+        nout, nseg = bras.shape[:2]
+        assert wv.ndim == 2 and wv.shape[1] == ngrids == owner.size
+        assert out.flags.c_contiguous and out.dtype == numpy.double
+        assert out.shape == (natm, nout, self.nao, Q.shape[1])
+        libdft.VXCfused_dot_terms_owner_mo(
+            out.ctypes.data_as(ctypes.c_void_p), wv.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(wv.shape[0]), owner.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(natm), ctypes.c_int(nout), ctypes.c_int(nseg),
+            kets.ctypes.data_as(ctypes.c_void_p),
+            bras.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(deriv),
+            Q.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(Q.shape[1]),
+            *self._args(0, ngrids, deriv))
+        return out
+
     def get_vxc_grad_q(self, ni, xc_code, xctype, mo_coeff, mo_occ):
         '''einsum('xij,ij->xi', vmat, dm) [3,nao] of the vmat[3,nao,nao] that
         get_vxc_grad (spin=0) adds for the density matrix dm of the real orbitals

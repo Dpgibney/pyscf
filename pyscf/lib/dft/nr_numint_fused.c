@@ -798,6 +798,35 @@ static void _combine(double *dst, size_t ld, double *aobuf, size_t comp_size,
         } }
 }
 
+/* Whether the weights wv[c*ldwv+q], c < nwv, q < ng, are all zero */
+static int _wv_all_zero(double *wv, size_t ldwv, int nwv, int ng)
+{
+        double *pw;
+        int c, q;
+        for (c = 0; c < nwv; c++) {
+                pw = wv + c * ldwv;
+                for (q = 0; q < ng; q++) {
+                        if (pw[q] != 0) {
+                                return 0;
+                        }
+                }
+        }
+        return 1;
+}
+
+/* Whether every entry of a term {nt, c_0, u_0, ...} carries a weight (u_t >= 0) */
+static int _term_weighted(int *term)
+{
+        int t;
+        for (t = 0; t < term[0]; t++) {
+                if (term[2+2*t] < 0) {
+                        return 0;
+                }
+        }
+        // an empty factor is zero as well
+        return 1;
+}
+
 /*
  * Sums of products of weighted AO values (up to third derivatives, computed in
  * place), for the XC terms of nuclear gradients and Hessians: for each set k of
@@ -808,7 +837,10 @@ static void _combine(double *dst, size_t ld, double *aobuf, size_t comp_size,
  * ket_terms[nseg] and bra_terms[nout,nseg]. The segments s are stacked along
  * the grid points, so each (k,o) takes one GEMM per group, and the kets are
  * shared by all outputs. out[nset,nout,nao,nao]; deriv <= 3 is the derivative
- * order of the AO components used; rcache only for deriv <= 1.
+ * order of the AO components used; rcache only for deriv <= 1. Where every
+ * segment has a weighted factor, a set whose weights are all zero on a group
+ * of points is skipped there (the weights of one atom's points among the sets
+ * of all atoms: one pass over the grid for all of them).
  */
 #define TERM_SLOTS      9
 void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
@@ -830,6 +862,16 @@ void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
         if (deriv > 1) {
                 rcache = NULL;
         }
+        // zero weights give zero products if a factor of every segment is weighted
+        int skip_zero = 1;
+        int io, is;
+        for (io = 0; io < nout; io++) {
+        for (is = 0; is < nseg; is++) {
+                if (!_term_weighted(ket_terms + is * TERM_SLOTS) &&
+                    !_term_weighted(bra_terms + (io * nseg + is) * TERM_SLOTS)) {
+                        skip_zero = 0;
+                }
+        } }
         if (max_nao > 0 && npriv > 0) {
         SlotStreams st;
         _slot_streams_init(&st, ngroup, nstream);
@@ -873,6 +915,9 @@ void VXCfused_dot_terms(double *out, double *wv, int nset, int nwv,
                             nbas, atm, bas, env, work);
                 for (k = 0; k < nset; k++) {
                         wvk = wv + (size_t)k * nwv * Ngrids;
+                        if (skip_zero && _wv_all_zero(wvk + ig0, Ngrids, nwv, ng)) {
+                                continue;
+                        }
                         for (s = 0; s < nseg; s++) {
                                 _combine(ketbuf + s * ng, nk, aobuf, comp_size,
                                          ket_terms + s * TERM_SLOTS, wvk, Ngrids, ig0,
@@ -924,6 +969,210 @@ static void _gather_rows(double *out, double *src, int ncol, GemmGroup *g)
                 }
                 out += n;
         }
+}
+
+// dst[n*ldd + t*m + j] = src[n*lds + t*ng + pts[j]]: the points pts[m] of each of
+// the nseg segments stacked along the points
+static void _take_points(double *dst, size_t ldd, double *src, size_t lds, int ns,
+                         int nseg, int ng, int *pts, int m)
+{
+        int n, t, j;
+        double *pd, *ps;
+        for (n = 0; n < ns; n++) {
+        for (t = 0; t < nseg; t++) {
+                pd = dst + n * ldd + (size_t)t * m;
+                ps = src + n * lds + (size_t)t * ng;
+                for (j = 0; j < m; j++) {
+                        pd[j] = ps[pts[j]];
+                }
+        } }
+}
+
+/*
+ * VXCfused_dot_terms for one set of weights wv[nwv,ngrids], apart for the points
+ * of each atom and as products with the real orbitals Q[nao,nq] (C order): with
+ * v_A[o] the matrix VXCfused_dot_terms adds for output o from the points g of
+ * atom A = owner[g] alone (owner[g] < 0 or >= natm_out: no atom),
+ *     out[A,o] += v_A[o] Q + v_A[o]^T Q,     out[natm_out,nout,nao,nq].
+ * These are the grid-response terms of the Fock matrix derivatives, where the
+ * points of an atom move with it: the gradient-type matrices of each atom's
+ * points, as the Hessian takes them (times the occupied orbitals). On the
+ * points of atom A in a group, with ZK = ket^T Q and ZB[o] = bra[o]^T Q (the
+ * segments stacked along the points), v Q = bra[o] ZK and v^T Q = ket ZB[o]:
+ * GEMMs of ns x nq x (the points of A), so that all atoms together take one
+ * pass over the grid, wherever their points are. A thread takes atoms of its
+ * own, whose rows of out are no one else's, and for each of them the groups of
+ * points that hold points of the atom: out does not depend on the threads.
+ */
+void VXCfused_dot_terms_owner_mo(double *out, double *wv, int nwv, int *owner, int natm_out,
+                                 int nout, int nseg, int *ket_terms, int *bra_terms, int deriv,
+                                 double *Q, int nq,
+                                 int nao, int ngrids, double *coords, int ldc,
+                                 uint8_t *screen_index, int *ao_loc,
+                                 int *atm, int natm, int *bas, int nbas, double *env,
+                                 double *rcache, int64_t *roffs)
+{
+        const size_t Nao = nao;
+        const size_t Ngrids = ngrids;
+        const int ncomp = (deriv+1)*(deriv+2)*(deriv+3)/6;
+        const int nblk = (ngrids + BLKSIZE - 1) / BLKSIZE;
+        const int ngroup = (nblk + GEMM_NBLK - 1) / GEMM_NBLK;
+        const int max_nao = _gemm_max_group_aos(screen_index, ngrids, nbas, ao_loc);
+        if (deriv > 1) {
+                rcache = NULL;
+        }
+        if (max_nao <= 0 || natm_out <= 0 || nout <= 0 || nq <= 0) {
+                return;
+        }
+        // zero weights give zero products if a factor of every segment is weighted
+        int skip_zero = 1;
+        int io, is;
+        for (io = 0; io < nout; io++) {
+        for (is = 0; is < nseg; is++) {
+                if (!_term_weighted(ket_terms + is * TERM_SLOTS) &&
+                    !_term_weighted(bra_terms + (io * nseg + is) * TERM_SLOTS)) {
+                        skip_zero = 0;
+                }
+        } }
+        // the groups that hold points of each atom
+        int *grp_ptr = calloc(natm_out + 2, sizeof(int));
+        char *seen = malloc(sizeof(char) * natm_out);
+        int igrp, ig, ia, g0, g1;
+        for (igrp = 0; igrp < ngroup; igrp++) {
+                g0 = igrp * GEMM_NGRIDS;
+                g1 = MIN(g0 + GEMM_NGRIDS, ngrids);
+                memset(seen, 0, natm_out);
+                for (ig = g0; ig < g1; ig++) {
+                        ia = owner[ig];
+                        if (ia >= 0 && ia < natm_out && !seen[ia]) {
+                                seen[ia] = 1;
+                                grp_ptr[ia+2]++;
+                        }
+                }
+        }
+        for (ia = 0; ia < natm_out; ia++) {
+                grp_ptr[ia+2] += grp_ptr[ia+1];
+        }
+        // grp_ptr[ia+1] is the position to fill for atom ia; after the fill it is its end
+        int *grp_lst = malloc(sizeof(int) * (grp_ptr[natm_out+1] + 1));
+        for (igrp = 0; igrp < ngroup; igrp++) {
+                g0 = igrp * GEMM_NGRIDS;
+                g1 = MIN(g0 + GEMM_NGRIDS, ngrids);
+                memset(seen, 0, natm_out);
+                for (ig = g0; ig < g1; ig++) {
+                        ia = owner[ig];
+                        if (ia >= 0 && ia < natm_out && !seen[ia]) {
+                                seen[ia] = 1;
+                                grp_lst[grp_ptr[ia+1]++] = igrp;
+                        }
+                }
+        }
+        free(seen);
+#pragma omp parallel
+{
+        const char TRANS_N = 'N';
+        const char TRANS_T = 'T';
+        const double D0 = 0;
+        const double D1 = 1;
+        const size_t nkmax = (size_t)GEMM_NGRIDS * nseg;
+        GemmGroup g;
+        _gemm_group_init(&g, nbas);
+        double *aobuf = malloc(sizeof(double) * max_nao * GEMM_NGRIDS * ncomp);
+        double *ketbuf = malloc(sizeof(double) * max_nao * nkmax * 4);
+        double *brabuf = ketbuf + (size_t)max_nao * nkmax;
+        double *kc = brabuf + (size_t)max_nao * nkmax;
+        double *bc = kc + (size_t)max_nao * nkmax;
+        double *zk = malloc(sizeof(double) * nkmax * nq * 2);
+        double *zb = zk + nkmax * nq;
+        double *qg = malloc(sizeof(double) * max_nao * nq * 2);
+        double *vbuf = qg + (size_t)max_nao * nq;
+        double *work = malloc(sizeof(double) * EVAL_WORK(ncomp));
+        int *pts = malloc(sizeof(int) * GEMM_NGRIDS);
+        int A, l, igroup, blk0, blk1, ig0, ng, ns, nk, nka, m, o, s, q, c, any;
+        size_t comp_size, i, nrow;
+        double *outa, *pin, *pout;
+#pragma omp for schedule(dynamic, 1)
+        for (A = 0; A < natm_out; A++) {
+                outa = out + (size_t)A * nout * Nao * nq;
+                for (l = grp_ptr[A]; l < grp_ptr[A+1]; l++) {
+                        igroup = grp_lst[l];
+                        blk0 = igroup * GEMM_NBLK;
+                        blk1 = MIN(blk0 + GEMM_NBLK, nblk);
+                        ig0 = blk0 * BLKSIZE;
+                        ng = MIN(blk1 * BLKSIZE, ngrids) - ig0;
+                        // the points of the atom in the group
+                        m = 0;
+                        any = 0;
+                        for (q = 0; q < ng; q++) {
+                                if (owner[ig0+q] == A) {
+                                        pts[m++] = q;
+                                        for (c = 0; c < nwv; c++) {
+                                                any |= wv[c * Ngrids + ig0 + q] != 0;
+                                        }
+                                }
+                        }
+                        if (m == 0 || (skip_zero && !any)) {
+                                continue;
+                        }
+                        _gemm_group_shells(&g, screen_index, blk0, blk1, nbas, ao_loc);
+                        ns = g.nao;
+                        if (ns == 0) {
+                                continue;
+                        }
+                        comp_size = (size_t)ns * ng;
+                        nk = nseg * ng;
+                        nka = nseg * m;
+                        _eval_group(aobuf, deriv, &g, ng, coords, ldc, blk0, rcache, roffs,
+                                    nbas, atm, bas, env, work);
+                        // qg[n,l] = Q[i_n,l]: as a column-major matrix, Q^T (nq x ns)
+                        _gather_rows(qg, Q, nq, &g);
+                        for (s = 0; s < nseg; s++) {
+                                _combine(ketbuf + s * ng, nk, aobuf, comp_size,
+                                         ket_terms + s * TERM_SLOTS, wv, Ngrids, ig0,
+                                         &g, ao_loc, ng);
+                        }
+                        _take_points(kc, nka, ketbuf, nk, ns, nseg, ng, pts, m);
+                        // zk[j,l] = sum_n kc[n,j] qg[n,l]
+                        dgemm_(&TRANS_N, &TRANS_T, &nka, &nq, &ns, &D1, kc, &nka,
+                               qg, &nq, &D0, zk, &nka);
+                        for (o = 0; o < nout; o++) {
+                                for (s = 0; s < nseg; s++) {
+                                        _combine(brabuf + s * ng, nk, aobuf, comp_size,
+                                                 bra_terms + (o * nseg + s) * TERM_SLOTS,
+                                                 wv, Ngrids, ig0, &g, ao_loc, ng);
+                                }
+                                _take_points(bc, nka, brabuf, nk, ns, nseg, ng, pts, m);
+                                // vbuf[n,l] = sum_j bc[n,j] zk[j,l]   (v Q)
+                                dgemm_(&TRANS_T, &TRANS_N, &nq, &ns, &nka, &D1, zk, &nka,
+                                       bc, &nka, &D0, vbuf, &nq);
+                                // zb[j,l] = sum_n bc[n,j] qg[n,l], then
+                                // vbuf[n,l] += sum_j kc[n,j] zb[j,l]   (v^T Q)
+                                dgemm_(&TRANS_N, &TRANS_T, &nka, &nq, &ns, &D1, bc, &nka,
+                                       qg, &nq, &D0, zb, &nka);
+                                dgemm_(&TRANS_T, &TRANS_N, &nq, &ns, &nka, &D1, zb, &nka,
+                                       kc, &nka, &D1, vbuf, &nq);
+                                pin = vbuf;
+                                for (s = 0; s < g.nseg; s++) {
+                                        pout = outa + ((size_t)o * Nao + g.seg_ao[s]) * nq;
+                                        nrow = g.seg_len[s] * (size_t)nq;
+                                        for (i = 0; i < nrow; i++) {
+                                                pout[i] += pin[i];
+                                        }
+                                        pin += nrow;
+                                }
+                        }
+                }
+        }
+        _gemm_group_free(&g);
+        free(aobuf);
+        free(ketbuf);
+        free(zk);
+        free(qg);
+        free(work);
+        free(pts);
+}
+        free(grp_ptr);
+        free(grp_lst);
 }
 
 /*
@@ -1413,6 +1662,11 @@ void VXCfused_dot_ao_mo(double *out, double *wv, int nset, int xctype,
                 }
                 _ao_mo_shared(bra, ket, aobuf, fq, xctype, nseg, ns, ng, nq);
                 for (k = 0; k < nset; k++) {
+                        // nothing to add for a potential that is zero on the group
+                        if (_wv_all_zero(wv + (size_t)k * nwv * Ngrids + ig0, Ngrids,
+                                         nwv, ng)) {
+                                continue;
+                        }
                         _ao_mo_dot(vpriv + k * nvq, wv + (size_t)k * nwv * Ngrids + ig0,
                                    Ngrids, aobuf, fq, ket, bra, vbuf, &g,
                                    xctype, nseg, ns, ng, nq);

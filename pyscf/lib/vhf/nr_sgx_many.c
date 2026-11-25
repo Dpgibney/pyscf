@@ -167,24 +167,32 @@ void SGXdot_points(double *a, double *b, double *c, int na, int k, int n, int ng
 }
 
 /*
- * F, G: (ngrids,nao,nset) for the grid points env[PTR_GRIDS:] of the block
- * (env[NGRIDS] of them, with sgxopt->wt, mbar_bi, vtol and full_f_bi set for
- * the block by SGXData.set_block); nset a multiple of 8. The rows of G of the
- * shells that have screened pairs are set, the other rows are not written.
- * blksize is SGX_BLKSIZE, the points of a batch of sgxopt's per-batch data.
- * s2 integrals over all shells, one component. The screening of sgxopt must
- * be SGXscreen_grid_pair (or SGXnoscreen_grid) with its shell function;
- * returns 1, doing nothing, for other screenings or nset, 0 otherwise.
+ * Fs[s], Gs[s]: (ngrids,nao,nsets[s]) for the grid points env[PTR_GRIDS:] of
+ * the block (env[NGRIDS] of them, with sgxopt->wt, mbar_bi, vtol and full_f_bi
+ * set for the block by SGXData.set_block), for ngroup groups of densities
+ * (those of the two spins of an unrestricted response: the integrals are
+ * evaluated once for all of them); each nsets[s] a multiple of 8. The rows of
+ * G of the shells that have screened pairs are set, the other rows are not
+ * written. blksize is SGX_BLKSIZE, the points of a batch of sgxopt's per-batch
+ * data. s2 integrals over all shells, one component. The screening of sgxopt
+ * must be SGXscreen_grid_pair (or SGXnoscreen_grid) with its shell function,
+ * the shell norms f_I taken over the densities of all groups; returns 1, doing
+ * nothing, for other screenings or nsets, 0 otherwise.
  */
-int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
-                        int blksize, int *ao_loc, CINTOpt *cintopt,
-                        CSGXOpt *sgxopt, int *atm, int natm, int *bas, int nbas,
-                        double *env)
+int SGXnr_direct_k_many_groups(int (*intor)(), double **Fs, double **Gs, int *nsets,
+                               int ngroup, int blksize, int *ao_loc, CINTOpt *cintopt,
+                               CSGXOpt *sgxopt, int *atm, int natm, int *bas, int nbas,
+                               double *env)
 {
         const int pair_screen = sgxopt->fscreen_grid == SGXscreen_grid_pair;
-        if ((!pair_screen && sgxopt->fscreen_grid != SGXnoscreen_grid) ||
-            nset % XC != 0) {
+        if (!pair_screen && sgxopt->fscreen_grid != SGXnoscreen_grid) {
                 return 1;
+        }
+        int igroup;
+        for (igroup = 0; igroup < ngroup; igroup++) {
+                if (nsets[igroup] % XC != 0) {
+                        return 1;
+                }
         }
         const size_t nao = ao_loc[nbas];
         int shls_slice[4] = {0, nbas, 0, nbas};
@@ -257,7 +265,7 @@ int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
         double *cache = malloc(sizeof(double) * (cache_size + 1));
         double *V = NULL;
         size_t V_size = 0;
-        int ibatch, p, k, ij, ish, r, xc0;
+        int ibatch, p, k, ij, ish, r, xc0, s;
         int shls[4];
         for (ibatch = 0; ibatch < nbatch; ibatch++) {
                 // f_I of the batch, all densities
@@ -271,8 +279,19 @@ int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
                         double *mbar_ii = sgxopt->mbar_bi + ibatch * nbas;
 #pragma omp for schedule(dynamic, 4)
                         for (ish = 0; ish < nbas; ish++) {
-                                shl_info[ish] = _shell_fnorm(F, ao_loc, nao, nset, wt,
-                                                             ig0, dg, ish) * mbar_ii[ish];
+                                double f = _shell_fnorm(Fs[0], ao_loc, nao, nsets[0], wt,
+                                                        ig0, dg, ish);
+                                if (ngroup > 1) {
+                                        // the norm over the densities of all groups
+                                        double f2 = f * f;
+                                        for (s = 1; s < ngroup; s++) {
+                                                f = _shell_fnorm(Fs[s], ao_loc, nao, nsets[s],
+                                                                 wt, ig0, dg, ish);
+                                                f2 += f * f;
+                                        }
+                                        f = sqrt(f2);
+                                }
+                                shl_info[ish] = f * mbar_ii[ish];
                         }
                 }
 #pragma omp single
@@ -393,8 +412,6 @@ int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
 #pragma omp for schedule(dynamic, 1)
                 for (k = 0; k < dg; k++) {
                         double *Ek = E + k * nnz;
-                        double *Fk = F + (ig0 + k) * nao * nset;
-                        double *Gk = G + (ig0 + k) * nao * nset;
                         int n, ii, jj;
                         for (r = 0; r < nrow; r++) {
                                 const int ish = rows[r];
@@ -415,13 +432,18 @@ int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
                                 }
                         }
                         // 8 densities of F (nao lines) stay in L1 over the rows
-                        for (xc0 = 0; xc0 < nset; xc0 += XC) {
-                                for (r = 0; r < nrow; r++) {
-                                        const int ish = rows[r];
-                                        const int di = ao_loc[ish+1] - ao_loc[ish];
-                                        row_fn[di](Gk, Fk, V + row_voff[ish],
-                                                   cols + row_coff[ish], row_ncol[ish],
-                                                   nset, xc0, ao_loc[ish], di);
+                        for (s = 0; s < ngroup; s++) {
+                                const int nset = nsets[s];
+                                double *Fk = Fs[s] + (ig0 + k) * nao * nset;
+                                double *Gk = Gs[s] + (ig0 + k) * nao * nset;
+                                for (xc0 = 0; xc0 < nset; xc0 += XC) {
+                                        for (r = 0; r < nrow; r++) {
+                                                const int ish = rows[r];
+                                                const int di = ao_loc[ish+1] - ao_loc[ish];
+                                                row_fn[di](Gk, Fk, V + row_voff[ish],
+                                                           cols + row_coff[ish], row_ncol[ish],
+                                                           nset, xc0, ao_loc[ish], di);
+                                        }
                                 }
                         }
                 }
@@ -444,4 +466,14 @@ int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
         free(screen_buf);
         free(sj_shells);
         return 0;
+}
+
+/* SGXnr_direct_k_many_groups for one group: F, G (ngrids,nao,nset) */
+int SGXnr_direct_k_many(int (*intor)(), double *F, double *G, int nset,
+                        int blksize, int *ao_loc, CINTOpt *cintopt,
+                        CSGXOpt *sgxopt, int *atm, int natm, int *bas, int nbas,
+                        double *env)
+{
+        return SGXnr_direct_k_many_groups(intor, &F, &G, &nset, 1, blksize, ao_loc,
+                                          cintopt, sgxopt, atm, natm, bas, nbas, env);
 }

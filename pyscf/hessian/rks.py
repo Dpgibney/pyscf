@@ -1422,6 +1422,11 @@ def _get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory):
     d2e_k = lib.dot(drho_dA, (f_rho_A * vv.weights).T)
     d2e_k += lib.dot(dgamma_dA, (f_gamma_A * vv.weights).T)
     d2e += d2e_k.reshape(natm,3,natm,3).transpose(0,2,1,3)
+    if grid_response and 4 * f_rho_A.nbytes / 1e6 < .5 * max(0, mf.max_memory - lib.current_memory()[0]):
+        # With the motion of the points in them, these are the density responses of the VV10 Fock matrix
+        # derivative too (_get_vnlc_deriv1, after this in hess_elec): their kernel terms, a pass over the
+        # pairs of points for 3*natm densities, are kept for it if they fit in memory
+        vv._f_t_dA = (f_rho_A, f_gamma_A)
     f_rho_A = f_gamma_A = d2e_k = None
     if grid_response:
         d2e += _vv10_grid_response_terms(mf, mol, grids, vv, dm0, drho_dA, dgamma_dA, wv[0], max_memory)
@@ -1530,13 +1535,19 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
             own = grids.atm_idx[ip0:ip1]
             dw = _becke_weight_derivs(mol, grids, ip0, ip1, None, True, table)[0]
             _grid_response_wv_(wv, vxc, own, dw, fac)
-            _grid_motion_vmat_(vmat, mol, ao, wv0, xctype, own, _nonzero_aos(mol, mask, nao))
-    fused = mocc = None
+            if wv0_all is not None:
+                # the motion of the points after the loop, from the potential of all points
+                wv0_all[:,ip0:ip1] = wv0
+            else:
+                _grid_motion_vmat_(vmat, mol, ao, wv0, xctype, own, _nonzero_aos(mol, mask, nao))
+    fused = mocc = wv0_all = None
     if occ_out is not None:
         fused = numint._fused_xc(ni, mol, grids, nao, xctype, max_memory, (),
                                  match_block_loop=False)
         mocc = numpy.asarray(mo_coeff[:,mo_occ>0], order='C')
         occ_sets = occ_out.reshape(mol.natm*3, nao, mocc.shape[1])
+        if grid_response and fused is not None:
+            wv0_all = numpy.zeros(({'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype], grids.weights.size))
 
     def add_potentials(wv, p0, p1):
         '''The potential matrices of wv[natm,3,ncomp,p1-p0] (wv[:,:,0] halved, a meta-GGA's
@@ -1653,6 +1664,12 @@ def _get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, occ_out=None):
                                         mask, ao_loc)
             ao_dm0 = wv = None
 
+    if wv0_all is not None:
+        # The points of atom G move with it: vmat[G] -= v_G, the gradient-type matrix of the ground-state
+        # potential on the points of G, i.e. v_G + v_G^T in the Fock derivative, times the occupied orbitals
+        fused.dot_terms_owner_mo(wv0_all, numint._xc_grad_terms(xctype), grids.atm_idx, mol.natm,
+                                 mocc, occ_out)
+
     for ia in range(mol.natm):
         p0, p1 = aoslices[ia][2:]
         vmat[ia,:,p0:p1] += v_ip[:,p0:p1]
@@ -1761,22 +1778,28 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=No
     fused = numint._fused_xc(ni, mol, grids, nao, 'GGA', max_memory, (), blksize=blksize,
                              radial_cache=False)
     ngrids = vv.ngrids
-    drho_dA = numpy.empty((natm*3,ngrids))
-    dgamma_dA = numpy.empty((natm*3,ngrids))
-    p1 = q1 = 0
-    for ao, mask_ao, weight, coords \
-            in ni.block_loop(mol, grids, nao, 2, blksize=blksize):
-        p0, p1 = p1, p1 + weight.size
-        sel = mask[p0:p1]
-        q0, q1 = q1, q1 + numpy.count_nonzero(sel)
-        drho, d2rho = _vv10_drho_dA(mol, ao, dm0, mask_ao, aoslices)
-        _vv10_add_grid_response_(drho, d2rho, atm_idx[p0:p1])
-        drho_dA[:,q0:q1] = drho.reshape(natm*3,-1)[:,sel]
-        dgamma = 2 * numpy.einsum('axig,ig->axg', d2rho, nabla_rho[:,p0:p1])
-        dgamma_dA[:,q0:q1] = dgamma.reshape(natm*3,-1)[:,sel]
-        drho = d2rho = dgamma = None
-    f_rho_A, f_gamma_A = vv.f_t(drho_dA, dgamma_dA)
-    drho_dA = dgamma_dA = None
+    kept = vv.__dict__.pop('_f_t_dA', None)
+    if kept is not None and kept[0].shape == (natm*3,ngrids):
+        # those of the energy's second derivative with the grid response (_get_enlc_deriv2)
+        f_rho_A, f_gamma_A = kept
+    else:
+        drho_dA = numpy.empty((natm*3,ngrids))
+        dgamma_dA = numpy.empty((natm*3,ngrids))
+        p1 = q1 = 0
+        for ao, mask_ao, weight, coords \
+                in ni.block_loop(mol, grids, nao, 2, blksize=blksize):
+            p0, p1 = p1, p1 + weight.size
+            sel = mask[p0:p1]
+            q0, q1 = q1, q1 + numpy.count_nonzero(sel)
+            drho, d2rho = _vv10_drho_dA(mol, ao, dm0, mask_ao, aoslices)
+            _vv10_add_grid_response_(drho, d2rho, atm_idx[p0:p1])
+            drho_dA[:,q0:q1] = drho.reshape(natm*3,-1)[:,sel]
+            dgamma = 2 * numpy.einsum('axig,ig->axg', d2rho, nabla_rho[:,p0:p1])
+            dgamma_dA[:,q0:q1] = dgamma.reshape(natm*3,-1)[:,sel]
+            drho = d2rho = dgamma = None
+        f_rho_A, f_gamma_A = vv.f_t(drho_dA, dgamma_dA)
+        drho_dA = dgamma_dA = None
+    kept = None
     f_rho_A = f_rho_A.reshape(natm,3,-1)
     f_gamma_A = f_gamma_A.reshape(natm,3,-1)
 
@@ -1855,10 +1878,15 @@ def _get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory, out=None, occ_out=No
         p0, p1 = aoslices[ia][2:]
         h1[ia,:,p0:p1] -= g[0,:,p0:p1]
     g = None
-    nbatch = max(1, int(max_memory*.1e6 / (8*ngrids_full*4)))
-    for ia0, ia1 in lib.prange(0, natm, nbatch):
-        on_atom = numpy.arange(ia0, ia1)[:,numpy.newaxis,numpy.newaxis] == atm_idx
-        _vv10_dot_terms(ni, mol, grids, on_atom * wv, 'grad', h1[ia0:ia1], max_memory, fused)
+    if fused is not None and occ_out is not None:
+        # of all AOs on the points of atom A: v_A + v_A^T times the occupied orbitals, for all atoms in one
+        # pass over the grid
+        fused.dot_terms_owner_mo(wv[0], numint._xc_grad_terms('GGA'), atm_idx, natm, mocc_c, occ_out)
+    else:
+        nbatch = max(1, int(max_memory*.1e6 / (8*ngrids_full*4)))
+        for ia0, ia1 in lib.prange(0, natm, nbatch):
+            on_atom = numpy.arange(ia0, ia1)[:,numpy.newaxis,numpy.newaxis] == atm_idx
+            _vv10_dot_terms(ni, mol, grids, on_atom * wv, 'grad', h1[ia0:ia1], max_memory, fused)
     lib.hermi_sum(h1_sets, axes=(0,2,1), inplace=True)
     if out is not None and h1 is not out:
         out += h1
@@ -1964,12 +1992,15 @@ def _even_batch(n, batch):
     '''The size of the fewest batches of at most batch items that cover n items, evened out'''
     return -(-n // -(-n // batch))
 
-def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out):
+def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out, ao_out=False):
     """
         out[k] += P^T v[k] Q (P = mo_coeff, Q the occupied orbitals) for the VV10 responses v[k] that
         get_vnlc_resp gives for the symmetric dms a[k] Q^T + Q a[k]^T, a[nset,nao,nocc], from these
         factors. Returns out; None, out untouched, if the fused kernels do not apply to the grids of
-        the VV10 response (mf.second_nlcgrids if set, otherwise mf.nlcgrids).
+        the VV10 response (mf.second_nlcgrids if set, otherwise mf.nlcgrids). With ao_out,
+        out[k] += v[k] Q, out[nset,nao,nocc]: for the orbitals of both spins as the columns of Q
+        (mo_coeff = Q, mo_occ = 1: the densities are the total ones, Q Q^T and a[k] Q^T + Q a[k]^T),
+        whose spin blocks are then transformed apart.
 
         Neither the dms nor the v[k] exist in the AO basis. The pair kernel goes through all pairs of
         points once per call, so a group of dms is as large as its data on the points of the mask allow
@@ -2030,7 +2061,10 @@ def get_vnlc_resp_mo(mf, mol, mo_coeff, mo_occ, a, max_memory, out):
                                  + nabla_rho_t[k0:k1,:,p0:p1] * vv.f_gamma[p0:p1]) * (2 * w))
                 wv[:,0] *= .5  # as _dot_wv: the matrix is v + v^T
                 fused.dot_ao_mo(ip0, ip1, wv, 'GGA', mocc, vq)
-            out[g0+k0:g0+k1] += lib.einsum('pa,kpi->kai', mo_coeff, vq)
+            if ao_out:
+                out[g0+k0:g0+k1] += vq
+            else:
+                out[g0+k0:g0+k1] += lib.einsum('pa,kpi->kai', mo_coeff, vq)
             vq = None
         f_rho_t = f_gamma_t = nabla_rho_t = None
     return out
@@ -2304,7 +2338,9 @@ def _grid_response_wv_(wv, vxc, own, dw, fac):
 def _grid_motion_vmat_(vmat, mol, ao, wv, xctype, own, idx):
     '''vmat[G] -= the AO-derivative matrix of the gradient (v_ip of _get_vxc_deriv1) of the potential wv on the
     points of atom G alone, for each atom G of the points of ao (own), on the AOs idx: the derivative of the AO
-    products with the ground-state potential as the points move'''
+    products with the ground-state potential as the points move. (Where the Fock derivatives are made as
+    products with the occupied orbitals, numint._FusedXC.dot_terms_owner_mo gives these terms for all atoms in
+    one pass over the grid instead.)'''
     for G in numpy.unique(own[own >= 0]):
         sel = own == G
         ao_g = numpy.asarray(ao[:,sel][:,:,idx], order='C')

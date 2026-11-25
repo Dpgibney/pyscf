@@ -1153,35 +1153,51 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
     '''get_k_only for many density matrices (nset, nao, nao): for each block of
     points, F[g,j,x] = sum_i X_i(g) (P dm_x)_ij and K'[i,j,x] += sum_g X_i(g)
     w_g G[g,j,x] by matrix products over all densities, and G[g,i,x] = sum_j
-    A_ij(g) F[g,j,x] by SGXnr_direct_k_many, which evaluates the integrals of a
-    batch's shell pairs (screened as get_k_only's) once for all densities. The
-    densities' grid-point screening (dm_mask, get_g_threshold) is not applied.
-    None if the screening of sgx's data is not one SGXnr_direct_k_many takes.
+    A_ij(g) F[g,j,x] by SGXnr_direct_k_many_groups, which evaluates the
+    integrals of a batch's shell pairs (screened as get_k_only's) once for all
+    densities. The densities' grid-point screening (dm_mask, get_g_threshold)
+    is not applied. None if the screening of sgx's data is not one
+    SGXnr_direct_k_many_groups takes.
 
     With factors = (a, mocc, mo_coeff) and dms=None: the same K (of hermi=1)
     of the symmetric density matrices a[x] mocc^T + mocc a[x]^T,
     a[nset,nao,nocc], returned in the MO basis, mo_coeff^T K mocc
     [nset,nmo,nocc]. F comes from the factors and K' only as far as its MO
     block needs, so that no AO matrix of the densities or of K is in memory,
-    and their matrix products take about 3 nocc/nao of the flops.'''
+    and their matrix products take about 3 nocc/nao of the flops.
+
+    factors may be a list of such tuples, groups of densities with orbitals
+    of their own (the spin densities of an unrestricted response): the K of
+    each group is returned, in a list, from one evaluation of the integrals
+    for all of them.'''
     mol = sgx.mol
     grids = sgx.grids
     sgxdat = sgx._pjs_data
     if not (sgxdat._pair_tol is not None or
             not (sgxdat._screen_energy or sgxdat._screen_potential)):
         return None
-    source = dms if factors is None else factors[0]
-    if source.dtype != numpy.double:
-        return None
-    nset, nao = source.shape[:2]
-    # SGXnr_direct_k_many takes the densities 8 at a time
-    nset_pad = (nset + 7) // 8 * 8
+    groups = None
+    if factors is not None:
+        groups = factors if isinstance(factors, list) else [factors]
+        if any(numpy.asarray(g[0]).dtype != numpy.double for g in groups):
+            return None
+        nao = groups[0][0].shape[1]
+        nsets = [len(g[0]) for g in groups]
+    else:
+        if dms.dtype != numpy.double:
+            return None
+        nao = dms.shape[1]
+        nsets = [len(dms)]
+    # SGXnr_direct_k_many_groups takes the densities of a group 8 at a time
+    nsets_pad = [(n + 7) // 8 * 8 for n in nsets]
+    ngroup = len(nsets)
     ngrids = grids.weights.size
-    loop_data = sgxdat.get_loop_data(nset=nset_pad, with_pair_mask=False)
+    loop_data = sgxdat.get_loop_data(nset=sum(nsets_pad), with_pair_mask=False)
     nbins, screen_index, pair_mask, ao_loc, blksize = loop_data
     ao_loc = numpy.asarray(ao_loc, dtype=numpy.int32)
     proj = sgxdat._overlap_correction_matrix
-    if factors is None:
+    if groups is None:
+        nset, nset_pad = nsets[0], nsets_pad[0]
         # (P dm_x)_ij as dmT[i,j,x], and K' in the same layout
         dmT = numpy.zeros((nao, nao, nset_pad))
         dmT[:,:,:nset] = lib.einsum('ki,xij->kjx', proj, dms)
@@ -1189,32 +1205,14 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
         vkT = numpy.zeros((nao, nao * nset_pad))
 
         def make_f(ao, ao_on):
-            return lib.dot(ao, dmT if ao_on is None else dmT[ao_on])
+            return [lib.dot(ao, dmT if ao_on is None else dmT[ao_on])]
 
-        def add_k(ao, ao_on, gv):
+        def add_k(ao, ao_on, gvs):
             if ao_on is None:
-                lib.dot(ao.T, gv, c=vkT, beta=1)
+                lib.dot(ao.T, gvs[0], c=vkT, beta=1)
             else:
-                vkT[ao_on] += lib.dot(ao.T, gv)
+                vkT[ao_on] += lib.dot(ao.T, gvs[0])
     else:
-        a, mocc, mo_coeff = factors
-        nocc, nmo = mocc.shape[1], mo_coeff.shape[1]
-        # The factors of P dm_x = (P a_x) mocc^T + (P mocc) a_x^T
-        pa = numpy.zeros((nao, nocc, nset_pad))
-        pa[:,:,:nset] = lib.einsum('ki,xij->kjx', proj, a)
-        pa = pa.reshape(nao, nocc * nset_pad)
-        at = numpy.zeros((nocc, nao, nset_pad))
-        at[:,:,:nset] = a.transpose(2,1,0)
-        at = at.reshape(nocc, nao * nset_pad)
-        po = proj.dot(mocc)
-        # the bases of K's first index
-        o1, c1 = (po, proj.dot(mo_coeff)) if sgxdat.sym_ovlp else (mocc, mo_coeff)
-        # K'[i,j,x] with j in mocc, and with i in o1
-        k_io = numpy.zeros((nao, nocc * nset_pad))
-        k_oj = numpy.zeros((nocc, nao * nset_pad))
-        mocc_c = numpy.asarray(mocc, order='C')
-        mocc_t = numpy.asarray(mocc.T, order='C')
-
         def dot_points(a, b, c):
             '''c[g] = a b[g], one thread for each product'''
             _vhf.libcvhf.SGXdot_points(a.ctypes.data_as(ctypes.c_void_p),
@@ -1223,22 +1221,64 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
                                        ctypes.c_int(a.shape[0]), ctypes.c_int(a.shape[1]),
                                        ctypes.c_int(b.shape[2]), ctypes.c_int(b.shape[0]))
 
-        def make_f(ao, ao_on):
-            ng = ao.shape[0]
-            on = slice(None) if ao_on is None else ao_on
-            xpa = lib.dot(ao, pa[on]).reshape(ng, nocc, nset_pad)
-            xpo = lib.dot(ao, po[on])
-            f = numpy.empty((ng, nao, nset_pad))
-            dot_points(mocc_c, xpa, f)
-            return lib.dot(xpo, at, c=f.reshape(ng, nao * nset_pad), beta=1)
+        class _Group:
+            '''The factors of the densities of a group and the two MO blocks of its K'''
+            def __init__(self, a, mocc, mo_coeff, nset, nset_pad):
+                self.nset, self.nset_pad = nset, nset_pad
+                self.mo_coeff = mo_coeff
+                self.nocc, self.nmo = nocc, nmo = mocc.shape[1], mo_coeff.shape[1]
+                # The factors of P dm_x = (P a_x) mocc^T + (P mocc) a_x^T
+                pa = numpy.zeros((nao, nocc, nset_pad))
+                pa[:,:,:nset] = lib.einsum('ki,xij->kjx', proj, a)
+                self.pa = pa.reshape(nao, nocc * nset_pad)
+                at = numpy.zeros((nocc, nao, nset_pad))
+                at[:,:,:nset] = a.transpose(2,1,0)
+                self.at = at.reshape(nocc, nao * nset_pad)
+                self.po = proj.dot(mocc)
+                # the bases of K's first index
+                self.o1, self.c1 = ((self.po, proj.dot(mo_coeff)) if sgxdat.sym_ovlp
+                                    else (mocc, mo_coeff))
+                # K'[i,j,x] with j in mocc, and with i in o1
+                self.k_io = numpy.zeros((nao, nocc * nset_pad))
+                self.k_oj = numpy.zeros((nocc, nao * nset_pad))
+                self.mocc_c = numpy.asarray(mocc, order='C')
+                self.mocc_t = numpy.asarray(mocc.T, order='C')
 
-        def add_k(ao, ao_on, gv):
-            ng = ao.shape[0]
+            def make_f(self, ao, on):
+                ng = ao.shape[0]
+                xpa = lib.dot(ao, self.pa[on]).reshape(ng, self.nocc, self.nset_pad)
+                xpo = lib.dot(ao, self.po[on])
+                f = numpy.empty((ng, nao, self.nset_pad))
+                dot_points(self.mocc_c, xpa, f)
+                return lib.dot(xpo, self.at, c=f.reshape(ng, nao * self.nset_pad), beta=1)
+
+            def add_k(self, ao, on, gv):
+                ng = ao.shape[0]
+                go = numpy.empty((ng, self.nocc, self.nset_pad))
+                dot_points(self.mocc_t, gv.reshape(ng, nao, self.nset_pad), go)
+                self.k_io[on] += lib.dot(ao.T, go.reshape(ng, self.nocc * self.nset_pad))
+                lib.dot(lib.dot(ao, self.o1[on]).T, gv, c=self.k_oj, beta=1)
+
+            def k_mo(self):
+                # .5 (c1^T K' mocc + (o1^T K' mo_coeff)^T)
+                nocc, nmo, nset, nset_pad = self.nocc, self.nmo, self.nset, self.nset_pad
+                kmo = lib.dot(self.c1.T, self.k_io).reshape(nmo, nocc, nset_pad)[:,:,:nset]
+                kom = numpy.empty((nocc, nmo, nset_pad))
+                dot_points(numpy.asarray(self.mo_coeff.T, order='C'),
+                           self.k_oj.reshape(nocc, nao, nset_pad), kom)
+                return .5 * (kmo.transpose(2,0,1) + kom[:,:,:nset].transpose(2,1,0))
+
+        gdata = [_Group(numpy.asarray(a), mocc, mo_coeff, n, npad)
+                 for (a, mocc, mo_coeff), n, npad in zip(groups, nsets, nsets_pad)]
+
+        def make_f(ao, ao_on):
             on = slice(None) if ao_on is None else ao_on
-            go = numpy.empty((ng, nocc, nset_pad))
-            dot_points(mocc_t, gv.reshape(ng, nao, nset_pad), go)
-            k_io[on] += lib.dot(ao.T, go.reshape(ng, nocc * nset_pad))
-            lib.dot(lib.dot(ao, o1[on]).T, gv, c=k_oj, beta=1)
+            return [g.make_f(ao, on) for g in gdata]
+
+        def add_k(ao, ao_on, gvs):
+            on = slice(None) if ao_on is None else ao_on
+            for g, gv in zip(gdata, gvs):
+                g.add_k(ao, on, gv)
 
     full_dm_ij = None
     if sgxdat.use_dm_screening and sgx._full_dm is not None:
@@ -1254,7 +1294,8 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
     cintor = _vhf._fpointer(sgxdat._intor)
     cintopt = sgxdat._cintopt
     atm, bas = mol._atm, mol._bas
-    drv = _vhf.libcvhf.SGXnr_direct_k_many
+    drv = _vhf.libcvhf.SGXnr_direct_k_many_groups
+    c_nsets = (ctypes.c_int * ngroup)(*nsets_pad)
     t_ao = t_f = t_drv = t_k = 0
     for i0, i1 in lib.prange(0, ngrids, blksize):
         assert i0 % SGX_BLKSIZE == 0
@@ -1272,21 +1313,22 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
         else:
             ao_on = None
         t2 = time.perf_counter()
-        fg = make_f(ao, ao_on)
+        fgs = make_f(ao, ao_on)
         t3 = time.perf_counter()
         full_fsgx_bi = None
         if full_dm_ij is not None:
             full_fni_bi = sgxdat.reduce_ao_to_shl_mat(ao_full, ao_loc, weights)
             full_fni_bi = lib.dot(full_fni_bi, full_dm_ij)
             full_fsgx_bi = sgxdat.reduce_mask_ni2sgx(full_fni_bi)
-        gv = numpy.zeros_like(fg)
+        gvs = [numpy.zeros_like(fg) for fg in fgs]
+        c_fgs = (ctypes.c_void_p * ngroup)(*[fg.ctypes.data for fg in fgs])
+        c_gvs = (ctypes.c_void_p * ngroup)(*[gv.ctypes.data for gv in gvs])
         env = numpy.append(mol._env, coords.ravel())
         env[gto.NGRIDS] = i1 - i0
         env[gto.PTR_GRIDS] = mol._env.size
         sgxdat.set_block(i0 // SGX_BLKSIZE, weights, full_fsgx_bi)
         try:
-            err = drv(cintor, fg.ctypes.data_as(ctypes.c_void_p),
-                      gv.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(nset_pad),
+            err = drv(cintor, c_fgs, c_gvs, c_nsets, ctypes.c_int(ngroup),
                       ctypes.c_int(SGX_BLKSIZE), ao_loc.ctypes.data_as(ctypes.c_void_p),
                       cintopt, ctypes.byref(sgxdat._this),
                       atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(mol.natm),
@@ -1295,24 +1337,24 @@ def _get_k_only_many(sgx, dms, hermi, direct_scf_tol, factors=None):
         finally:
             sgxdat.unset_block()
         assert err == 0
-        fg = ao_full = None
+        fgs = ao_full = None
         t4 = time.perf_counter()
-        gv *= weights[:,None]
-        add_k(ao, ao_on, gv)
-        gv = ao = None
+        for gv in gvs:
+            gv *= weights[:,None]
+        add_k(ao, ao_on, gvs)
+        gvs = ao = None
         t5 = time.perf_counter()
         t_ao += t2 - t1
         t_f += t3 - t2
         t_drv += t4 - t3
         t_k += t5 - t4
-    logger.debug1(sgx, 'sgX K of %d dms (wall): AO values %.2f s, F = X D %.2f s, '
-                  'G = A F %.2f s, K = X^T w G %.2f s', nset, t_ao, t_f, t_drv, t_k)
-    if factors is not None:
-        # .5 (c1^T K' mocc + (o1^T K' mo_coeff)^T)
-        kmo = lib.dot(c1.T, k_io).reshape(nmo, nocc, nset_pad)[:,:,:nset]
-        kom = numpy.empty((nocc, nmo, nset_pad))
-        dot_points(numpy.asarray(mo_coeff.T, order='C'), k_oj.reshape(nocc, nao, nset_pad), kom)
-        return .5 * (kmo.transpose(2,0,1) + kom[:,:,:nset].transpose(2,1,0))
+    logger.debug1(sgx, 'sgX K of %s dms (wall): AO values %.2f s, F = X D %.2f s, '
+                  'G = A F %.2f s, K = X^T w G %.2f s', ' + '.join(str(n) for n in nsets),
+                  t_ao, t_f, t_drv, t_k)
+    if groups is not None:
+        out = [g.k_mo() for g in gdata]
+        return out if isinstance(factors, list) else out[0]
+    nset, nset_pad = nsets[0], nsets_pad[0]
     dmT = None
     vk = vkT.reshape(nao, nao, nset_pad)[:,:,:nset].transpose(2,0,1)
     vkT = None
@@ -1341,7 +1383,17 @@ def get_k_mo(sgx, a, mocc, mo_coeff, direct_scf_tol=1e-13):
     symmetric density matrices a[x] mocc^T + mocc a[x]^T, a[nset,nao,nocc], made
     without the AO matrices of the densities or of K. None if get_k_only
     would not take them all at once: fewer than SGX_MANY_DM_MIN densities,
-    or a screening that _get_k_only_many does not take.'''
+    or a screening that _get_k_only_many does not take.
+
+    With lists a, mocc, mo_coeff (the spins of an unrestricted response): the
+    list of the K of each, from one evaluation of the integrals for all.'''
+    if isinstance(a, (list, tuple)):
+        if sgx.debug or sum(len(x) for x in a) < SGX_MANY_DM_MIN:
+            return None
+        _require_pjs(sgx, direct_scf_tol)
+        return _get_k_only_many(sgx, None, 1, direct_scf_tol,
+                                factors=[(numpy.asarray(x), q, c)
+                                         for x, q, c in zip(a, mocc, mo_coeff)])
     if sgx.debug or len(a) < SGX_MANY_DM_MIN:
         return None
     _require_pjs(sgx, direct_scf_tol)

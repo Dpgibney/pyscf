@@ -525,18 +525,162 @@ def _gen_uhf_response(mf, mo_coeff=None, mo_occ=None, *, dm0=None,
                 # the spin whose x tells the number of sets (the other may have
                 # no occupied orbitals)
                 s0 = int(numpy.prod(shapes[1]) > numpy.prod(shapes[0]))
+
+                def xc_from_factors(a, v1mo):
+                    """v1mo[s] += the XC response from the factors, where that path
+                    is the cheaper one; whether it was"""
+                    nset = len(a[0])
+                    if not (all(x.dtype == numpy.double for x in (*a, *mo_coeff, *mocc)) and
+                            fused.lowrank_cheaper(xctype, a[0].shape[2] + a[1].shape[2],
+                                                  mocc[0].shape[1] + mocc[1].shape[1], nset,
+                                                  nspin=2)):
+                        return False
+                    fused.uks_fxc_mo(ni, xctype, fxc, a, mocc, mo_coeff, mocc, v1mo)
+                    return True
+
+                def k_from_factors(a, v1mo):
+                    """v1mo[s] -= the exchange response of spin s in the MO basis,
+                    from SGX's K of many densities (SGX.get_k_mo): the integrals
+                    of the grid once for the densities of both spins, and no AO
+                    matrix of a density or of K. Whether there is such a path."""
+                    with_df = getattr(mf, 'with_df', None)
+                    if not hybrid or hermi != 1 or not hasattr(with_df, 'get_k_mo'):
+                        return False
+                    # the spins that have occupied orbitals
+                    on = [s for s in range(2) if shapes[s][1] > 0]
+                    a_on = [a[s] for s in on]
+                    q_on = [mocc[s] for s in on]
+                    c_on = [mo_coeff[s] for s in on]
+                    tol = mf.direct_scf_tol
+                    # as vind_jk: (range parameter, coefficient)
+                    if omega == 0:
+                        terms = ((None, hyb),)
+                    elif alpha == 0: # LR=0, only SR exchange
+                        terms = ((-omega, hyb),)
+                    elif hyb == 0: # SR=0, only LR exchange
+                        terms = ((omega, alpha),)
+                    else: # SR and LR exchange with different ratios
+                        # both from one evaluation of the mixed-range integrals where
+                        # the SGX object has them
+                        if getattr(with_df, 'mixed_range_ok', lambda: False)():
+                            v = with_df.get_k_mo(a_on, q_on, c_on, tol, omega,
+                                                 mix=(hyb, alpha-hyb))
+                            if v is not None:
+                                for s, vs in zip(on, v):
+                                    v1mo[s] -= vs
+                                return True
+                        terms = ((None, hyb), (omega, alpha-hyb))
+                    vk = [0] * len(on)
+                    for om, coeff in terms:
+                        v = with_df.get_k_mo(a_on, q_on, c_on, tol, om)
+                        if v is None:
+                            return False
+                        for i, vs in enumerate(v):
+                            vs *= coeff
+                            vk[i] = vk[i] + vs
+                    for s, vs in zip(on, vk):
+                        v1mo[s] -= vs
+                    return True
+
+                def nlc_from_factors(a, v1mo):
+                    """v1mo[s] += the VV10 response, the same potential for both
+                    spins, of the total density from the factors of both spins
+                    (hessian.rks.get_vnlc_resp_mo with the occupied orbitals of
+                    both spins as one set); whether there is such a path"""
+                    if not (with_nlc and mf.do_nlc() and
+                            all(x.dtype == numpy.double for x in a)):
+                        return False
+                    from pyscf.hessian.rks import get_vnlc_resp_mo
+                    nset, nao = a[0].shape[:2]
+                    nocc = [shapes[s][1] for s in range(2)]
+                    # dm0 = Q Q^T and dm1 = A Q^T + Q A^T for Q, A of both spins
+                    q_all = numpy.hstack(mocc)
+                    a_all = numpy.concatenate(a, axis=2)
+                    vq = numpy.zeros((nset, nao, sum(nocc)))
+                    if get_vnlc_resp_mo(mf, mol, q_all, numpy.ones(sum(nocc)), a_all,
+                                        max_memory, vq, ao_out=True) is None:
+                        return False
+                    v1mo[0] += lib.einsum('pa,kpi->kai', mo_coeff[0], vq[:,:,:nocc[0]])
+                    v1mo[1] += lib.einsum('pa,kpi->kai', mo_coeff[1], vq[:,:,nocc[0]:])
+                    return True
+
                 def vind_mo(dm1, x):
                     '''(mo_coeff[s]^T vind(dm1)[s] mocc[s]) for s = alpha, beta, for
                     the symmetric spin dms dm1[s] = mo_coeff[s] x[s] mocc[s]^T + h.c.,
-                    x[s][nset,nmo_s,nocc_s]'''
+                    x[s][nset,nmo_s,nocc_s], made from x for dm1=None. As
+                    _gen_rhf_response's vind_mo: the XC and VV10 responses and
+                    SGX's K of many densities come from the factors of the dms,
+                    and the AO matrices of the dms and of their responses exist
+                    for a chunk of the sets at a time, for the Coulomb response
+                    of the total density (one J per set, not one per spin) and
+                    for what has no path from the factors.'''
                     x = [numpy.asarray(xs) for xs in x]
                     nset = x[s0].size // numpy.prod(shapes[s0])
+                    nao = mo_coeff[0].shape[0]
                     a = [lib.einsum('pa,kai->kpi', mo_coeff[s], x[s].reshape(nset, *shapes[s]))
                          for s in range(2)]
-                    v1, v1mo = vind_lowrank(dm1, a, mo_coeff, mocc)
-                    for s in range(2):
-                        for i, v in enumerate(v1[s]):
-                            v1mo[s][i] += reduce(numpy.dot, (mo_coeff[s].T, v, mocc[s]))
+                    v1mo = [numpy.zeros((nset, *shapes[s])) for s in range(2)]
+                    with_xc = not xc_from_factors(a, v1mo)
+                    k_done = k_from_factors(a, v1mo)
+                    nlc_done = not (with_nlc and mf.do_nlc()) or nlc_from_factors(a, v1mo)
+
+                    def spin_dms(p0, p1):
+                        if dm1 is not None:
+                            return numpy.asarray(dm1)[:,p0:p1]
+                        d = numpy.empty((2, p1-p0, nao, nao))
+                        for s in range(2):
+                            ds = numpy.matmul(a[s][p0:p1], mocc[s].T)
+                            d[s] = ds + ds.transpose(0,2,1)
+                        return d
+
+                    def total_dms(p0, p1):
+                        if dm1 is not None:
+                            return numpy.asarray(dm1[0][p0:p1]) + numpy.asarray(dm1[1][p0:p1])
+                        d = numpy.matmul(a[0][p0:p1], mocc[0].T)
+                        d += numpy.matmul(a[1][p0:p1], mocc[1].T)
+                        return d + d.transpose(0,2,1)
+
+                    def add(p0, p1, v1):
+                        # v1 [n,nao,nao] for both spins, or [2,n,nao,nao]
+                        for s in range(2):
+                            vs = v1 if v1.ndim == 3 else v1[s]
+                            v1mo[s][p0:p1] += numpy.matmul(mo_coeff[s].T,
+                                                           numpy.matmul(vs, mocc[s]))
+
+                    left = (mf.max_memory - lib.current_memory()[0]) * .5e6
+                    if k_done or not hybrid:
+                        # J of the total density
+                        if with_j and hermi != 2:
+                            sgx = getattr(mf, 'with_df', None)
+                            if sgx is None or (getattr(sgx, 'direct_j', False)
+                                               and not getattr(sgx, 'dfj', False)):
+                                chunk = _cphf_chunk(mf, nset, nao, True, False, True)
+                            else:
+                                # RI-J: chunks cost no integrals
+                                chunk = min(nset, max(16, int(left / (4 * 8 * nao**2))))
+                            for p0, p1 in lib.prange(0, nset, chunk):
+                                add(p0, p1, mf.get_j(mol, total_dms(p0, p1), hermi=hermi))
+                        rest = with_xc or not nlc_done
+                    else:
+                        rest = True
+                    if rest:
+                        # the spin dms of a chunk: 2 dms and their responses per set
+                        if k_done or not hybrid:
+                            chunk = min(nset, max(8, int(left / (6 * 8 * nao**2))))
+                        else:
+                            chunk = max(1, _cphf_chunk(mf, 2*nset, nao, with_j, True) // 2)
+                        for p0, p1 in lib.prange(0, nset, chunk):
+                            d = spin_dms(p0, p1)
+                            v1 = numpy.zeros_like(d)
+                            if with_xc:
+                                v1 += ni.nr_uks_fxc(mol, grids, mf.xc, dm0, d, 0, hermi,
+                                                    rho0, vxc, fxc, max_memory=max_memory)
+                            if not nlc_done:
+                                v1 = vind_nlc(d, v1)
+                            if hybrid and not k_done:
+                                v1 = vind_jk(d, v1)
+                            add(p0, p1, v1)
+                            d = v1 = None
                     return v1mo
                 vind.vind_mo = vind_mo
 
