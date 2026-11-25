@@ -36,6 +36,10 @@ JK_ENERGY = getattr(__config__, 'grad_rhf_jk_energy', True)
 # jk_energy_per_atom's batched integrals contracted with the densities inside qcint's kernels where it offers that
 # (int2e_ip1_sph_batch_dot); False keeps the contraction in grad_jk_energy.c
 JK_ENERGY_DOT = getattr(__config__, 'grad_rhf_jk_energy_dot', True)
+# jk_energy_per_atom screens the derivative integrals of a shell quartet by their bound times the two density
+# elements each is contracted with (as hessian.rhf.JK_ENERGY_DD_SCREEN); False: the bound with one density
+# element, that of the J and K matrices (CVHFgrad_jk_prescreen)
+JK_ENERGY_DD_SCREEN = getattr(__config__, 'grad_rhf_jk_energy_dd_screen', True)
 
 
 def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
@@ -294,7 +298,8 @@ def jk_energy_per_atom(mol, dm, j_factor=1., k_factor=1., omega=None, screen=Non
                 dmj.ctypes, dmk.ctypes, ctypes.c_int(len(dmk)),
                 ctypes.c_double(j_factor), ctypes.c_double(ck),
                 ctypes.c_int('j' in screen), ctypes.c_int('k' in screen), lib.c_null_ptr(),
-                ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+                ctypes.c_int(((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0)
+                             + (0 if JK_ENERGY_DD_SCREEN else 4)), ao_loc.ctypes,
                 mol._atm.ctypes, ctypes.c_int(mol.natm),
                 mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
     return de

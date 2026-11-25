@@ -63,14 +63,25 @@
 #define EJK_NCHUNK      4096
 #define EJK_CHUNK_BUF   4000000
 
-// CVHFgrad_jk_prescreen (with_j and with_k), CVHFgrad_j_prescreen (with_j)
-// or CVHFgrad_k_prescreen (with_k) for the shells (a,b,c,d)
+// Whether the derivative integrals of the shells (a,b,c,d), a the derived one,
+// are computed. dd: by the two density elements each is contracted with,
+// 2 D_ab D_cd (with_j) and D_ac D_bd, D_ad D_bc (with_k), which for the
+// exchange energy of a large molecule leaves out most of what a bound with one
+// element computes. Otherwise by one, as the J and K matrices are screened:
+// CVHFgrad_jk_prescreen (with_j and with_k), CVHFgrad_j_prescreen (with_j) or
+// CVHFgrad_k_prescreen (with_k).
 static int _screen(const double *q0, const double *q1, const double *dmc,
                    int n, int a, int b, int c, int d, double cutoff,
-                   int with_j, int with_k)
+                   int with_j, int with_k, int dd)
 {
         double qijkl = q0[a*n+b] * q1[c*n+d];
         double dmin = cutoff / qijkl;
+        if (dd) {
+                return qijkl > cutoff
+                    && ((with_j && 2*dmc[a*n+b]*dmc[c*n+d] > dmin)
+                     || (with_k && ((dmc[a*n+c]*dmc[b*n+d] > dmin) ||
+                                    (dmc[a*n+d]*dmc[b*n+c] > dmin))));
+        }
         return qijkl > cutoff
             && ((with_j && 2*dmc[d*n+c] > dmin)
              || (with_k && ((dmc[b*n+c] > dmin) || (dmc[b*n+d] > dmin))));
@@ -207,6 +218,7 @@ typedef struct {
         int nao;
         int with_j;
         int with_k;
+        int dd_screen;          // the screening by two density elements, or (0) by one
 } EJKEnvs;
 
 // The plan of the orbit of shells (ish,jsh,ksh,lsh): which centres take an
@@ -249,7 +261,7 @@ static int _orbit_plan(EJKOrbit *o, int ish, int jsh, int ksh, int lsh, EJKEnvs 
                         nrep++;
                         pass[c] = _screen(e->q0, e->q1, e->dmc, n, sh[c][0], sh[c][1],
                                           sh[c][2], sh[c][3], e->cutoff,
-                                          e->with_j, e->with_k);
+                                          e->with_j, e->with_k, e->dd_screen);
                         npass += pass[c];
                 }
         }
@@ -550,7 +562,8 @@ static void _eval_batch(void *ctx, void *pth, double *de, void *orbits, int nq)
  * int2e_batch: int2e_ip1_sph evaluates several orbits at once where qcint offers
  * that (the queues of orbit_engine.h), contracted with Gamma in qcint's kernels
  * where it offers that (int2e_ip1_sph_batch_dot); 2: the batched integrals
- * contracted here. CVHFgrad_jk_energy takes 1.
+ * contracted here. CVHFgrad_jk_energy takes 1. Plus 4: the screening by one
+ * density element (_screen), as the J and K matrices are screened.
  */
 void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
                              CVHFOpt *vhfopt, double *dmj, double *dmk, int nk,
@@ -562,7 +575,10 @@ void CVHFgrad_jk_energy_mode(double *de, int (*intor)(), CINTOpt *cintopt,
         EJKEnvs envs = {intor, cintopt, vhfopt->q_cond, vhfopt->q_cond + nbas2,
                 vhfopt->dm_cond, dmj, dmk, ao_loc, atm, bas, env,
                 vhfopt->direct_scf_cutoff, cj, ck, nk, natm, nbas, ao_loc[nbas],
-                with_j, with_k};
+                with_j, with_k, 0};
+        // int2e_batch + 4: the screening by one density element
+        envs.dd_screen = !(int2e_batch & 4);
+        int2e_batch &= 3;
         if (cj == 0) {
                 envs.dmj = NULL;
         }

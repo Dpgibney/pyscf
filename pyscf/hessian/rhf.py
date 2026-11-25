@@ -41,17 +41,28 @@ from pyscf.grad import rhf
 JK_ENERGY = getattr(__config__, 'hessian_rhf_jk_energy', True)
 # The screening threshold of hess_jk_energy (that of the _VHFOpt of _make_vhfopt). 0 computes every shell
 # quartet whose densities are not zero, as the loops of _partial_hess_2e do: _make_vhfopt finds no int2e_ip1ip2
-# etc. in libcvhf (they are int2e_ip1ip2_sph etc.), so their integrals are not screened.
-JK_ENERGY_TOL = getattr(__config__, 'hessian_rhf_jk_energy_tol', 1e-14)
+# etc. in libcvhf (they are int2e_ip1ip2_sph etc.), so their integrals are not screened. With the bound of
+# JK_ENERGY_DD_SCREEN, on a 57-atom doublet (1198 functions, def2-TZVP; J and full-range K, 10 threads): 1e-13
+# 943 s and blocks within 7e-10 of those of the bound with one density element at 1e-14 (1856 s); 1e-12 767 s
+# and 1.1e-8 (the Coulomb part: its neglected terms add up; the exchange part 8e-10).
+JK_ENERGY_TOL = getattr(__config__, 'hessian_rhf_jk_energy_tol', 1e-13)
 # The memory (MB) hess_jk_energy's chunk buffers may take; fixed, so that the results do not depend on the memory
 # available
 JK_ENERGY_BUF = 128
 # hess_jk_energy's batched integrals contracted with the densities inside qcint's kernels where it offers that
 # (int2e_*_sph_batch_dot); False keeps the contraction in hess_jk_energy
 JK_ENERGY_DOT = getattr(__config__, 'hessian_rhf_jk_energy_dot', True)
+# hess_jk_energy screens a shell quartet by its integral bound times the two density elements each of its
+# integrals is contracted with, 2 D_ij D_kl for the Coulomb and D_ik D_jl, D_il D_jk for the exchange energy:
+# what the quartet adds to the energy's second derivative. False: the bound with one density element, that of
+# the J and K matrices of the loops of _partial_hess_2e, which for a large molecule computes about twice the
+# quartets at the same threshold (the exchange of a pair of shells with a distant pair needs two elements of
+# the density between them).
+JK_ENERGY_DD_SCREEN = getattr(__config__, 'hessian_rhf_jk_energy_dd_screen', True)
 # The screening threshold of make_h1's int2e_ip1 J/K (_make_h1_vhfopt); 0 computes every quartet, as without a
-# vhfopt
-MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-14)
+# vhfopt. 1e-12 against 1e-14 on a 57-atom doublet (1198 functions, def2-TZVP): 20% less time, the matrices
+# within 1.3e-10; the Hessians of 16 and 17 atoms with both thresholds of this module at 1e-12 within 1.5e-11.
+MAKE_H1_TOL = getattr(__config__, 'hessian_rhf_make_h1_tol', 1e-12)
 # cphf.solve_residual's tol under HessianBase.sgx_response when cphf_residual_tol is None. cphf.solve is not used with
 # SGX's K: its Krylov vectors shrink below what SGX's absolute thresholds resolve (propane: 42 response calls instead
 # of 5, or stopping short)
@@ -210,7 +221,6 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     # Energy weighted density matrix
     dme0 = numpy.einsum('pi,qi,i->pq', mocc, mocc, mo_energy[mo_occ>0]) * 2
 
-    hcore_deriv = hessobj.hcore_generator(mol)
     s1aa, s1ab, s1a = get_ovlp(mol)
 
     # Skip the K-type contractions when no exact exchange is needed (with_k=False)
@@ -220,6 +230,10 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     aoslices = mol.aoslice_by_atom()
     natm = len(atmlst)
     e1 = numpy.zeros((natm, natm, 3, 3))
+    # the core Hamiltonian's second derivatives with dm0, from the blocks of each pair of atoms
+    hcore_deriv = None
+    if not _hcore_deriv2_dm_(e1, hessobj, mol, dm0, atmlst):
+        hcore_deriv = hessobj.hcore_generator(mol)
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ia]
         e1[i0, i0] -= numpy.einsum('xypq,pq->xy', s1aa[:,:,p0:p1], dme0[p0:p1])*2
@@ -228,14 +242,66 @@ def _partial_hess_ejk(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
             q0, q1 = aoslices[ja][2:]
             e1[i0, j0] -= numpy.einsum('xypq,pq->xy', s1ab[:,:,p0:p1,q0:q1], dme0[p0:p1,q0:q1])*2
 
-            h1ao = hcore_deriv(ia, ja)
-            e1[i0, j0] += numpy.einsum('xypq,pq->xy', h1ao, dm0)
+            if hcore_deriv is not None:
+                h1ao = hcore_deriv(ia, ja)
+                e1[i0, j0] += numpy.einsum('xypq,pq->xy', h1ao, dm0)
 
         for j0 in range(i0):
             e1[j0, i0] = e1[i0, j0].T
 
+    t1 = log.timer_debug1('one-electron terms', *t1)
     log.timer('RHF partial hessian', *time0)
     return e1, ej, ek
+
+def _hcore_deriv2_dm_(e1, hessobj, mol, dm0, atmlst):
+    '''e1[i0,j0] += einsum('xypq,pq->xy', hcore_deriv(ia, ja), dm0) for the atoms ja = atmlst[j0],
+    j0 <= i0, of HessianBase.hcore_generator's second derivatives of the core Hamiltonian and a real
+    symmetric dm0: from the blocks of the derivative integrals of each pair of atoms that are not zero
+    (the rows of the two atoms), not from a [3,3,nao,nao] matrix per pair, which is natm^2 nao^2 work.
+    Returns False, e1 untouched, where the generator is not HessianBase's own, with x2c or with ECPs.'''
+    if (getattr(type(hessobj), 'hcore_generator', None) is not HessianBase.hcore_generator or
+            getattr(hessobj.base, 'with_x2c', None) or mol.has_ecp()):
+        return False
+    aoslices = mol.aoslice_by_atom()
+    nbas = mol.nbas
+    nao = mol.nao_nr()
+    h1aa, h1ab = hessobj.get_hcore(mol)
+    dm0 = numpy.asarray(dm0, order='C')
+
+    def rinv2(iatm, shls_slice=None):
+        # z_i times the second derivatives of 1/|r - R_i|: ip ip rinv, ip rinv ip
+        with mol.with_rinv_at_nucleus(iatm):
+            aa = mol.intor('int1e_ipiprinv', comp=9, shls_slice=shls_slice)
+            ab = mol.intor('int1e_iprinvip', comp=9, shls_slice=shls_slice)
+        zi = mol.atom_charge(iatm)
+        n = aa.shape[-2]
+        return (aa * zi).reshape(3,3,n,nao), (ab * zi).reshape(3,3,n,nao)
+
+    for i0, ia in enumerate(atmlst):
+        ish0, ish1, p0, p1 = aoslices[ia]
+        for j0, ja in enumerate(atmlst[:i0+1]):
+            jsh0, jsh1, q0, q1 = aoslices[ja]
+            if ia == ja:
+                aa, ab = rinv2(ia)
+                e = -numpy.einsum('xypq,pq->xy', aa, dm0)
+                e -= numpy.einsum('xypq,pq->xy', ab, dm0)
+                e += numpy.einsum('xypq,pq->xy', h1aa[:,:,p0:p1], dm0[p0:p1])
+                # the rows of the atom, and their transposes in its columns
+                e += numpy.einsum('xypq,pq->xy', aa[:,:,p0:p1], dm0[p0:p1]) * 2
+                e += numpy.einsum('xypq,pq->xy', ab[:,:,p0:p1], dm0[p0:p1])
+                e += numpy.einsum('xypq,pq->xy', ab[:,:,:,p0:p1], dm0[:,p0:p1])
+                e += numpy.einsum('xypq,pq->xy', h1ab[:,:,p0:p1,p0:p1], dm0[p0:p1,p0:p1])
+            else:
+                e = numpy.einsum('xypq,pq->xy', h1ab[:,:,p0:p1,q0:q1], dm0[p0:p1,q0:q1])
+                aa, ab = rinv2(ia, (jsh0, jsh1, 0, nbas))
+                e += numpy.einsum('xypq,pq->xy', aa, dm0[q0:q1])
+                e += numpy.einsum('yxpq,pq->xy', ab, dm0[q0:q1])
+                aa, ab = rinv2(ja, (ish0, ish1, 0, nbas))
+                e += numpy.einsum('xypq,pq->xy', aa, dm0[p0:p1])
+                e += numpy.einsum('xypq,pq->xy', ab, dm0[p0:p1])
+            # hcore + its transpose, with the symmetric dm0
+            e1[i0,j0] += e * 2
+    return True
 
 def _partial_hess_2e(mol, dm_j, dms_k, k_fac, atmlst, with_j=True, with_k=True,
                      omega=None, verbose=None):
@@ -415,7 +481,8 @@ def hess_jk_energy(mol, dm_j, dms_k, k_fac, tol=None, stats=None, verbose=None):
             c_intors, c_cintopts, q_cond.ctypes, dm_cond.ctypes, ctypes.c_double(tol),
             lib.c_null_ptr() if dmj is None else dmj.ctypes, dmk.ctypes, ctypes.c_int(nk),
             ctypes.c_double(k_fac), ctypes.c_size_t(int(JK_ENERGY_BUF * 1e6 / 8)), c_stats.ctypes,
-            ctypes.c_int((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0), ao_loc.ctypes,
+            ctypes.c_int(((1 if JK_ENERGY_DOT else 2) if _vhf.INT2E_BATCH else 0)
+                         + (0 if JK_ENERGY_DD_SCREEN else 4)), ao_loc.ctypes,
             c_atm, ctypes.c_int(natm), c_bas, ctypes.c_int(nbas), c_env)
     log.debug1('hess_jk_energy: %d shell quartet orbits, %d integral evaluations '
                '(%d cross-atom centre pairs), %d orbits batched', *c_stats)

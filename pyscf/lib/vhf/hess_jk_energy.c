@@ -54,14 +54,22 @@
  *     Q = max(qd[I,J] qd[K,L], qv[I,J] q[K,L], qv[K,L] q[I,J])
  * with qd the int2e_ip1ip2 pair bounds (CVHFnr_int2e_pp_q_cond, both orders
  * of the pair), qv those of int2e_ipvip1 (CVHFnr_int2e_pppp_q_cond), q those of
- * int2e, and D the largest of 2 dm_cond[I,J], 2 dm_cond[K,L] (with Gamma_J)
- * and dm_cond[I,K], dm_cond[I,L], dm_cond[J,K], dm_cond[J,L] (with Gamma_K),
- * dm_cond being the largest |D| of the shell pair over all densities. With
- * both Gammas, each test of CVHFip1ip2_prescreen and CVHFipvip1_prescreen
- * (hessian_screen.c) of the orbit's integrals passes only if this one does;
- * with one, the terms of the other (whose contributions are zero) are left
- * out. A computed orbit takes all its integrals. cutoff = 0 computes every
- * orbit whose Gammas are not zero.
+ * int2e, and D a bound of the Gammas, the two density elements every integral
+ * is contracted with: the largest of 2 dm_cond[I,J] dm_cond[K,L] (with
+ * Gamma_J) and dm_cond[I,K] dm_cond[J,L], dm_cond[I,L] dm_cond[J,K] (with
+ * Gamma_K), dm_cond being the largest |D| of the shell pair over all
+ * densities. For the exchange energy of a large molecule this leaves out
+ * most of the orbits that a bound with one density element computes (the
+ * exchange of a pair of shells with a distant pair needs two elements of the
+ * density between them). That bound, the one of the J and K matrices, is the
+ * screening with int2e_batch + 4: D the largest of 2 dm_cond[I,J],
+ * 2 dm_cond[K,L] (with Gamma_J) and dm_cond[I,K], dm_cond[I,L], dm_cond[J,K],
+ * dm_cond[J,L] (with Gamma_K); with both Gammas, each test of
+ * CVHFip1ip2_prescreen and CVHFipvip1_prescreen (hessian_screen.c) of the
+ * orbit's integrals passes only if this one does. With one Gamma, the terms
+ * of the other (whose contributions are zero) are left out. A computed orbit
+ * takes all its integrals. cutoff = 0 computes every orbit whose Gammas are
+ * not zero.
  *
  * The loop over the orbits, their chunks (summed in a fixed order: the result
  * does not depend on the thread count or the schedule) and the queues of the
@@ -233,6 +241,7 @@ typedef struct {
         int with_j;
         int with_k;
         int nh;                 // Gammas: with_j + with_k
+        int dd_screen;          // the bound of the Gammas: two density elements, or (0) one
 } HJKEnvs;
 
 typedef struct {
@@ -259,6 +268,16 @@ static int _orbit_screen(HJKEnvs *e, int ish, int jsh, int ksh, int lsh)
                 return 0;
         }
         double dm = 0;
+        if (e->dd_screen) {
+                if (e->with_j) {
+                        dm = 2 * dmc[ish*n+jsh] * dmc[ksh*n+lsh];
+                }
+                if (e->with_k) {
+                        dm = MAX(dm, dmc[ish*n+ksh] * dmc[jsh*n+lsh]);
+                        dm = MAX(dm, dmc[ish*n+lsh] * dmc[jsh*n+ksh]);
+                }
+                return qm * dm > e->cutoff;
+        }
         if (e->with_j) {
                 dm = 2 * MAX(dmc[ish*n+jsh], dmc[ksh*n+lsh]);
         }
@@ -779,7 +798,8 @@ static void _eval_batch(void *ctx, void *pth, double *h, void *orbits, int nq)
  * int2e_batch: several orbits at once where qcint offers that (the queues of
  * orbit_engine.h), their integrals contracted with the Gammas in qcint's
  * kernels where it offers that (int2e_*_sph_batch_dot); 2: the batched
- * integrals contracted here.
+ * integrals contracted here. Plus 4: the screening by one density element
+ * (see the top).
  */
 void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cintopts,
                         double *q_cond, double *dm_cond, double cutoff,
@@ -794,8 +814,11 @@ void CVHFhess_jk_energy(double *hj, double *hk, int (**intors)(), CINTOpt **cint
                 {cintopts[0], cintopts[1], cintopts[2]},
                 q_cond, q_cond + nbas2, q_cond + nbas2 * 2, dm_cond, dmj, dmk,
                 ao_loc, atm, bas, env, plans, cutoff, kfac * .25, nk, natm, nbas,
-                ao_loc[nbas], hj != NULL, hk != NULL && nk > 0, 0};
+                ao_loc[nbas], hj != NULL, hk != NULL && nk > 0, 0, 0};
         envs.nh = envs.with_j + envs.with_k;
+        // int2e_batch + 4: the screening by one density element
+        envs.dd_screen = !(int2e_batch & 4);
+        int2e_batch &= 3;
         const size_t ntri = (size_t)natm * (natm - 1) / 2;
         const size_t nhess = (size_t)natm * natm * 9;
         if (hj != NULL) {

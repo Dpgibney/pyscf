@@ -355,6 +355,20 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(grad.rhf.jk_energy_per_atom(mol, dm, 0, 1, omega=-.4) - ref).max(),
                                0, 12)
 
+    def test_jk_energy_per_atom_dd_screen(self):
+        # the screening by the two density elements of each derivative integral against the one by
+        # one element (CVHFgrad_jk_prescreen), on a chain of molecules: J and K, K of the long range
+        mol1 = gto.M(atom=''.join('O 0 0 %.1f; H 0 .757 %.3f; H 0 -.757 %.3f; ' % (z, z + .587, z + .587)
+                                  for z in (0., 4.5, 9., 13.5)), basis='def2-svp', verbose=0)
+        dm = scf.RHF(mol1).run().make_rdm1()
+        for jf, kf, omega in ((1, .3, None), (0, .6, .4)):
+            with lib.temporary_env(grad.rhf, JK_ENERGY_DD_SCREEN=False):
+                ref = grad.rhf.jk_energy_per_atom(mol1, dm, jf, kf, omega=omega)
+            self.assertTrue(grad.rhf.JK_ENERGY_DD_SCREEN)
+            de = grad.rhf.jk_energy_per_atom(mol1, dm, jf, kf, omega=omega)
+            self.assertTrue(abs(ref).max() > 1e-2)
+            self.assertAlmostEqual(abs(de - ref).max(), 0, 10)
+
     def test_jk_energy_per_atom_int2e_batch(self):
         # qcint's int2e_ip1_sph_batch (several orbits in the SIMD lanes), contracted in its _dot kernels
         # and in grad_jk_energy.c, against int2e_ip1_sph orbit by orbit, with d and f shells; with

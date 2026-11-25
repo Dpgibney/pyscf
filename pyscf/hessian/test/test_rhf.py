@@ -310,6 +310,31 @@ class KnownValues(unittest.TestCase):
                         self.assertAlmostEqual(abs(ej - ref[0]).max(), 0, 11)
                         self.assertAlmostEqual(abs(ek - ref[1]).max(), 0, 11)
 
+    def test_hess_jk_energy_dd_screen(self):
+        # hess_jk_energy's screening by the two density elements of each integral against the one by
+        # one element (that of the J and K matrices): fewer shell quartets on a chain of molecules,
+        # the same blocks within what the threshold leaves out; J and K, spin densities, K alone
+        # of the long range
+        from pyscf.hessian import rhf as rhf_hess
+        mol1 = gto.M(atom=''.join('O 0 0 %.1f; H 0 .757 %.3f; H 0 -.757 %.3f; ' % (z, z + .587, z + .587)
+                                  for z in (0., 4.5, 9., 13.5)), basis='def2-svp', verbose=0)
+        dm = scf.RHF(mol1).run().make_rdm1()
+        for dm_j, dms_k, k_fac, omega in ((dm, [dm], 1, None), (dm, [dm * .5, dm * .5], 2, None),
+                                          (None, [dm], 1, .3)):
+            res = []
+            for dd, tol in ((False, 0), (False, 1e-14), (True, 1e-14), (True, 1e-12)):
+                stats = []
+                with lib.temporary_env(rhf_hess, JK_ENERGY_DD_SCREEN=dd), mol1.with_range_coulomb(omega):
+                    ej, ek = rhf_hess.hess_jk_energy(mol1, dm_j, dms_k, k_fac, tol=tol, stats=stats)
+                res.append((ej, ek, stats[0]))
+            for (ej, ek, n), places in zip(res[1:], (11, 10, 8)):
+                self.assertAlmostEqual(abs(ej - res[0][0]).max(), 0, places)
+                self.assertAlmostEqual(abs(ek - res[0][1]).max(), 0, places)
+            self.assertTrue(abs(res[0][1]).max() > 1e-2)
+            # orbits computed: all > one element > two elements > two at the looser threshold
+            self.assertTrue(res[0][2] > res[1][2] > res[2][2] > res[3][2])
+            self.assertTrue(res[2][2] < .9 * res[1][2])
+
     def test_make_h1_screening(self):
         # make_h1's int2e_ip1 J/K with the screening of _make_h1_vhfopt against every quartet:
         # RHF, hybrid, pure and range-separated RKS, UHF, hybrid and range-separated UKS
@@ -329,9 +354,13 @@ class KnownValues(unittest.TestCase):
             hobj = mf1.Hessian()
             with lib.temporary_env(rhf_hess, MAKE_H1_TOL=0):
                 ref = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
-            h1 = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
+            with lib.temporary_env(rhf_hess, MAKE_H1_TOL=1e-14):
+                h1 = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
             self.assertTrue(abs(ref).max() > .1)
             self.assertAlmostEqual(abs(h1 - ref).max(), 0, 11)
+            # the default threshold
+            h1 = numpy.asarray(hobj.make_h1(mf1.mo_coeff, mf1.mo_occ))
+            self.assertAlmostEqual(abs(h1 - ref).max(), 0, 9)
 
 
 if __name__ == "__main__":
