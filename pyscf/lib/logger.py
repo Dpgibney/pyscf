@@ -244,3 +244,94 @@ def new_logger(rec=None, verbose=None):
     else:
         log = Logger(rec.stdout, rec.verbose)
     return log
+
+# Progress lines of long loops (Progress, and the integral drivers' scf._vhf.oe_progress): the first once a
+# loop has run for PROGRESS_AFTER seconds, then one at every PROGRESS_STEP percent, all with Logger.info
+PROGRESS_AFTER = getattr(pyscf.__config__, 'PROGRESS_AFTER', 30.)
+PROGRESS_STEP = getattr(pyscf.__config__, 'PROGRESS_STEP', 10)
+
+class Progress:
+    '''Progress lines of a loop that may take long, in the form of the integral drivers' lines:
+
+        XC second derivatives, pair terms: 40% of the grid after 302 s
+        XC second derivatives, pair terms: done in 755 s
+
+    add(n) counts n more of the `total` units (`unit`: what they are, for the line) as done. Nothing is
+    written before the loop has run for PROGRESS_AFTER seconds; then a line at once, one at every
+    PROGRESS_STEP percent, and done() writes the last. All with Logger.info: nothing below that level.
+
+    >>> prog = logger.Progress(mf, 'XC second derivatives, pair terms', grids.weights.size)
+    >>> for ao, mask, weight, coords in prog.blocks(ni.block_loop(mol, grids, nao, 2, max_memory)):
+    ...     ...
+
+    Args:
+        rec : a Logger, or an object with the attributes stdout and verbose
+        label : what the loop computes
+        total : the units of the whole loop
+    '''
+    def __init__(self, rec, label, total, unit='grid', after=None, step=None):
+        self.log = new_logger(rec, rec if isinstance(rec, Logger) else None)
+        self.label = label
+        self.total = total
+        self.unit = unit
+        self.after = PROGRESS_AFTER if after is None else after
+        self.step = PROGRESS_STEP if step is None else step
+        self.count = 0
+        self.printed = False
+        self._next = self.step
+        self._t0 = perf_counter()
+
+    def add(self, n=1):
+        '''n more units are done'''
+        self.count += n
+        if self.log.verbose < INFO or self.total <= 0:
+            return
+        dt = perf_counter() - self._t0
+        if dt < self.after:
+            return
+        pct = 100. * self.count / self.total
+        if pct < 100 and (pct >= self._next or not self.printed):
+            self.log.info('    %s: %d%% of the %s after %d s', self.label, pct, self.unit, dt)
+            self.printed = True
+            self._next = (int(pct) // self.step + 1) * self.step
+
+    def done(self, always=False):
+        '''The loop has ended: the last line, if it wrote any (always: or if it ran for `after` seconds)'''
+        dt = perf_counter() - self._t0
+        if self.printed or (always and dt >= self.after):
+            self.log.info('    %s: done in %d s', self.label, dt)
+            self.printed = False
+
+    # with Progress(log, label, 0): a step without a count, reported when it ends if it took `after` seconds
+    def __enter__(self):
+        self._t0 = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.done(always=True)
+
+    def blocks(self, block_loop):
+        '''The items (ao, mask, weight, coords) of NumInt.block_loop, each counted with its grid points when
+        the loop asks for the next one'''
+        for blk in block_loop:
+            n = blk[2].size
+            yield blk
+            blk = None
+            self.add(n)
+        self.done()
+
+    def ranges(self, ranges):
+        '''The pairs (p0, p1) of an iterable of ranges, each counted with its p1 - p0 units when the loop
+        asks for the next one'''
+        for p0, p1 in ranges:
+            yield p0, p1
+            self.add(p1 - p0)
+        self.done()
+
+    def items(self, iterable):
+        '''The items of an iterable, each counted as one unit when the loop asks for the next one'''
+        for x in iterable:
+            yield x
+            self.add(1)
+        self.done()

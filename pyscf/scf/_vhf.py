@@ -31,18 +31,25 @@ class oe_progress:
     quartets): a line at every `step` percent of the call's chunks of shell
     pairs once it has run for `after` seconds, written by a thread while the
     call, which releases the interpreter lock, runs. Short calls print
-    nothing.
+    nothing. The lines are those of lib.logger.Progress, for a loop inside
+    a compiled function; `progress` and `unit` serve another library's
+    counter (the VV10 pair kernels of libdft).
 
     >>> with oe_progress(log, 'two-electron gradient, J and K'):
     ...     libcvhf.CVHFgrad_jk_energy_mode(...)
     '''
-    def __init__(self, log, label, after=30., step=10, poll=2.):
+    def __init__(self, log, label, after=None, step=None, poll=2., progress=None, unit='shell-pair chunks'):
         self.log = log
         self.label = label
-        self.after = after
-        self.step = step
+        # as lib.logger.Progress
+        self.after = logger.PROGRESS_AFTER if after is None else after
+        self.step = logger.PROGRESS_STEP if step is None else step
         self.poll = poll
         self.printed = False
+        # the function of a compiled library that tells (done, total) of its call in flight (None: that of
+        # the drivers here; False or missing in the library: no lines), and what it counts
+        self.progress = getattr(libcvhf, 'CVHFoe_progress', None) if progress is None else progress
+        self.unit = unit
 
     def _run(self):
         import time
@@ -52,13 +59,13 @@ class oe_progress:
             dt = time.perf_counter() - self._t0
             if dt < self.after:
                 continue
-            libcvhf.CVHFoe_progress(buf)
+            self.progress(buf)
             if buf[1] <= 0:
                 continue
             pct = 100. * buf[0] / buf[1]
             if pct >= nxt or not self.printed:
-                self.log.info('    %s: %d%% of the shell-pair chunks after %d s',
-                              self.label, pct, dt)
+                self.log.info('    %s: %d%% of the %s after %d s',
+                              self.label, pct, self.unit, dt)
                 self.printed = True
                 nxt = (int(pct) // self.step + 1) * self.step
 
@@ -66,7 +73,7 @@ class oe_progress:
         import threading, time
         self._t0 = time.perf_counter()
         self._thread = None
-        if hasattr(libcvhf, 'CVHFoe_progress') and self.log.verbose >= logger.INFO:
+        if callable(self.progress) and self.log.verbose >= logger.INFO:
             self._stop = threading.Event()
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
