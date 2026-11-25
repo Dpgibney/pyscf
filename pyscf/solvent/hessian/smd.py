@@ -36,12 +36,17 @@ def get_cds(smdobj):
     log = logger.new_logger(mol, mol.verbose)
     t1 = (logger.process_clock(), logger.perf_counter())
     log.warn("Using finite difference scheme for CDS contribution.")
+    # Mole.set_geom_ writes every new geometry with Logger.info: 6 natm geometries of natm lines here,
+    # left to the debug levels
+    if mol.verbose < logger.DEBUG1:
+        mol.verbose = min(mol.verbose, logger.NOTE)
     coords = mol.atom_coords(unit='B')
     coords_backup = coords.copy()
     eps = 1e-4
     natm = mol.natm
     hess_cds = np.zeros([natm,natm,3,3])
-    for ia in range(mol.natm):
+    prog = logger.Progress(log, 'CDS second derivatives by finite differences', natm, 'atoms')
+    for ia in prog.items(range(mol.natm)):
         for j in range(3):
             coords[ia,j] += eps
             mol.set_geom_(coords, unit='B')

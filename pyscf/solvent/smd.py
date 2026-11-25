@@ -385,11 +385,15 @@ class SMD(pcm.PCM):
         from pyscf.solvent.hessian.pcm import (
             analytical_hess_nuc, analytical_hess_qv, analytical_hess_solver)
         from pyscf.solvent.hessian.smd import get_cds
-        de_solvent  =    analytical_hess_nuc(self, dm, verbose=self.verbose)
-        de_solvent +=     analytical_hess_qv(self, dm, verbose=self.verbose)
-        de_solvent += analytical_hess_solver(self, dm, verbose=self.verbose)
+        with logger.Progress(self, "the solvent's second derivatives", 0):
+            de_solvent  =    analytical_hess_nuc(self, dm, verbose=self.verbose)
+            de_solvent +=     analytical_hess_qv(self, dm, verbose=self.verbose)
+            de_solvent += analytical_hess_solver(self, dm, verbose=self.verbose)
         de_cds = get_cds(self)
-        logger.info(self, 'Cavitation, Dispersion and Solvent structure contribution %s', de_cds)
+        # the [natm,natm,3,3] array itself only at the debug levels
+        logger.info(self, 'Cavitation, Dispersion and Solvent structure contribution to the Hessian: '
+                    'largest element %.3e', abs(de_cds).max())
+        logger.debug1(self, 'Cavitation, Dispersion and Solvent structure contribution %s', de_cds)
         return de_solvent + de_cds
 
     def reset(self, mol=None):

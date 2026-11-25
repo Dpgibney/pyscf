@@ -240,6 +240,39 @@ H -0.646 -0.464 -0.804
         g2 = get_cds_grad(mf.with_solvent)
         assert abs(dat[0,:,2] - ((g2 - g1) / 2e-3 * lib.param.BOHR)).max() < 1e-5
 
+    def test_cds_output(self):
+        # the geometries of the finite differences are written at the debug levels only, and the
+        # array of the term too
+        import io
+        from pyscf.solvent.hessian.smd import get_cds as get_cds_hess
+        out = {}
+        for verbose in (4, 6):
+            mol = gto.M(atom='''
+                        C        0.000000    0.000000   -0.542500
+                        H        0.000000    0.935307   -1.082500
+                        H        0.000000   -0.935307   -1.082500''', verbose=0)
+            mol.stdout = io.StringIO()
+            mol.verbose = verbose
+            mf = mol.RHF().SMD()
+            mf.with_solvent.solvent_descriptors = [1.3843, 1.3766, 0.0, 0.45, 35.06, 13.45, 0.0, 0.0]
+            get_cds_hess(mf.with_solvent)
+            self.assertEqual(mol.verbose, verbose)
+            out[verbose] = mol.stdout.getvalue()
+        self.assertNotIn('New geometry', out[4])
+        self.assertEqual(out[6].count('New geometry'), 18)
+        with lib.temporary_env(lib.logger, PROGRESS_AFTER=0.):
+            mol.stdout = io.StringIO()
+            mol.verbose = 4
+            mf = mol.RHF().SMD()
+            mf.with_solvent.solvent_descriptors = [1.3843, 1.3766, 0.0, 0.45, 35.06, 13.45, 0.0, 0.0]
+            mf.run()
+            mf.with_solvent.hess(mf.make_rdm1())
+            text = mol.stdout.getvalue()
+        self.assertIn('CDS second derivatives by finite differences: 33% of the atoms', text)
+        self.assertIn('Cavitation, Dispersion and Solvent structure contribution to the Hessian: '
+                      'largest element', text)
+        self.assertNotIn('contribution [[', text)
+
     def test_hess(self):
         mol = gto.M(atom='''
         C        0.000000    0.000000   -0.542500
