@@ -49,6 +49,9 @@ def grids_response(grids, lko=False):
                                             grids.level, grids.prune)
     atm_coords = numpy.asarray(mol.atom_coords() , order='C')
     atm_dist = gto.mole.inter_distance(mol, atm_coords)
+    # the distances R of the atoms; the partition takes f(R) of LKO in their place,
+    # whose derivatives with respect to the atoms' positions are f'(R) (R_a - R_b) / R
+    atm_r = atm_dist + numpy.eye(mol.natm)
     if lko:
         atm_dist = fcut(atm_dist, RCUT_LKO, MC_LKO)
 
@@ -127,19 +130,19 @@ def grids_response(grids, lko=False):
                     if ia == atom_id:  # dA PA: dA~ib, PA~ia
                         ua = atm_coords[ib] - coords
                         d_uab = ua/grid_dist[ib,:,None]/atm_dist[ia,ib]
-                        v = (grid_dist[ia]-grid_dist[ib])/atm_dist[ia,ib]**3
+                        v = (grid_dist[ia]-grid_dist[ib])/(atm_dist[ia,ib]**2 * atm_r[ia,ib])
                         if lko:
                             v[cond] = 0
-                            v *= dfcut(atm_dist[ia,ib], RCUT_LKO, MC_LKO)
+                            v *= dfcut(atm_r[ia,ib], RCUT_LKO, MC_LKO)
                         d_uab-= v[:,None] * uab
                         dpbecke[ia,ia] += (pbecke[ia]*t_uab).reshape(-1,1) * d_uab
                     else:  # dB PB: dB~ib, PB~ia
                         ua = atm_coords[ia] - coords
                         d_uab = ua/grid_dist[ia,:,None]/atm_dist[ia,ib]
-                        v = (grid_dist[ia]-grid_dist[ib])/atm_dist[ia,ib]**3
+                        v = (grid_dist[ia]-grid_dist[ib])/(atm_dist[ia,ib]**2 * atm_r[ia,ib])
                         if lko:
                             v[cond] = 0
-                            v *= dfcut(atm_dist[ia,ib], RCUT_LKO, MC_LKO)
+                            v *= dfcut(atm_r[ia,ib], RCUT_LKO, MC_LKO)
                         d_uab-= v[:,None] * uab
                         dpbecke[ia,ia] += (pbecke[ia]*t_uab).reshape(-1,1) * d_uab
 
@@ -153,19 +156,19 @@ def grids_response(grids, lko=False):
                     if ib == atom_id:  # dA PB: dA~ib PB~ia
                         ub = atm_coords[ia] - coords
                         d_uba = ub/grid_dist[ia,:,None]/atm_dist[ia,ib]
-                        v = (grid_dist[ib]-grid_dist[ia])/atm_dist[ia,ib]**3
+                        v = (grid_dist[ib]-grid_dist[ia])/(atm_dist[ia,ib]**2 * atm_r[ia,ib])
                         if lko:
                             v[cond] = 0
-                            v *= dfcut(atm_dist[ia,ib], RCUT_LKO, MC_LKO)
+                            v *= dfcut(atm_r[ia,ib], RCUT_LKO, MC_LKO)
                         d_uba-= v[:,None] * uba
                         dpbecke[ib,ia] += -(pbecke[ia]*t_uab).reshape(-1,1) * d_uba
                     else:  # dB PC: dB~ib, PC~ia and dB PA: dB~ib, PA~ia
                         ub = atm_coords[ib] - coords
                         d_uba = ub/grid_dist[ib,:,None]/atm_dist[ia,ib]
-                        v = (grid_dist[ib]-grid_dist[ia])/atm_dist[ia,ib]**3
+                        v = (grid_dist[ib]-grid_dist[ia])/(atm_dist[ia,ib]**2 * atm_r[ia,ib])
                         if lko:
                             v[cond] = 0
-                            v *= dfcut(atm_dist[ia,ib], RCUT_LKO, MC_LKO)
+                            v *= dfcut(atm_r[ia,ib], RCUT_LKO, MC_LKO)
                         d_uba-= v[:,None] * uba
                         dpbecke[ib,ia] += -(pbecke[ia]*t_uab).reshape(-1,1) * d_uba
         return pbecke, dpbecke
@@ -463,6 +466,25 @@ class KnownValues(unittest.TestCase):
         c, w0a      = grids_response(grids0)[:2]
         dw = (w0a-w0b) / .00002
         self.assertTrue(abs(dw-w1a[0,:,2]).max() < 1e-5)
+        # the same for the LKO partition, with atoms further apart (f(R) of LKO and R
+        # differ more there), of the reference and of VXCgen_grid_lko_deriv
+        for g in (grids0, grids1):
+            g.becke_scheme = gen_grid.becke_lko
+        w0b = grids_response(grids1, lko=True)[1]
+        w0c = grids_response(grids0, lko=True)[1]
+        mol2 = mol.copy()
+        grids2 = dft.gen_grid.Grids(mol2)
+        grids2.becke_scheme = gen_grid.becke_lko
+        c2, w0l, w1l = grids_response(grids2, lko=True)
+        dw = (w0c-w0b) / .00002
+        self.assertTrue(abs(dw-w1l[0,:,2]).max() < 1e-5)
+        atm_idx2 = numpy.concatenate([numpy.full(grids2.gen_atomic_grids(
+            mol2, grids2.atom_grid, grids2.radi_method, grids2.level, grids2.prune)[
+            mol2.atom_symbol(ia)][1].size, ia, dtype=numpy.int32) for ia in range(mol2.natm)])
+        w1c = rks.get_dw_partition_sorted(mol2, atm_idx2, c2, w0l, grids2.radii_adjust, grids2.atomic_radii)
+        self.assertAlmostEqual(abs(w1c.transpose(1,2,0) - w1l).max(), 0, 9)
+        for g in (grids0, grids1):
+            g.becke_scheme = gen_grid.original_becke
 
         coords = []
         w0 = []

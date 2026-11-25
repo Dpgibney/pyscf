@@ -721,7 +721,9 @@ void VXCgen_grid_lko_deriv(double *out, double *dw, double *coords, double *atm_
             dz = atm_coords[i*3+2] - atm_coords[j*3+2];
             dr = sqrt(dx*dx + dy*dy + dz*dz);
             atom_dist[i*natm+j] = 1 / _lko_sat_func(dr);
-            sat_deriv = _lko_sat_deriv(dr) * pow(atom_dist[i*natm+j], 3);
+            // d(1/f(R))/dR_i = -f'(R) / f(R)^2 (R_i - R_j) / R: the partition's
+            // distance is f(R), not R (the factor was 1/f(R)^3)
+            sat_deriv = _lko_sat_deriv(dr) * atom_dist[i*natm+j] * atom_dist[i*natm+j] / dr;
             dadx[i*natm+j] = -dx * sat_deriv;
             dady[i*natm+j] = -dy * sat_deriv;
             dadz[i*natm+j] = -dz * sat_deriv;
